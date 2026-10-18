@@ -15,6 +15,7 @@ mod types;
 
 use alloc::{borrow::ToOwned as _, boxed::Box};
 pub use args::{Args, IntoArg, IntoArgs};
+pub(crate) use ffi::defer_call_job;
 pub use ffi::RustFunction;
 pub use params::{FromParam, FromParams, ParamRequirement, Params, ParamsAccessor};
 #[cfg(feature = "futures")]

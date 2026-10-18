@@ -3,20 +3,34 @@ use crate::{class::JsCell, function::Params, qjs, runtime::opaque::Opaque, Atom,
 use alloc::boxed::Box;
 use core::{any::TypeId, mem, panic::AssertUnwindSafe, ptr::NonNull};
 
+/// The Rust data of a class object. It is missing in an object restored from a snapshot until
+/// [`Runtime::read_snapshot`](crate::Runtime::read_snapshot) attaches it, and in a function whose
+/// data was moved to the restored object.
+pub(crate) unsafe fn class_cell(
+    val: qjs::JSValueConst,
+    class_id: qjs::JSClassID,
+) -> Option<NonNull<ClassCell<()>>> {
+    NonNull::new(qjs::JS_GetOpaque(val, class_id)).map(NonNull::cast)
+}
+
+unsafe fn throw_missing_data(ctx: *mut qjs::JSContext) -> qjs::JSValue {
+    qjs::JS_ThrowTypeError(ctx, c"Rust object without its Rust data".as_ptr())
+}
+
 /// FFI finalizer, destroying the object once it is delete by the Gc.
 pub(crate) unsafe extern "C" fn class_finalizer(rt: *mut qjs::JSRuntime, val: qjs::JSValue) {
     let class_id = Opaque::from_runtime_ptr(rt).get_class_id();
-    let ptr = qjs::JS_GetOpaque(val, class_id);
-    let ptr = NonNull::new(ptr).unwrap().cast::<ClassCell<()>>();
-    (ptr.as_ref().v_table.finalizer)(ptr);
+    if let Some(ptr) = class_cell(val, class_id) {
+        (ptr.as_ref().v_table.finalizer)(ptr);
+    }
 }
 
 /// FFI finalizer, destroying the object once it is delete by the Gc.
 pub(crate) unsafe extern "C" fn exotic_class_finalizer(rt: *mut qjs::JSRuntime, val: qjs::JSValue) {
     let class_id = Opaque::from_runtime_ptr(rt).get_exotic_id();
-    let ptr = qjs::JS_GetOpaque(val, class_id);
-    let ptr = NonNull::new(ptr).unwrap().cast::<ClassCell<()>>();
-    (ptr.as_ref().v_table.finalizer)(ptr);
+    if let Some(ptr) = class_cell(val, class_id) {
+        (ptr.as_ref().v_table.finalizer)(ptr);
+    }
 }
 
 /// FFI tracing function for non callable classes.
@@ -26,10 +40,10 @@ pub(crate) unsafe extern "C" fn class_trace(
     mark_func: qjs::JS_MarkFunc,
 ) {
     let class_id = Opaque::from_runtime_ptr(rt).get_class_id();
-    let ptr = qjs::JS_GetOpaque(val, class_id);
-    let ptr = NonNull::new(ptr).unwrap().cast::<ClassCell<()>>();
-    let tracer = Tracer::from_ffi(rt, mark_func);
-    (ptr.as_ref().v_table.trace)(ptr, tracer)
+    if let Some(ptr) = class_cell(val, class_id) {
+        let tracer = Tracer::from_ffi(rt, mark_func);
+        (ptr.as_ref().v_table.trace)(ptr, tracer)
+    }
 }
 
 /// FFI tracing function for non callable exotic classes.
@@ -39,18 +53,18 @@ pub(crate) unsafe extern "C" fn exotic_class_trace(
     mark_func: qjs::JS_MarkFunc,
 ) {
     let class_id = Opaque::from_runtime_ptr(rt).get_exotic_id();
-    let ptr = qjs::JS_GetOpaque(val, class_id);
-    let ptr = NonNull::new(ptr).unwrap().cast::<ClassCell<()>>();
-    let tracer = Tracer::from_ffi(rt, mark_func);
-    (ptr.as_ref().v_table.trace)(ptr, tracer)
+    if let Some(ptr) = class_cell(val, class_id) {
+        let tracer = Tracer::from_ffi(rt, mark_func);
+        (ptr.as_ref().v_table.trace)(ptr, tracer)
+    }
 }
 
 /// FFI finalizer, destroying the object once it is delete by the Gc.
 pub(crate) unsafe extern "C" fn callable_finalizer(rt: *mut qjs::JSRuntime, val: qjs::JSValue) {
     let class_id = Opaque::from_runtime_ptr(rt).get_callable_id();
-    let ptr = qjs::JS_GetOpaque(val, class_id);
-    let ptr = NonNull::new(ptr).unwrap().cast::<ClassCell<()>>();
-    (ptr.as_ref().v_table.finalizer)(ptr)
+    if let Some(ptr) = class_cell(val, class_id) {
+        (ptr.as_ref().v_table.finalizer)(ptr)
+    }
 }
 
 /// FFI tracing function for classes of type callable.
@@ -60,10 +74,10 @@ pub(crate) unsafe extern "C" fn callable_trace(
     mark_func: qjs::JS_MarkFunc,
 ) {
     let class_id = Opaque::from_runtime_ptr(rt).get_callable_id();
-    let ptr = qjs::JS_GetOpaque(val, class_id);
-    let ptr = NonNull::new(ptr).unwrap().cast::<ClassCell<()>>();
-    let tracer = Tracer::from_ffi(rt, mark_func);
-    (ptr.as_ref().v_table.trace)(ptr, tracer)
+    if let Some(ptr) = class_cell(val, class_id) {
+        let tracer = Tracer::from_ffi(rt, mark_func);
+        (ptr.as_ref().v_table.trace)(ptr, tracer)
+    }
 }
 
 /// FFI calling function.
@@ -77,8 +91,9 @@ pub(crate) unsafe extern "C" fn call(
 ) -> qjs::JSValue {
     let rt = qjs::JS_GetRuntime(ctx);
     let id = Opaque::from_runtime_ptr(rt).get_callable_id();
-    let ptr = qjs::JS_GetOpaque(function, id);
-    let ptr = NonNull::new(ptr).unwrap().cast::<ClassCell<()>>();
+    let Some(ptr) = class_cell(function, id) else {
+        return throw_missing_data(ctx);
+    };
     (ptr.as_ref().v_table.call)(ptr, ctx, function, this, argc, argv, flags)
 }
 
@@ -91,8 +106,9 @@ pub(crate) unsafe extern "C" fn exotic_get_property(
 ) -> qjs::JSValue {
     let rt = qjs::JS_GetRuntime(ctx);
     let id = Opaque::from_runtime_ptr(rt).get_exotic_id();
-    let ptr = qjs::JS_GetOpaque(obj, id);
-    let ptr = NonNull::new(ptr).unwrap().cast::<ClassCell<()>>();
+    let Some(ptr) = class_cell(obj, id) else {
+        return throw_missing_data(ctx);
+    };
     (ptr.as_ref().v_table.get_property)(ptr, ctx, obj, atom, receiver)
 }
 
@@ -107,8 +123,10 @@ pub(crate) unsafe extern "C" fn exotic_set_property(
 ) -> qjs::c_int {
     let rt = qjs::JS_GetRuntime(ctx);
     let id = Opaque::from_runtime_ptr(rt).get_exotic_id();
-    let ptr = qjs::JS_GetOpaque(obj, id);
-    let ptr = NonNull::new(ptr).unwrap().cast::<ClassCell<()>>();
+    let Some(ptr) = class_cell(obj, id) else {
+        throw_missing_data(ctx);
+        return -1;
+    };
     (ptr.as_ref().v_table.set_property)(ptr, ctx, obj, atom, receiver, value, flags)
 }
 
@@ -120,8 +138,10 @@ pub(crate) unsafe extern "C" fn exotic_has_property(
 ) -> qjs::c_int {
     let rt = qjs::JS_GetRuntime(ctx);
     let id = Opaque::from_runtime_ptr(rt).get_exotic_id();
-    let ptr = qjs::JS_GetOpaque(obj, id);
-    let ptr = NonNull::new(ptr).unwrap().cast::<ClassCell<()>>();
+    let Some(ptr) = class_cell(obj, id) else {
+        throw_missing_data(ctx);
+        return -1;
+    };
     (ptr.as_ref().v_table.has_property)(ptr, ctx, obj, atom)
 }
 
@@ -133,8 +153,10 @@ pub(crate) unsafe extern "C" fn exotic_delete_property(
 ) -> qjs::c_int {
     let rt = qjs::JS_GetRuntime(ctx);
     let id = Opaque::from_runtime_ptr(rt).get_exotic_id();
-    let ptr = qjs::JS_GetOpaque(obj, id);
-    let ptr = NonNull::new(ptr).unwrap().cast::<ClassCell<()>>();
+    let Some(ptr) = class_cell(obj, id) else {
+        throw_missing_data(ctx);
+        return -1;
+    };
     (ptr.as_ref().v_table.delete_property)(ptr, ctx, obj, prop)
 }
 
@@ -147,8 +169,10 @@ pub(crate) unsafe extern "C" fn exotic_get_own_property(
 ) -> qjs::c_int {
     let rt = qjs::JS_GetRuntime(ctx);
     let id = Opaque::from_runtime_ptr(rt).get_exotic_id();
-    let ptr = qjs::JS_GetOpaque(obj, id);
-    let ptr = NonNull::new(ptr).unwrap().cast::<ClassCell<()>>();
+    let Some(ptr) = class_cell(obj, id) else {
+        throw_missing_data(ctx);
+        return -1;
+    };
     (ptr.as_ref().v_table.get_own_property)(ptr, ctx, desc, obj, prop)
 }
 
@@ -161,8 +185,10 @@ pub(crate) unsafe extern "C" fn exotic_get_own_property_names(
 ) -> qjs::c_int {
     let rt = qjs::JS_GetRuntime(ctx);
     let id = Opaque::from_runtime_ptr(rt).get_exotic_id();
-    let ptr = qjs::JS_GetOpaque(obj, id);
-    let ptr = NonNull::new(ptr).unwrap().cast::<ClassCell<()>>();
+    let Some(ptr) = class_cell(obj, id) else {
+        throw_missing_data(ctx);
+        return -1;
+    };
     (ptr.as_ref().v_table.get_own_property_names)(ptr, ctx, ptab, plen, obj)
 }
 

@@ -387,6 +387,9 @@ impl<'js> Opaque<'js> {
         self.interrupt_handler.get_mut().take();
         self.panic.take();
         self.prototypes.get_mut().clear();
+        self.snapshot_natives.get_mut().take();
+        self.builtin_request.get_mut().take();
+        self.resume_value.get_mut().take();
         #[cfg(feature = "futures")]
         self.spawner.take();
         self.userdata.clear();

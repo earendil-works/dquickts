@@ -31,6 +31,7 @@ pub(crate) use safe_ref::*;
 pub mod runtime;
 pub use runtime::Runtime;
 pub mod context;
+pub mod snapshot;
 pub use context::{Context, Ctx};
 pub mod class;
 pub use class::Class;

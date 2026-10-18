@@ -727,14 +727,25 @@ impl<'js> Ctx<'js> {
     ///
     /// # Safety
     /// Assumes to have ownership of the [`JSValue`]
+    ///
+    /// A suspension by the `snapshot()` builtin is carried out (the runtime is saved) and the
+    /// execution continues; one by the `restore()` builtin is returned as [`Error::Restore`].
     pub(crate) unsafe fn handle_exception(&self, js_val: qjs::JSValue) -> Result<qjs::JSValue> {
-        if qjs::JS_VALUE_GET_NORM_TAG(js_val) != qjs::JS_TAG_EXCEPTION {
-            Ok(js_val)
-        } else {
-            if let Some(x) = self.get_opaque().take_panic() {
-                crate::util::resume_unwind(x);
+        let mut js_val = js_val;
+        loop {
+            if qjs::JS_VALUE_GET_NORM_TAG(js_val) != qjs::JS_TAG_EXCEPTION {
+                return Ok(js_val);
             }
-            Err(Error::Exception)
+            let error = self.raise_exception();
+            // taken in any case: when the suspension of the builtin call failed (e.g. out of
+            // memory), the request must not be carried out by a later suspension
+            let request = self.get_opaque().take_builtin_request();
+            match request {
+                Some(request) if error.is_suspended() => {
+                    js_val = crate::snapshot::complete_builtin(self, request)?
+                }
+                _ => return Err(error),
+            }
         }
     }
 
