@@ -253,9 +253,61 @@ impl<'js> Ctx<'js> {
     /// ```
     pub fn catch(&self) -> Value<'js> {
         unsafe {
+            // the marker of a suspension is not a value: it stays until `resume()`
+            if qjs::JS_IsSuspendException(self.ctx.as_ptr()) != 0 {
+                return Value::new_undefined(self.clone());
+            }
             let v = qjs::JS_GetException(self.ctx.as_ptr());
             Value::from_js_value(self.clone(), v)
         }
+    }
+
+    /// Continues the execution which was suspended (the call which returned
+    /// [`Error::Suspended`]), in this runtime or in a runtime restored from a snapshot.
+    ///
+    /// Returns the result of the suspended call, [`Error::Suspended`] if it was suspended again,
+    /// or [`Error::Exception`] (a `TypeError` if nothing is suspended).
+    ///
+    /// A suspended `snapshot()` call (see
+    /// [`SnapshotHost::builtins`](crate::snapshot::SnapshotHost::builtins)) returns the value
+    /// given to `restore()`, or `undefined`.
+    pub fn resume<V: FromJs<'js>>(&self) -> Result<V> {
+        let val = unsafe {
+            let val = match self.get_opaque().take_resume_value() {
+                Some(value) => qjs::JS_ResumeWith(self.ctx.as_ptr(), value.into_js_value(), 0),
+                None => qjs::JS_Resume(self.ctx.as_ptr()),
+            };
+            let val = self.handle_exception(val)?;
+            Value::from_js_value(self.clone(), val)
+        };
+        V::from_js(self, val)
+    }
+
+    /// Same as [`Ctx::resume`], but the suspended `snapshot()` call returns `value`.
+    pub fn resume_with<T: IntoJs<'js>, V: FromJs<'js>>(&self, value: T) -> Result<V> {
+        let value = value.into_js(self)?;
+        let val = unsafe {
+            let val = qjs::JS_ResumeWith(self.ctx.as_ptr(), value.into_js_value(), 0);
+            let val = self.handle_exception(val)?;
+            Value::from_js_value(self.clone(), val)
+        };
+        V::from_js(self, val)
+    }
+
+    /// Saves the runtime of this context: every context, object, pending job and suspended
+    /// execution, plus `roots`, values which [`Runtime::read_snapshot`](crate::Runtime::read_snapshot)
+    /// gives back. See [`snapshot`](crate::snapshot).
+    ///
+    /// # Errors
+    /// [`Error::Exception`] (a `TypeError`) if the heap holds something which cannot be saved,
+    /// or if JavaScript code is running (save between calls or while suspended).
+    pub fn write_snapshot(
+        &self,
+        host: &crate::snapshot::SnapshotHost,
+        kind: crate::snapshot::SnapshotKind,
+        roots: &[Value<'js>],
+    ) -> Result<Vec<u8>> {
+        crate::snapshot::write(self, host, kind, roots)
     }
 
     /// Returns true if there is a pending JavaScript exception.

@@ -1,7 +1,8 @@
 //! QuickJS runtime related types.
 
 use super::{
-    opaque::Opaque, raw::RawRuntime, InterruptHandler, MemoryUsage, PromiseHook, RejectionTracker,
+    opaque::Opaque, raw::RawRuntime, Decorators, InterruptHandler, MemoryUsage, PromiseHook,
+    RejectionTracker, Suspender,
 };
 use crate::allocator::Allocator;
 #[cfg(feature = "loader")]
@@ -125,6 +126,46 @@ impl Runtime {
         unsafe {
             self.inner.lock().set_interrupt_handler(handler);
         }
+    }
+
+    /// Returns a handle which suspends the running JavaScript of this runtime (see
+    /// [`Suspender`]).
+    pub fn suspender(&self) -> Suspender {
+        self.inner.lock().get_opaque().suspender()
+    }
+
+    /// Returns whether an execution is suspended (see [`Suspender`]).
+    pub fn is_suspended(&self) -> bool {
+        self.inner.lock().is_suspended()
+    }
+
+    /// Sets how TypeScript code compiled from now on compiles decorators (default
+    /// [`Decorators::Standard`]).
+    pub fn set_decorators(&self, decorators: Decorators) {
+        self.inner.lock().get_opaque().set_decorators(decorators)
+    }
+
+    /// Rebuilds the snapshot `base` (with the delta `delta` applied on top of it if any) in
+    /// this runtime, which must have no context. See [`snapshot`](crate::snapshot).
+    ///
+    /// # Errors
+    /// [`Error::Snapshot`](crate::Error::Snapshot) if the snapshot is invalid, comes from
+    /// another build of the program, uses other natives, or if the runtime is not empty.
+    /// The runtime cannot be used after an error.
+    pub fn read_snapshot(
+        &self,
+        host: &crate::snapshot::SnapshotHost,
+        base: &[u8],
+        delta: Option<&[u8]>,
+    ) -> Result<crate::snapshot::Restored> {
+        crate::snapshot::read(self, host, base, delta)
+    }
+
+    /// Detaches the base of the delta snapshots (see
+    /// [`SnapshotKind::Base`](crate::snapshot::SnapshotKind::Base)): its objects can be
+    /// garbage collected again.
+    pub fn drop_snapshot_base(&self) {
+        unsafe { qjs::JS_DropSnapshotBase(self.inner.lock().rt.as_ptr()) }
     }
 
     /// Set the module loader

@@ -99,6 +99,7 @@ impl RawRuntime {
 
         let opaque = Box::into_raw(Box::new(opaque));
         unsafe { qjs::JS_SetRuntimeOpaque(rt.as_ptr(), opaque as *mut _) };
+        Self::install_interrupt_handler(rt);
 
         Ok(RawRuntime {
             rt,
@@ -131,6 +132,7 @@ impl RawRuntime {
 
         let opaque = Box::into_raw(Box::new(opaque));
         unsafe { qjs::JS_SetRuntimeOpaque(rt.as_ptr(), opaque as *mut _) };
+        Self::install_interrupt_handler(rt);
 
         Ok(RawRuntime {
             rt,
@@ -335,8 +337,20 @@ impl RawRuntime {
     /// If the provided closure returns `true` the interpreter will raise and uncatchable
     /// exception and return control flow to the caller.
     pub unsafe fn set_interrupt_handler(&mut self, handler: Option<InterruptHandler>) {
+        self.get_opaque().set_interrupt_handler(handler);
+    }
+
+    /// TRUE if an execution is suspended (see [`Suspender`](super::Suspender)).
+    pub fn is_suspended(&self) -> bool {
+        unsafe { qjs::JS_IsSuspended(self.rt.as_ptr()) != 0 }
+    }
+
+    /// Installs the C interrupt handler (once the opaque is set): it runs the user interrupt
+    /// handler, then forwards the suspension requests of the
+    /// [`Suspender`](super::Suspender)s to the engine.
+    unsafe fn install_interrupt_handler(rt: NonNull<qjs::JSRuntime>) {
         unsafe extern "C" fn interrupt_handler_trampoline(
-            _rt: *mut qjs::JSRuntime,
+            rt: *mut qjs::JSRuntime,
             opaque: *mut ::core::ffi::c_void,
         ) -> ::core::ffi::c_int {
             // This should be safe as the value is set below to a non-null pointer.
@@ -357,22 +371,18 @@ impl RawRuntime {
                     }
                 }
             };
+            if opaque.as_ref().take_suspend_request() {
+                qjs::JS_RequestSuspend(rt);
+            }
 
             should_interrupt as _
         }
 
         qjs::JS_SetInterruptHandler(
-            self.rt.as_ptr(),
-            handler.as_ref().map(|_| interrupt_handler_trampoline as _),
-            qjs::JS_GetRuntimeOpaque(self.rt.as_ptr()),
+            rt.as_ptr(),
+            Some(interrupt_handler_trampoline),
+            qjs::JS_GetRuntimeOpaque(rt.as_ptr()),
         );
-        self.get_opaque().set_interrupt_handler(handler);
-    }
-
-    fn add_dump_flags(rt: *mut rquickjs_sys::JSRuntime) {
-        unsafe {
-            qjs::JS_SetDumpFlags(rt, build_dump_flags());
-        }
     }
 }
 

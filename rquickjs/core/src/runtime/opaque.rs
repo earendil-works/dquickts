@@ -8,7 +8,10 @@ use super::{
     userdata::{UserDataGuard, UserDataMap},
     InterruptHandler, PromiseHook, PromiseHookType, RejectionTracker, UserDataError,
 };
-use alloc::boxed::Box;
+use super::{Decorators, Suspender};
+use crate::snapshot::{BuiltinRequest, SnapshotHost};
+use alloc::{boxed::Box, sync::Arc};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::{
     any::{Any, TypeId},
     cell::{Cell, UnsafeCell},
@@ -45,6 +48,23 @@ pub(crate) struct Opaque<'js> {
     /// The user provided interrupt handler, if any.
     interrupt_handler: UnsafeCell<Option<InterruptHandler>>,
 
+    /// Set by [`Suspender::request`], polled by the interrupt handler trampoline.
+    suspend_request: Arc<AtomicBool>,
+
+    /// The natives of the [`SnapshotHost`] of this runtime, built on first use or restored from
+    /// a snapshot.
+    snapshot_natives: UnsafeCell<Option<(Object<'js>, SnapshotHost)>>,
+
+    /// The request of the snapshot builtin whose call is suspending the execution.
+    builtin_request: UnsafeCell<Option<BuiltinRequest>>,
+
+    /// The value the next [`Ctx::resume`](crate::Ctx::resume) gives to the suspended call
+    /// (see [`Restore::apply`](crate::snapshot::Restore::apply)).
+    resume_value: UnsafeCell<Option<Value<'js>>>,
+
+    /// How TypeScript sources compile decorators.
+    decorators: Cell<Decorators>,
+
     /// The class id for rust classes.
     class_id: qjs::JSClassID,
     /// The class id for rust classes which can be called.
@@ -74,6 +94,16 @@ impl<'js> Opaque<'js> {
             rejection_tracker: UnsafeCell::new(None),
 
             interrupt_handler: UnsafeCell::new(None),
+
+            suspend_request: Arc::new(AtomicBool::new(false)),
+
+            snapshot_natives: UnsafeCell::new(None),
+
+            builtin_request: UnsafeCell::new(None),
+
+            resume_value: UnsafeCell::new(None),
+
+            decorators: Cell::new(Decorators::Standard),
 
             class_id: qjs::JS_INVALID_CLASS_ID,
             callable_class_id: qjs::JS_INVALID_CLASS_ID,
@@ -242,7 +272,72 @@ impl<'js> Opaque<'js> {
     }
 
     pub fn run_interrupt_handler(&self) -> bool {
-        unsafe { (*self.interrupt_handler.get()).as_mut().unwrap()() }
+        unsafe {
+            (*self.interrupt_handler.get())
+                .as_mut()
+                .is_some_and(|h| h())
+        }
+    }
+
+    pub fn suspender(&self) -> Suspender {
+        Suspender(self.suspend_request.clone())
+    }
+
+    pub fn decorators(&self) -> Decorators {
+        self.decorators.get()
+    }
+
+    pub fn set_decorators(&self, decorators: Decorators) {
+        self.decorators.set(decorators);
+    }
+
+    pub fn take_suspend_request(&self) -> bool {
+        self.suspend_request.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn snapshot_natives(&self) -> Option<Object<'js>> {
+        unsafe {
+            (*self.snapshot_natives.get())
+                .as_ref()
+                .map(|(tree, _)| tree.clone())
+        }
+    }
+
+    pub fn snapshot_host(&self) -> Option<SnapshotHost> {
+        unsafe {
+            (*self.snapshot_natives.get())
+                .as_ref()
+                .map(|(_, host)| host.clone())
+        }
+    }
+
+    pub fn set_snapshot_natives(&self, natives: Option<(Object<'js>, SnapshotHost)>) {
+        unsafe { *self.snapshot_natives.get() = natives }
+    }
+
+    pub fn set_builtin_request(&self, request: Option<BuiltinRequest>) {
+        unsafe { *self.builtin_request.get() = request }
+    }
+
+    pub fn take_builtin_request(&self) -> Option<BuiltinRequest> {
+        unsafe { (*self.builtin_request.get()).take() }
+    }
+
+    pub fn set_resume_value(&self, value: Option<Value<'js>>) {
+        unsafe { *self.resume_value.get() = value }
+    }
+
+    pub fn take_resume_value(&self) -> Option<Value<'js>> {
+        unsafe { (*self.resume_value.get()).take() }
+    }
+
+    /// Replaces the cached prototypes of the Rust classes.
+    pub fn reset_prototypes(&self, prototypes: impl IntoIterator<Item = (TypeId, Object<'js>)>) {
+        unsafe {
+            let map = &mut *self.prototypes.get();
+            map.clear();
+            map.extend(prototypes.into_iter().map(|(id, proto)| (id, Some(proto))));
+        }
     }
 
     #[allow(dead_code)] // not used in no_std

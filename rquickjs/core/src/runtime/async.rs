@@ -13,8 +13,8 @@ use std::sync::mpsc::{self, Sender};
 use async_lock::Mutex;
 
 use super::{
-    opaque::Opaque, raw::RawRuntime, schedular::SchedularPoll, spawner::DriveFuture,
-    InterruptHandler, MemoryUsage, PromiseHook, RejectionTracker,
+    opaque::Opaque, raw::RawRuntime, schedular::SchedularPoll, spawner::DriveFuture, Decorators,
+    InterruptHandler, MemoryUsage, PromiseHook, RejectionTracker, Suspender,
 };
 use crate::allocator::Allocator;
 #[cfg(feature = "loader")]
@@ -178,6 +178,28 @@ impl AsyncRuntime {
                 .runtime
                 .set_interrupt_handler(handler);
         }
+    }
+
+    /// Returns a handle which suspends the running JavaScript of this runtime (see
+    /// [`Suspender`]).
+    pub async fn suspender(&self) -> Suspender {
+        self.inner.lock().await.runtime.get_opaque().suspender()
+    }
+
+    /// Returns whether an execution is suspended (see [`Suspender`]).
+    pub async fn is_suspended(&self) -> bool {
+        self.inner.lock().await.runtime.is_suspended()
+    }
+
+    /// Sets how TypeScript code compiled from now on compiles decorators (default
+    /// [`Decorators::Standard`]).
+    pub async fn set_decorators(&self, decorators: Decorators) {
+        self.inner
+            .lock()
+            .await
+            .runtime
+            .get_opaque()
+            .set_decorators(decorators)
     }
 
     /// Set the module loader
