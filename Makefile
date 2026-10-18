@@ -484,6 +484,10 @@ ifdef CONFIG_TEMPORAL_INTL
 	$(WINE) ./qjs$(EXE) --experimental tests/test_intl.js
 endif
 
+# suspension and heap snapshots (see tests/snapshot/Makefile)
+test-snapshot:
+	$(MAKE) -C tests/snapshot check
+
 stats: qjs$(EXE)
 	$(WINE) ./qjs$(EXE) -qd
 

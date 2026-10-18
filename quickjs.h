@@ -1118,6 +1118,109 @@ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
    returns a module. */
 int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
 
+/* Heap snapshots
+
+   JS_WriteSnapshot() serializes the complete state of a runtime: every
+   context, object, closure, suspended async function or generator, the
+   pending jobs and, when JS_IsSuspended(), the suspended call stack.
+   JS_ReadSnapshot() rebuilds that state in a fresh runtime of the same
+   engine build, in any process.
+
+   Code pointers stored in the heap are encoded through a registry made of
+   the engine builtins and the host natives listed in JSSnapshotHost. The
+   host must give the same natives in the same order when reading.
+
+   Incremental snapshots: a full snapshot written with JS_SNAPSHOT_BASE
+   becomes the base of the runtime (e.g. once the host natives are set
+   up and the application script has run). A snapshot written later with
+   JS_SNAPSHOT_DELTA only contains what differs from the base: the cells
+   (objects, closure variables, frames...) that were modified or created
+   since, their new strings and atoms, and the roots. JS_ReadSnapshot()
+   applies a delta on top of its base. A runtime restored from a base
+   (with or without a delta) has that base attached, so its next deltas
+   are relative to the same base. Deltas are not chained: each one only
+   needs the base.
+
+   While a base is attached, the runtime references every cell, string
+   and atom of the base so that they keep their identity: they are not
+   garbage collected (weak references to them never become empty) until
+   JS_DropSnapshotBase() or JS_FreeRuntime().
+
+   ArrayBuffer data is always restored into engine-owned memory (host
+   buffers are copied and their free function is not kept).
+
+   Unsupported (JS_WriteSnapshot() fails with a TypeError): host-class
+   objects with opaque data when no save_opaque hook is given, contexts
+   with the Intl or Temporal intrinsics, SharedArrayBuffers whose memory may be
+   shared (host SharedArrayBuffer allocator or host memory), and JS code
+   running on the C stack (snapshots are taken between jobs or while
+   suspended).
+
+   Like bytecode, a snapshot is trusted input: JS_ReadSnapshot() detects
+   truncated or mismatched snapshots but not malicious ones. */
+
+struct JSCFunctionListEntry;
+
+typedef struct JSSnapshotHost {
+    /* host code pointers that can be stored in the heap: C functions
+       given to JS_NewCFunction*(), JSCFunctionData callbacks, job
+       functions, C module init functions */
+    const void * const *natives;
+    int native_count;
+    /* host function lists given to JS_SetPropertyFunctionList(): lazily
+       instantiated properties keep a pointer to their entry */
+    const struct JSCFunctionListEntry * const *func_lists;
+    const int *func_list_lens;
+    int func_list_count;
+    /* Host classes (class_id >= JS_CLASS_INIT_COUNT) with opaque data.
+       save_opaque() returns a JS value describing the opaque data of 'obj'
+       (JS_UNDEFINED if none) or JS_EXCEPTION. load_opaque() is called once
+       the whole heap is rebuilt and must attach the opaque data with
+       JS_SetOpaque(); it returns < 0 and throws on error. */
+    JSValue (*save_opaque)(JSContext *ctx, JSValueConst obj, void *opaque);
+    int (*load_opaque)(JSContext *ctx, JSValueConst obj, JSValueConst saved,
+                       void *opaque);
+    void *opaque;
+} JSSnapshotHost;
+
+/* full snapshot that becomes the base of the runtime (replacing the
+   previous base) */
+#define JS_SNAPSHOT_BASE  (1 << 0)
+/* only the differences with the base of the runtime */
+#define JS_SNAPSHOT_DELTA (1 << 1)
+
+/* Serialize the runtime of 'ctx' ('flags' is 0 for a self-contained
+   snapshot, or one of JS_SNAPSHOT_x). 'roots' are values held by the host
+   that JS_ReadSnapshot() hands back in the same order. Return a buffer to
+   free with js_free(), or NULL with a pending exception. */
+uint8_t *JS_WriteSnapshot(JSContext *ctx, size_t *psize,
+                          const JSSnapshotHost *host,
+                          JSValueConst *roots, int root_count, int flags);
+
+typedef struct JSSnapshotResult {
+    /* contexts in creation order; the host owns one reference to each */
+    JSContext **contexts;
+    int context_count;
+    /* the 'roots' given to JS_WriteSnapshot(); owned by the host */
+    JSValue *roots;
+    int root_count;
+} JSSnapshotResult;
+
+/* Rebuild a full snapshot 'buf', with the delta 'delta' applied on top
+   of it if not NULL ('buf' must then be its base), into 'rt', a runtime
+   without contexts on which the host registered the same classes as
+   when writing. Return 0 on success, or -1 with a message in 'errbuf';
+   the runtime must then be freed. */
+int JS_ReadSnapshot(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
+                    const uint8_t *delta, size_t delta_len,
+                    const JSSnapshotHost *host, JSSnapshotResult *res,
+                    char *errbuf, size_t errbuf_size);
+/* Detach the base of the incremental snapshots (if any): the cells of
+   the base can be garbage collected again. */
+void JS_DropSnapshotBase(JSRuntime *rt);
+/* free the arrays of 'res' (not the contexts and values it references) */
+void JS_FreeSnapshotResult(JSRuntime *rt, JSSnapshotResult *res);
+
 /* only exported for os.Worker() */
 JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels);
 /* only exported for os.Worker() */

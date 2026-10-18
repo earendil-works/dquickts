@@ -162,6 +162,7 @@ cp Makefile VERSION TODO Changelog readme.txt LICENSE \
    release.sh unicode_download.sh \
    qjs.c qjsc.c repl.js \
    quickjs.c quickjs.h quickjs-atom.h \
+   quickjs-snapshot.c quickjs-snapshot-data.c quickjs-snapshot-control.c \
    quickjs-libc.c quickjs-libc.h quickjs-opcode.h \
    cutils.c cutils.h list.h \
    libregexp.c libregexp.h libregexp-opcode.h \
@@ -173,6 +174,9 @@ cp Makefile VERSION TODO Changelog readme.txt LICENSE \
    $outdir
 
 cp tests/*.js tests/*.patch tests/bjson.c $outdir/tests
+mkdir -p $outdir/tests/snapshot
+cp -R tests/snapshot/Makefile tests/snapshot/*.c tests/snapshot/*.sh \
+   tests/snapshot/js $outdir/tests/snapshot
 
 cp examples/*.js examples/*.c examples/*.json $outdir/examples
 

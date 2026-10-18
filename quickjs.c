@@ -417,6 +417,9 @@ struct JSRuntime {
     int shape_hash_size;
     int shape_hash_count; /* number of hashed shapes */
     JSShape **shape_hash;
+    /* base of the incremental snapshots (JS_SNAPSHOT_BASE), NULL if none.
+       It references every cell, atom and string of the base. */
+    struct JSSnapshotBase *snapshot_base;
     void *user_opaque;
 };
 
@@ -38573,6 +38576,7 @@ typedef struct BCWriterState {
     BOOL allow_bytecode : 8;
     BOOL allow_sab : 8;
     BOOL allow_reference : 8;
+    BOOL is_snapshot : 8; /* values are encoded by snap_put_value_hook() */
     uint32_t first_atom;
     uint32_t *atom_to_idx;
     int atom_to_idx_size;
@@ -38885,6 +38889,7 @@ static int JS_WriteBigInt(BCWriterState *s, JSValueConst obj)
 }
 
 static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj);
+static int snap_put_value_hook(BCWriterState *s, JSValueConst val);
 
 static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
 {
@@ -39200,6 +39205,8 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
         JS_ThrowStackOverflow(s->ctx);
         return -1;
     }
+    if (s->is_snapshot)
+        return snap_put_value_hook(s, obj);
 
     tag = JS_VALUE_GET_NORM_TAG(obj);
     switch(tag) {
@@ -39431,6 +39438,7 @@ typedef struct BCReaderState {
     BOOL allow_bytecode : 8;
     BOOL is_rom_data : 8;
     BOOL allow_reference : 8;
+    BOOL is_snapshot : 8; /* values are decoded by snap_get_value_hook() */
     /* object references */
     JSObject **objects;
     int objects_count;
@@ -39675,8 +39683,11 @@ static uint32_t bc_get_flags(uint32_t flags, int *pidx, int n)
     return val;
 }
 
+/* read the bytecode into b->byte_code_buf (allocated by
+   js_alloc_function_bytecode()) or point to the input buffer if it is
+   ROM data */
 static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
-                                   int byte_code_offset, uint32_t bc_len)
+                                   uint32_t bc_len)
 {
     uint8_t *bc_buf;
     int pos, len, op;
@@ -39690,7 +39701,7 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
         bc_buf = (uint8_t *)s->ptr;
         s->ptr += bc_len;
     } else {
-        bc_buf = (void *)((uint8_t*)b + byte_code_offset);
+        bc_buf = b->byte_code_buf;
         if (bc_get_buf(s, bc_buf, bc_len))
             return -1;
     }
@@ -39786,6 +39797,7 @@ static JSValue JS_ReadBigInt(BCReaderState *s)
 }
 
 static JSValue JS_ReadObjectRec(BCReaderState *s);
+static JSValue snap_get_value_hook(BCReaderState *s);
 
 static int BC_add_object_ref1(BCReaderState *s, JSObject *p)
 {
@@ -39804,83 +39816,96 @@ static int BC_add_object_ref(BCReaderState *s, JSValueConst obj)
     return BC_add_object_ref1(s, JS_VALUE_GET_OBJ(obj));
 }
 
-static JSValue JS_ReadFunctionTag(BCReaderState *s)
+/* Read the flags, name and sizes of a function bytecode into 'bc'.
+   bc->func_name is a new atom reference (JS_ATOM_NULL if not read). */
+static int JS_ReadFunctionHeader(BCReaderState *s, JSFunctionBytecode *bc,
+                                 int *plocal_count)
 {
-    JSContext *ctx = s->ctx;
-    JSFunctionBytecode bc, *b;
-    JSValue obj = JS_UNDEFINED;
     uint16_t v16;
     uint8_t v8;
-    int idx, i, local_count;
+    int idx;
+
+    memset(bc, 0, sizeof(*bc));
+    if (bc_get_u16(s, &v16))
+        return -1;
+    idx = 0;
+    bc->has_prototype = bc_get_flags(v16, &idx, 1);
+    bc->has_simple_parameter_list = bc_get_flags(v16, &idx, 1);
+    bc->is_derived_class_constructor = bc_get_flags(v16, &idx, 1);
+    bc->need_home_object = bc_get_flags(v16, &idx, 1);
+    bc->func_kind = bc_get_flags(v16, &idx, 2);
+    bc->new_target_allowed = bc_get_flags(v16, &idx, 1);
+    bc->super_call_allowed = bc_get_flags(v16, &idx, 1);
+    bc->super_allowed = bc_get_flags(v16, &idx, 1);
+    bc->arguments_allowed = bc_get_flags(v16, &idx, 1);
+    bc->has_debug = bc_get_flags(v16, &idx, 1);
+    bc->is_direct_or_indirect_eval = bc_get_flags(v16, &idx, 1);
+    bc->read_only_bytecode = s->is_rom_data;
+    if (bc_get_u8(s, &v8))
+        return -1;
+    bc->js_mode = v8;
+    if (bc_get_atom(s, &bc->func_name) ||
+        bc_get_leb128_u16(s, &bc->arg_count) ||
+        bc_get_leb128_u16(s, &bc->var_count) ||
+        bc_get_leb128_u16(s, &bc->defined_arg_count) ||
+        bc_get_leb128_u16(s, &bc->stack_size) ||
+        bc_get_leb128_u16(s, &bc->var_ref_count) ||
+        bc_get_leb128_int(s, &bc->closure_var_count) ||
+        bc_get_leb128_int(s, &bc->cpool_count) ||
+        bc_get_leb128_int(s, &bc->byte_code_len) ||
+        bc_get_leb128_int(s, plocal_count))
+        return -1;
+    /* the variable definitions are absent or describe all the
+       arguments and variables */
+    if (*plocal_count != 0 &&
+        *plocal_count != bc->arg_count + bc->var_count) {
+        JS_ThrowSyntaxError(s->ctx, "bad function object");
+        return -1;
+    }
+    return 0;
+}
+
+/* Allocate a zeroed function bytecode whose arrays (constant pool,
+   variables, closure variables and bytecode unless it is ROM data) are
+   sized by the counts of 'bc'. The fields of 'bc' before 'debug' are
+   copied: the reference to bc->func_name is transferred. Also used by
+   JS_ReadSnapshot(), which allocates every bytecode before reading it. */
+static JSFunctionBytecode *js_alloc_function_bytecode(JSContext *ctx,
+                                                      const JSFunctionBytecode *bc,
+                                                      int local_count)
+{
+    JSFunctionBytecode *b;
     int cpool_offset, byte_code_offset;
     int closure_var_offset, vardefs_offset;
     uint64_t function_size;
-    
-    memset(&bc, 0, sizeof(bc));
 
-    if (bc_get_u16(s, &v16))
-        goto fail;
-    idx = 0;
-    bc.has_prototype = bc_get_flags(v16, &idx, 1);
-    bc.has_simple_parameter_list = bc_get_flags(v16, &idx, 1);
-    bc.is_derived_class_constructor = bc_get_flags(v16, &idx, 1);
-    bc.need_home_object = bc_get_flags(v16, &idx, 1);
-    bc.func_kind = bc_get_flags(v16, &idx, 2);
-    bc.new_target_allowed = bc_get_flags(v16, &idx, 1);
-    bc.super_call_allowed = bc_get_flags(v16, &idx, 1);
-    bc.super_allowed = bc_get_flags(v16, &idx, 1);
-    bc.arguments_allowed = bc_get_flags(v16, &idx, 1);
-    bc.has_debug = bc_get_flags(v16, &idx, 1);
-    bc.is_direct_or_indirect_eval = bc_get_flags(v16, &idx, 1);
-    bc.read_only_bytecode = s->is_rom_data;
-    if (bc_get_u8(s, &v8))
-        goto fail;
-    bc.js_mode = v8;
-    if (bc_get_atom(s, &bc.func_name))  //@ atom leak if failure
-        goto fail;
-    if (bc_get_leb128_u16(s, &bc.arg_count))
-        goto fail;
-    if (bc_get_leb128_u16(s, &bc.var_count))
-        goto fail;
-    if (bc_get_leb128_u16(s, &bc.defined_arg_count))
-        goto fail;
-    if (bc_get_leb128_u16(s, &bc.stack_size))
-        goto fail;
-    if (bc_get_leb128_u16(s, &bc.var_ref_count))
-        goto fail;
-    if (bc_get_leb128_int(s, &bc.closure_var_count))
-        goto fail;
-    if (bc_get_leb128_int(s, &bc.cpool_count))
-        goto fail;
-    if (bc_get_leb128_int(s, &bc.byte_code_len))
-        goto fail;
-    if (bc_get_leb128_int(s, &local_count))
-        goto fail;
-
-    if (bc.has_debug) {
+    if (bc->has_debug) {
         function_size = sizeof(*b);
     } else {
         function_size = offsetof(JSFunctionBytecode, debug);
     }
-    cpool_offset = function_size;
-    function_size += (uint64_t)bc.cpool_count * sizeof(*bc.cpool);
+    /* JSValue alignment for strict-alignment platforms */
+    cpool_offset = (function_size + 7) & ~7;
+    function_size = cpool_offset + (uint64_t)bc->cpool_count * sizeof(*bc->cpool);
     vardefs_offset = function_size;
-    function_size += (uint64_t)local_count * sizeof(*bc.vardefs);
+    function_size += (uint64_t)local_count * sizeof(*bc->vardefs);
     closure_var_offset = function_size;
-    function_size += (uint64_t)bc.closure_var_count * sizeof(*bc.closure_var);
+    function_size += (uint64_t)bc->closure_var_count * sizeof(*bc->closure_var);
     byte_code_offset = function_size;
-    if (!bc.read_only_bytecode) {
-        function_size += bc.byte_code_len;
+    if (!bc->read_only_bytecode) {
+        function_size += bc->byte_code_len;
     }
 
-    if (function_size > INT32_MAX)
-        return JS_ThrowOutOfMemory(ctx);
+    if (function_size > INT32_MAX) {
+        JS_ThrowOutOfMemory(ctx);
+        return NULL;
+    }
 
     b = js_mallocz(ctx, function_size);
     if (!b)
-        return JS_EXCEPTION;
+        return NULL;
 
-    memcpy(b, &bc, offsetof(JSFunctionBytecode, debug));
+    memcpy(b, bc, offsetof(JSFunctionBytecode, debug));
     if (local_count != 0) {
         b->vardefs = (void *)((uint8_t*)b + vardefs_offset);
     }
@@ -39890,11 +39915,25 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     if (b->cpool_count != 0) {
         b->cpool = (void *)((uint8_t*)b + cpool_offset);
     }
+    if (!b->read_only_bytecode) {
+        b->byte_code_buf = (uint8_t*)b + byte_code_offset;
+    }
 
     js_rc(b)->ref_count = 1;
     add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
+    return b;
+}
 
-    obj = JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b);
+/* Read the variables, closure variables, bytecode, debug information
+   and constant pool of 'b', allocated by js_alloc_function_bytecode().
+   On error, 'b' can be freed. */
+static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
+                               int local_count)
+{
+    JSContext *ctx = s->ctx;
+    uint16_t v16;
+    uint8_t v8;
+    int idx, i;
 
 #ifdef DUMP_READ_OBJECT
     bc_read_trace(s, "name: "); print_atom(s->ctx, b->func_name); printf("\n");
@@ -39955,7 +39994,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     }
     {
         bc_read_trace(s, "bytecode {\n");
-        if (JS_ReadFunctionBytecode(s, b, byte_code_offset, b->byte_code_len))
+        if (JS_ReadFunctionBytecode(s, b, b->byte_code_len))
             goto fail;
         bc_read_trace(s, "}\n");
     }
@@ -39999,10 +40038,32 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         }
         bc_read_trace(s, "}\n");
     }
+    return 0;
+ fail:
+    return -1;
+}
+
+static JSValue JS_ReadFunctionTag(BCReaderState *s)
+{
+    JSContext *ctx = s->ctx;
+    JSFunctionBytecode bc, *b;
+    JSValue obj;
+    int local_count;
+
+    if (JS_ReadFunctionHeader(s, &bc, &local_count))
+        goto fail;
+    b = js_alloc_function_bytecode(ctx, &bc, local_count);
+    if (!b)
+        goto fail;
+    obj = JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b);
+    if (JS_ReadFunctionBody(s, b, local_count)) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     b->realm = JS_DupContext(ctx);
     return obj;
  fail:
-    JS_FreeValue(ctx, obj);
+    JS_FreeAtom(ctx, bc.func_name); /* not owned by a bytecode */
     return JS_EXCEPTION;
 }
 
@@ -40380,6 +40441,8 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
 
     if (js_check_stack_overflow(ctx->rt, 0))
         return JS_ThrowStackOverflow(ctx);
+    if (s->is_snapshot)
+        return snap_get_value_hook(s);
 
     if (bc_get_u8(s, &tag))
         return JS_EXCEPTION;
@@ -54109,11 +54172,9 @@ static const JSClassShortDef js_proxy_class_def[] = {
     { JS_ATOM_Object, js_proxy_finalizer, js_proxy_mark }, /* JS_CLASS_PROXY */
 };
 
-int JS_AddIntrinsicProxy(JSContext *ctx)
+/* register the Proxy class (idempotent). Also used by JS_ReadSnapshot(). */
+static int js_init_proxy_class(JSRuntime *rt)
 {
-    JSRuntime *rt = ctx->rt;
-    JSValue obj1;
-
     if (!JS_IsRegisteredClass(rt, JS_CLASS_PROXY)) {
         if (init_class_range(rt, js_proxy_class_def, JS_CLASS_PROXY,
                              countof(js_proxy_class_def)))
@@ -54121,6 +54182,16 @@ int JS_AddIntrinsicProxy(JSContext *ctx)
         rt->class_array[JS_CLASS_PROXY].exotic = &js_proxy_exotic_methods;
         rt->class_array[JS_CLASS_PROXY].call = js_proxy_call;
     }
+    return 0;
+}
+
+int JS_AddIntrinsicProxy(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue obj1;
+
+    if (js_init_proxy_class(rt))
+        return -1;
 
     /* additional fields: name, length */
     obj1 = JS_NewCFunction3(ctx, js_proxy_constructor, "Proxy", 2,
@@ -57542,12 +57613,10 @@ static JSClassShortDef const js_async_class_def[] = {
     { JS_ATOM_AsyncGenerator, js_async_generator_finalizer, js_async_generator_mark },  /* JS_CLASS_ASYNC_GENERATOR */
 };
 
-int JS_AddIntrinsicPromise(JSContext *ctx)
+/* register the Promise and async function classes (idempotent). Also
+   used by JS_ReadSnapshot(). */
+static int js_init_async_classes(JSRuntime *rt)
 {
-    JSRuntime *rt = ctx->rt;
-    JSValue obj1;
-    JSCFunctionType ft;
-
     if (!JS_IsRegisteredClass(rt, JS_CLASS_PROMISE)) {
         if (init_class_range(rt, js_async_class_def, JS_CLASS_PROMISE,
                              countof(js_async_class_def)))
@@ -57559,6 +57628,17 @@ int JS_AddIntrinsicPromise(JSContext *ctx)
         rt->class_array[JS_CLASS_ASYNC_FUNCTION_REJECT].call = js_async_function_resolve_call;
         rt->class_array[JS_CLASS_ASYNC_GENERATOR_FUNCTION].call = js_async_generator_function_call;
     }
+    return 0;
+}
+
+int JS_AddIntrinsicPromise(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue obj1;
+    JSCFunctionType ft;
+
+    if (js_init_async_classes(rt))
+        return -1;
 
     /* Promise */
     obj1 = JS_NewCConstructor(ctx, JS_CLASS_PROMISE, "Promise",
@@ -64347,17 +64427,31 @@ static const JSClassShortDef js_finrec_class_def[] = {
     { JS_ATOM_FinalizationRegistry, js_finrec_finalizer, js_finrec_mark }, /* JS_CLASS_FINALIZATION_REGISTRY */
 };
 
-int JS_AddIntrinsicWeakRef(JSContext *ctx)
+/* register the WeakRef and FinalizationRegistry classes (idempotent).
+   Also used by JS_ReadSnapshot(). */
+static int js_init_weakref_classes(JSRuntime *rt)
 {
-    JSRuntime *rt = ctx->rt;
-    JSValue obj;
-    
-    /* WeakRef */
     if (!JS_IsRegisteredClass(rt, JS_CLASS_WEAK_REF)) {
         if (init_class_range(rt, js_weakref_class_def, JS_CLASS_WEAK_REF,
                              countof(js_weakref_class_def)))
             return -1;
     }
+    if (!JS_IsRegisteredClass(rt, JS_CLASS_FINALIZATION_REGISTRY)) {
+        if (init_class_range(rt, js_finrec_class_def, JS_CLASS_FINALIZATION_REGISTRY,
+                             countof(js_finrec_class_def)))
+            return -1;
+    }
+    return 0;
+}
+
+int JS_AddIntrinsicWeakRef(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue obj;
+    
+    if (js_init_weakref_classes(rt))
+        return -1;
+    /* WeakRef */
     obj = JS_NewCConstructor(ctx, JS_CLASS_WEAK_REF, "WeakRef",
                              js_weakref_constructor, 1, JS_CFUNC_constructor_or_func, 0,
                              JS_UNDEFINED,
@@ -64369,12 +64463,6 @@ int JS_AddIntrinsicWeakRef(JSContext *ctx)
     JS_FreeValue(ctx, obj);
 
     /* FinalizationRegistry */
-    if (!JS_IsRegisteredClass(rt, JS_CLASS_FINALIZATION_REGISTRY)) {
-        if (init_class_range(rt, js_finrec_class_def, JS_CLASS_FINALIZATION_REGISTRY,
-                             countof(js_finrec_class_def)))
-            return -1;
-    }
-
     obj = JS_NewCConstructor(ctx, JS_CLASS_FINALIZATION_REGISTRY, "FinalizationRegistry",
                              js_finrec_constructor, 1, JS_CFUNC_constructor_or_func, 0,
                              JS_UNDEFINED,

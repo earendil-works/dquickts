@@ -1,5 +1,6 @@
 *.a
 .obj/
+tests/snapshot/build*/
 tests/bjson.so
 examples/test_fib
 test_fib.c
