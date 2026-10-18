@@ -1108,6 +1108,8 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
     BOOL legacy_decorators, decorator_metadata;
     int flags;
 
+    legacy_decorators = (ts->ts_eval_flags & JS_EVAL_FLAG_TS_LEGACY_DECORATORS) != 0;
+    decorator_metadata = (ts->ts_eval_flags & JS_EVAL_FLAG_TS_DECORATOR_METADATA) != 0;
     if (argc >= 2) {
         options_obj = argv[1];
         if (get_bool_option(ctx, &backtrace_barrier, options_obj,
@@ -3845,6 +3847,7 @@ typedef struct {
     char *basename; /* module base name */
     JSWorkerMessagePipe *recv_pipe, *send_pipe;
     int strip_flags;
+    int ts_eval_flags;
 } WorkerFuncArgs;
 
 typedef struct {
@@ -4009,6 +4012,7 @@ static void *worker_func(void *opaque)
     ts = JS_GetRuntimeOpaque(rt);
     ts->recv_pipe = args->recv_pipe;
     ts->send_pipe = args->send_pipe;
+    ts->ts_eval_flags = args->ts_eval_flags;
 
     /* function pointer to avoid linking the whole JS_NewContext() if
        not needed */
@@ -4120,6 +4124,7 @@ static JSValue js_worker_ctor(JSContext *ctx, JSValueConst new_target,
         goto oom_fail;
 
     args->strip_flags = JS_GetStripInfo(rt);
+    args->ts_eval_flags = ((JSThreadState *)JS_GetRuntimeOpaque(rt))->ts_eval_flags;
     
     obj = js_worker_ctor_internal(ctx, new_target,
                                   args->send_pipe, args->recv_pipe);

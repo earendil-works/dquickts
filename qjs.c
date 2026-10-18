@@ -557,6 +557,7 @@ int main(int argc, char **argv)
     JS_SetStripInfo(rt, strip_flags);
     js_std_set_worker_new_context_func(JS_NewCustomContext);
     js_std_init_handlers(rt);
+    js_std_set_typescript_flags(rt, ts_flags);
     ctx = JS_NewCustomContext(rt);
     if (!ctx) {
         fprintf(stderr, "qjs: cannot allocate JS context\n");
