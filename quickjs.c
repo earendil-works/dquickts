@@ -2198,6 +2198,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     if (!rt)
         return NULL;
     memset(rt, 0, sizeof(*rt));
+    rt->resume_value = JS_UNDEFINED;
     js_malloc_init(&rt->malloc_ctx);
     rt->malloc_ctx.mf = *mf;
     rt->malloc_ctx.malloc_state = ms;
@@ -7759,11 +7760,27 @@ static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop
 
 #define JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL (1 << 0)
 
-/* if filename != NULL, an additional level is added with the filename
-   and line number information (used for parse error). */
-static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
-                            const char *filename, int line_num, int col_num,
-                            int backtrace_flags)
+/* default value of Error.stackTraceLimit (same as V8) */
+#define JS_DEFAULT_STACK_TRACE_LIMIT 10
+
+/* stack frame given to Error.prepareStackTrace() (JS_CLASS_CALL_SITE) */
+typedef struct JSCallSiteData {
+    JSValue filename; /* string, null if no source position */
+    JSValue func; /* null for the parse error position */
+    JSValue func_name; /* string, null if anonymous */
+    int line_num; /* 0 if no source position */
+    int col_num;
+    BOOL native : 8; /* C function */
+    BOOL constructor : 8; /* called with new */
+} JSCallSiteData;
+
+static inline JSStackFrame *js_host_callback_enter(JSRuntime *rt);
+static inline void js_host_callback_leave(JSRuntime *rt,
+                                          JSStackFrame *saved_caller);
+
+/* Return a data property of the Error constructor of the realm without
+   running JS code (like V8): the stack trace configuration. */
+static JSValueConst js_get_error_ctor_data(JSContext *ctx, JSAtom prop)
 {
     JSStackFrame *sf;
     JSValue str;
@@ -8115,7 +8132,10 @@ static __exception int js_call_interrupt_handler(JSContext *ctx)
     JSRuntime *rt = ctx->rt;
     ctx->interrupt_counter = JS_INTERRUPT_COUNTER_INIT;
     if (rt->interrupt_handler) {
-        if (rt->interrupt_handler(rt, rt->interrupt_opaque)) {
+        JSStackFrame *saved_caller = js_host_callback_enter(rt);
+        int interrupted = rt->interrupt_handler(rt, rt->interrupt_opaque);
+        js_host_callback_leave(rt, saved_caller);
+        if (interrupted) {
             JS_ThrowInterrupted(ctx);
             return -1;
         }
@@ -8204,7 +8224,9 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
         const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
         int ret;
         if (em && em->set_prototype) {
+            JSStackFrame *saved_caller = js_host_callback_enter(ctx->rt);
             ret = em->set_prototype(ctx, obj, proto_val);
+            js_host_callback_leave(ctx->rt, saved_caller);
             if (ret == 0 && throw_flag) {
                 JS_ThrowTypeError(ctx, "proxy: bad prototype");
                 return -1;
@@ -8309,7 +8331,10 @@ JSValue JS_GetPrototype(JSContext *ctx, JSValueConst obj)
         if (unlikely(p->is_exotic)) {
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
             if (em && em->get_prototype) {
-                return em->get_prototype(ctx, obj);
+                JSStackFrame *saved_caller = js_host_callback_enter(ctx->rt);
+                val = em->get_prototype(ctx, obj);
+                js_host_callback_leave(ctx->rt, saved_caller);
+                return val;
             }
         }
         p = p->shape->proto;
@@ -8599,8 +8624,11 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                         /* XXX: should pass throw_ref_error */
                         /* Note: if 'p' is a prototype, it can be
                            freed in the called function */
+                        JSStackFrame *saved_caller;
                         obj1 = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+                        saved_caller = js_host_callback_enter(ctx->rt);
                         retval = em->get_property(ctx, obj1, prop, this_obj);
+                        js_host_callback_leave(ctx->rt, saved_caller);
                         JS_FreeValue(ctx, obj1);
                         return retval;
                     }
@@ -8611,8 +8639,11 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
 
                         /* Note: if 'p' is a prototype, it can be
                            freed in the called function */
+                        JSStackFrame *saved_caller;
                         obj1 = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+                        saved_caller = js_host_callback_enter(ctx->rt);
                         ret = em->get_own_property(ctx, &desc, obj1, prop);
+                        js_host_callback_leave(ctx->rt, saved_caller);
                         JS_FreeValue(ctx, obj1);
                         if (ret < 0)
                             return JS_EXCEPTION;
@@ -8939,8 +8970,11 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
         } else {
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
             if (em && em->get_own_property_names) {
-                if (em->get_own_property_names(ctx, &tab_exotic, &exotic_count,
-                                               JS_MKPTR(JS_TAG_OBJECT, p)))
+                JSStackFrame *saved_caller = js_host_callback_enter(ctx->rt);
+                int res = em->get_own_property_names(ctx, &tab_exotic, &exotic_count,
+                                                     JS_MKPTR(JS_TAG_OBJECT, p));
+                js_host_callback_leave(ctx->rt, saved_caller);
+                if (res)
                     return -1;
                 for(i = 0; i < exotic_count; i++) {
                     atom = tab_exotic[i].atom;
@@ -9160,8 +9194,11 @@ retry:
         } else {
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
             if (em && em->get_own_property) {
-                return em->get_own_property(ctx, desc,
-                                            JS_MKPTR(JS_TAG_OBJECT, p), prop);
+                JSStackFrame *saved_caller = js_host_callback_enter(ctx->rt);
+                int ret = em->get_own_property(ctx, desc,
+                                               JS_MKPTR(JS_TAG_OBJECT, p), prop);
+                js_host_callback_leave(ctx->rt, saved_caller);
+                return ret;
             }
         }
     }
@@ -9189,7 +9226,10 @@ int JS_IsExtensible(JSContext *ctx, JSValueConst obj)
     if (unlikely(p->is_exotic)) {
         const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
         if (em && em->is_extensible) {
-            return em->is_extensible(ctx, obj);
+            JSStackFrame *saved_caller = js_host_callback_enter(ctx->rt);
+            int ret = em->is_extensible(ctx, obj);
+            js_host_callback_leave(ctx->rt, saved_caller);
+            return ret;
         }
     }
     return p->extensible;
@@ -9217,7 +9257,10 @@ int JS_PreventExtensions(JSContext *ctx, JSValueConst obj)
         } else {
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
             if (em && em->prevent_extensions) {
-                return em->prevent_extensions(ctx, obj);
+                JSStackFrame *saved_caller = js_host_callback_enter(ctx->rt);
+                int ret = em->prevent_extensions(ctx, obj);
+                js_host_callback_leave(ctx->rt, saved_caller);
+                return ret;
             }
         }
     }
@@ -9240,8 +9283,11 @@ int JS_HasProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
             if (em && em->has_property) {
                 /* has_property can free the prototype */
+                JSStackFrame *saved_caller;
                 obj1 = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+                saved_caller = js_host_callback_enter(ctx->rt);
                 ret = em->has_property(ctx, obj1, prop);
+                js_host_callback_leave(ctx->rt, saved_caller);
                 JS_FreeValue(ctx, obj1);
                 return ret;
             }
@@ -9672,7 +9718,10 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
         } else {
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
             if (em && em->delete_property) {
-                return em->delete_property(ctx, JS_MKPTR(JS_TAG_OBJECT, p), atom);
+                JSStackFrame *saved_caller = js_host_callback_enter(ctx->rt);
+                int ret = em->delete_property(ctx, JS_MKPTR(JS_TAG_OBJECT, p), atom);
+                js_host_callback_leave(ctx->rt, saved_caller);
+                return ret;
             }
         }
     }
@@ -10060,18 +10109,24 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                     JSValue obj1;
                     if (em->set_property) {
                         /* set_property can free the prototype */
+                        JSStackFrame *saved_caller;
                         obj1 = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p1));
+                        saved_caller = js_host_callback_enter(ctx->rt);
                         ret = em->set_property(ctx, obj1, prop,
                                                val, this_obj, flags);
+                        js_host_callback_leave(ctx->rt, saved_caller);
                         JS_FreeValue(ctx, obj1);
                         JS_FreeValue(ctx, val);
                         return ret;
                     }
                     if (em->get_own_property) {
                         /* get_own_property can free the prototype */
+                        JSStackFrame *saved_caller;
                         obj1 = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p1));
+                        saved_caller = js_host_callback_enter(ctx->rt);
                         ret = em->get_own_property(ctx, &desc,
                                                    obj1, prop);
+                        js_host_callback_leave(ctx->rt, saved_caller);
                         JS_FreeValue(ctx, obj1);
                         if (ret < 0) {
                             JS_FreeValue(ctx, val);
@@ -10470,8 +10525,11 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
             const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
             if (em) {
                 if (em->define_own_property) {
-                    return em->define_own_property(ctx, JS_MKPTR(JS_TAG_OBJECT, p),
-                                                   prop, val, getter, setter, flags);
+                    JSStackFrame *saved_caller = js_host_callback_enter(ctx->rt);
+                    ret = em->define_own_property(ctx, JS_MKPTR(JS_TAG_OBJECT, p),
+                                                  prop, val, getter, setter, flags);
+                    js_host_callback_leave(ctx->rt, saved_caller);
+                    return ret;
                 }
                 ret = JS_IsExtensible(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
                 if (ret < 0)
@@ -16992,9 +17050,14 @@ static JSValue JS_IteratorNext2(JSContext *ctx, JSValueConst enum_obj,
                 args[0] = JS_UNDEFINED;
                 argv = args;
             }
+            JSStackFrame *saved_caller;
+            JSValue ret;
             func = p->u.cfunc.c_function;
-            return func.iterator_next(ctx, enum_obj, argc, argv,
-                                      pdone, p->u.cfunc.magic);
+            saved_caller = js_host_callback_enter(ctx->rt);
+            ret = func.iterator_next(ctx, enum_obj, argc, argv,
+                                     pdone, p->u.cfunc.magic);
+            js_host_callback_leave(ctx->rt, saved_caller);
+            return ret;
         }
     }
     obj = js_call(ctx, method, enum_obj, argc, argv);
@@ -21755,6 +21818,7 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
 {
     JSObject *p;
     JSFunctionBytecode *b;
+    JSValue ret;
 
     if (js_poll_interrupts(ctx))
         return JS_EXCEPTION;
@@ -21789,7 +21853,7 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
     if (b->is_derived_class_constructor) {
         return JS_CallInternal(ctx, func_obj, JS_UNDEFINED, new_target, argc, argv, flags);
     } else {
-        JSValue obj, ret;
+        JSValue obj;
         /* legacy constructor behavior */
         obj = JS_CreateFromConstructor(ctx, new_target, JS_CLASS_OBJECT);
         if (JS_IsException(obj))
@@ -31057,8 +31121,10 @@ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
     if (!rt->module_normalize_func) {
         cname = js_default_module_normalize_name(ctx, base_cname, cname1);
     } else {
+        JSStackFrame *saved_caller = js_host_callback_enter(rt);
         cname = rt->module_normalize_func(ctx, base_cname, cname1,
                                           rt->module_loader_opaque);
+        js_host_callback_leave(rt, saved_caller);
     }
     if (!cname)
         return NULL;
@@ -31087,10 +31153,14 @@ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
         js_free(ctx, cname);
         return NULL;
     }
-    if (rt->module_loader_has_attr) {
-        m = rt->u.module_loader_func2(ctx, cname, rt->module_loader_opaque, attributes);
-    } else {
-        m = rt->u.module_loader_func(ctx, cname, rt->module_loader_opaque);
+    {
+        JSStackFrame *saved_caller = js_host_callback_enter(rt);
+        if (rt->module_loader_has_attr) {
+            m = rt->u.module_loader_func2(ctx, cname, rt->module_loader_opaque, attributes);
+        } else {
+            m = rt->u.module_loader_func(ctx, cname, rt->module_loader_opaque);
+        }
+        js_host_callback_leave(rt, saved_caller);
     }
     js_free(ctx, cname);
     return m;
@@ -50645,8 +50715,14 @@ int lre_check_timeout(void *opaque)
 {
     JSContext *ctx = opaque;
     JSRuntime *rt = ctx->rt;
-    return (rt->interrupt_handler && 
-            rt->interrupt_handler(rt, rt->interrupt_opaque));
+    JSStackFrame *saved_caller;
+    int interrupted;
+    if (!rt->interrupt_handler)
+        return 0;
+    saved_caller = js_host_callback_enter(rt);
+    interrupted = rt->interrupt_handler(rt, rt->interrupt_opaque);
+    js_host_callback_leave(rt, saved_caller);
+    return interrupted;
 }
 
 void *lre_realloc(void *opaque, void *ptr, size_t size)
@@ -56167,8 +56243,10 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
     if (s->promise_state == JS_PROMISE_REJECTED && !s->is_handled) {
         JSRuntime *rt = ctx->rt;
         if (rt->host_promise_rejection_tracker) {
+            JSStackFrame *saved_caller = js_host_callback_enter(rt);
             rt->host_promise_rejection_tracker(ctx, promise, value, FALSE,
                                                rt->host_promise_rejection_tracker_opaque);
+            js_host_callback_leave(rt, saved_caller);
         }
     }
 
@@ -57269,8 +57347,10 @@ static __exception int perform_promise_then(JSContext *ctx,
         if (s->promise_state == JS_PROMISE_REJECTED && !s->is_handled) {
             JSRuntime *rt = ctx->rt;
             if (rt->host_promise_rejection_tracker) {
+                JSStackFrame *saved_caller = js_host_callback_enter(rt);
                 rt->host_promise_rejection_tracker(ctx, promise, s->promise_result,
                                                    TRUE, rt->host_promise_rejection_tracker_opaque);
+                js_host_callback_leave(rt, saved_caller);
             }
         }
         i = s->promise_state - JS_PROMISE_FULFILLED;
