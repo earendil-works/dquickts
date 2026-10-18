@@ -1,3 +1,82 @@
+unreleased:
+
+- added in-process suspension of running code (JS_RequestSuspend(),
+  JS_IsSuspended(), JS_Resume())
+- added heap snapshots (JS_WriteSnapshot(), JS_ReadSnapshot()): a
+  runtime, including a suspended execution, can be saved and restored in
+  another runtime or process
+- added incremental snapshots (JS_SNAPSHOT_BASE, JS_SNAPSHOT_DELTA): a
+  delta only contains the changes since a base snapshot
+- added JS_SuspendCall() and JS_ResumeWith(): a C function suspends its
+  JS caller until the host gives the result of the call
+- added JS_IsSuspendException(), JS_IsUncatchableException(),
+  JS_IsEqual(), JS_NewProxy(), JS_IsProxy(), JS_GetProxyTarget(),
+  JS_GetProxyHandler(), JS_GetTypedArrayType(), JS_GetFunctionProto()
+  and JS_PromiseMarkAsHandled()
+- added rquickjs/: the rquickjs Rust bindings built on this engine, with
+  suspension, snapshots and the optional snapshot()/restore() builtins
+- added TypeScript (JS_EVAL_FLAG_TYPESCRIPT; .ts/.mts/.cts files in qjs,
+  qjsc and the module loader, qjs --typescript): types are erased while
+  parsing; enums, namespaces and parameter properties are compiled to
+  bytecode; const enum members are folded; imports only used as types
+  are elided
+- quickjs-libc: js_module_normalize() resolves './x.js' / './x' to an
+  existing './x.ts' ('./x.mjs' to './x.mts'); std.evalScript()
+  'typescript' option; qjs: '-' as file name reads stdin
+- fixed the export of the names bound by array destructuring exports
+  ('export const [a, b] = ...', quickjs-ng #1576)
+- added explicit resource management (ES2026): 'using' and 'await using'
+  declarations, DisposableStack, AsyncDisposableStack, SuppressedError,
+  Symbol.dispose, Symbol.asyncDispose, Iterator.prototype[Symbol.dispose]
+  and %AsyncIteratorPrototype%[Symbol.asyncDispose], also in TypeScript;
+  the dispose calls of 'using' declarations can be suspended and saved
+  in snapshots, as can the stacks and a running disposeAsync()
+- added standard decorators (2023-05) and auto-accessors ('accessor'),
+  with Symbol.metadata
+- added TypeScript legacy decorators (JS_EVAL_FLAG_TS_LEGACY_DECORATORS,
+  qjs --experimental-decorators) and decorator metadata
+  (JS_EVAL_FLAG_TS_DECORATOR_METADATA, qjs --emit-decorator-metadata),
+  js_std_set_typescript_flags() and the std.evalScript() decorator options
+- private getters and setters are named 'get #x' / 'set #x'
+- bytecode version 6
+- ported from quickjs-ng:
+  - queueMicrotask(), atob()/btoa(), DOMException
+    (JS_AddIntrinsicAToB(), JS_AddIntrinsicDOMException(),
+    JS_ThrowDOMException())
+  - Error.captureStackTrace(), Error.stackTraceLimit (default 10) and
+    Error.prepareStackTrace() with CallSite objects; Error.prototype.stack
+    is an accessor
+  - promise hooks (JS_SetPromiseHook()) and faster %Promise% creation
+  - C API: JS_NewObjectFrom(), JS_NewObjectFromStr(), JS_NewArrayFrom(),
+    JS_GetLength(), JS_ToBigUint64(), JS_NewUint64(), JS_IsDate(),
+    JS_IsRegExp(), JS_IsMap(), JS_IsSet(), JS_IsWeakRef(),
+    JS_IsArrayBuffer(), JS_IsAsyncFunction(), JS_IsPromise(),
+    JS_ThrowPlainError(), JS_NewSettledPromise(), JS_PromiseThen(),
+    JS_GetPendingJobContext(), JS_FreeCStringRT(), JS_DupAtomRT(),
+    JS_GetVersion(), QJS_VERSION_*, JS_GetInterruptHandler()
+  - os.setInterval(), os.clearInterval(), os.exePath(), os.mkstemp(),
+    os.mkdtemp(); 'text' and 'bytes' module types (import ... with
+    { type: "text" }); js_module_test_json() replaced by
+    js_module_get_type() and js_module_new_value()
+  - fixes: Promise.withResolvers() double free on out of memory;
+    Array.prototype.sort() calls the comparator for identical values;
+    Iterator.prototype.constructor and [Symbol.toStringTag] setters;
+    Iterator.concat() return(); RegExp named group limit, 'v' class
+    escapes and out of memory paths; TypedArray.prototype.with()
+    conversion order, content type checks, sort size overflow,
+    JS_NewTypedArray() with argc < 3; Proxy invariant checks and ownKeys
+    results; ToPropertyDescriptor exceptions; JSON.stringify() with a
+    rope 'space'; interruptible Array iteration methods; module identity
+    keyed by import attributes, re-export errors, spurious unhandled
+    rejection of throwing modules; for await return() semantics;
+    multiplicative property hash; bytecode reader hardening;
+    JS_DetachArrayBuffer() double free; resolving functions on out of
+    memory; JS_NewCConstructor() leak; allocation size overflows;
+    std: FILE leak, std.evalScript() interrupt handler, loading pipes
+    and /proc files, std.open() 'x' mode, std.popen() modes
+- snapshot format version 6
+- fixed an atom leak when reading truncated bytecode
+
 2026-06-04:
 
 - added custom malloc for small blocks (11% faster on bench-v8)
