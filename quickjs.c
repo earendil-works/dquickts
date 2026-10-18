@@ -359,6 +359,34 @@ struct JSRuntime {
 
     struct JSStackFrame *current_stack_frame;
 
+    /* Suspension of running code (see JS_RequestSuspend()). 'suspended'
+       is an owned reference to the outermost (bottom) frame of a
+       suspended execution, NULL when not suspended. The other frames
+       of the suspended call stack are reached through
+       JSAsyncFunctionState.suspended_child. While unwinding a
+       suspension, it temporarily holds the frames already saved. */
+    struct JSAsyncFunctionState *suspended;
+    /* set by JS_RequestSuspend(), cleared when a suspension happens */
+    BOOL suspend_requested : 8;
+    /* TRUE while JS_ExecutePendingJob() runs a job: a frame entered
+       from a job is not entered from the host */
+    BOOL in_job : 8;
+    /* number of class 'call' handlers (C functions, bound functions,
+       Proxy, promise resolving functions...) running: a frame entered
+       below one of them is not entered from the host */
+    int native_call_depth;
+    /* frame which called the running native function (C function or
+       class 'call' handler) from a call opcode (JS_CALL_FLAG_DIRECT),
+       NULL otherwise: the frames JS_SuspendCall() suspends */
+    struct JSStackFrame *native_caller_frame;
+    /* set by JS_SuspendCall() until the caller frame is saved: it is
+       blocked in the call of the native function */
+    BOOL suspending_call : 8;
+    /* result of the call suspended by JS_SuspendCall(), given to
+       JS_ResumeWith() (thrown if 'resume_throw') */
+    BOOL resume_throw : 8;
+    JSValue resume_value;
+
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
 
@@ -406,6 +434,15 @@ struct JSClass {
 #define JS_MODE_ASYNC  (1 << 2) /* async function */
 #define JS_MODE_BACKTRACE_BARRIER (1 << 3) /* stop backtrace before this frame */
 
+/* JSStackFrame.entry_kind (only set for bytecode frames) */
+#define JS_FRAME_ENTRY_NATIVE 0 /* called from native code: a native
+                                   continuation may follow the call */
+#define JS_FRAME_ENTRY_DIRECT 1 /* called from an interpreter call site of
+                                   the previous frame (JS_CALL_FLAG_DIRECT) */
+#define JS_FRAME_ENTRY_HOST   2 /* called by a public host entry point
+                                   (JS_CALL_FLAG_HOST) with no JS or
+                                   native code running */
+
 typedef struct JSStackFrame {
     struct JSStackFrame *prev_frame; /* NULL if first stack frame */
     JSValue cur_func; /* current function, JS_UNDEFINED if the frame is detached */
@@ -416,6 +453,13 @@ typedef struct JSStackFrame {
                         instruction after the call */
     int arg_count;
     int js_mode; /* not supported for C functions */
+    /* JS_FRAME_ENTRY_x: how the frame was entered. Set when a bytecode
+       frame starts or is resumed by JS_Resume(); meaningless in a
+       suspended frame. */
+    uint8_t entry_kind;
+    /* TRUE if the function was called as a constructor (for
+       CallSite.prototype.isConstructor()) */
+    uint8_t is_constructor;
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
@@ -511,7 +555,9 @@ typedef enum {
 
 /* must be large enough to have a negligible runtime cost and small
    enough to call the interrupt callback often. */
+#ifndef JS_INTERRUPT_COUNTER_INIT
 #define JS_INTERRUPT_COUNTER_INIT 10000
+#endif
 
 struct JSContext {
     JSGCObjectHeader header; /* must come first */
@@ -548,6 +594,11 @@ struct JSContext {
 
     /* when the counter reaches zero, JSRutime.interrupt_handler is called */
     int interrupt_counter;
+    /* > 0 when interrupt_counter was set to 1 to reach a suspension point
+       quickly after a suspension request at a poll which is not one:
+       number of polls left in the regular period of the interrupt
+       handler (see __js_poll_interrupts()) */
+    int suspend_poll_budget;
 
     struct list_head loaded_modules; /* list of JSModuleDef.link */
 
@@ -785,6 +836,24 @@ typedef struct JSGlobalObject {
     JSValue uninitialized_vars; /* hidden object containing the list of uninitialized variables */
 } JSGlobalObject;
 
+/* Heap stack frame of a generator, of an async function or of a
+   suspended normal function (see JS_RequestSuspend()).
+
+   Layout (see async_func_init()): arg_buf = (JSValue *)(s + 1) with
+   frame.arg_count = max(b->arg_count, argc) values, then var_buf
+   (b->var_count values), then the operand stack (b->stack_size
+   values), then var_refs (b->var_ref_count pointers). frame.js_mode
+   includes JS_MODE_ASYNC ("heap frame"). An open JSVarRef pointing into
+   the frame holds a reference to the JSAsyncFunctionState. While the
+   frame is not running, frame.cur_pc and frame.cur_sp give the resume
+   point and the values in [arg_buf, cur_sp) are owned by the frame.
+
+   Suspended normal frames (is_suspended_frame = TRUE) own a reference
+   to frame.cur_func, this_val and new_target. this_val, new_target
+   and argc are the 'this', new.target and argument count of the
+   suspended call. A frame blocked in a call owns a reference to the
+   suspended callee frame 'suspended_child'; when the callee returns,
+   the call opcode 'pending_opcode' is completed with its result. */
 typedef struct JSAsyncFunctionState {
     JSGCObjectHeader header;
     JSValue this_val; /* 'this' argument */
@@ -793,6 +862,28 @@ typedef struct JSAsyncFunctionState {
     BOOL is_completed; /* TRUE if the function has returned. The stack
                           frame is no longer valid */
     JSValue resolving_funcs[2]; /* only used in JS async functions */
+    /* new.target of the call: JS_UNDEFINED except for suspended frames
+       of constructor calls */
+    JSValue new_target;
+    /* suspended frame of the callee this frame is blocked on (owned
+       reference), NULL for the innermost suspended frame */
+    struct JSAsyncFunctionState *suspended_child;
+    /* TRUE for a suspended normal (JS_FUNC_NORMAL) frame */
+    uint8_t is_suspended_frame;
+    /* TRUE if the frame is blocked in the call of a native function
+       suspended by JS_SuspendCall(): the call completes with the value
+       given to JS_ResumeWith() */
+    uint8_t pending_native;
+    /* call opcode waiting for the result of 'suspended_child' (or of the
+       native function if 'pending_native'): OP_call0-3, OP_call,
+       OP_tail_call, OP_call_method, OP_tail_call_method,
+       OP_call_constructor or OP_apply. Meaningless when the frame is not
+       blocked in a call. frame.cur_pc points after the call instruction
+       and the operand stack still holds its operands. */
+    uint8_t pending_opcode;
+    /* argument count of 'pending_opcode' (the apply magic for OP_apply,
+       whose operands are the function, 'this' and the argument array) */
+    uint16_t pending_argc;
     JSStackFrame frame;
     /* arg_buf, var_buf, stack_buf and var_refs follow */
 } JSAsyncFunctionState;
@@ -1167,6 +1258,19 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
                                           JSValueConst func_obj,
                                           JSValueConst new_target,
                                           int argc, JSValue *argv, int flags);
+/* Engine versions of JS_Call(), JS_CallConstructor(),
+   JS_CallConstructor2() and JS_Invoke(). The public functions mark the
+   call as a host call (see JS_RequestSuspend()) and must not be used
+   inside the engine. */
+static JSValue js_call(JSContext *ctx, JSValueConst func_obj,
+                       JSValueConst this_obj, int argc, JSValueConst *argv);
+static JSValue js_call_constructor(JSContext *ctx, JSValueConst func_obj,
+                                   int argc, JSValueConst *argv);
+static JSValue js_call_constructor2(JSContext *ctx, JSValueConst func_obj,
+                                    JSValueConst new_target,
+                                    int argc, JSValueConst *argv);
+static JSValue js_invoke(JSContext *ctx, JSValueConst this_val, JSAtom atom,
+                         int argc, JSValueConst *argv);
 static JSValue JS_CallFree(JSContext *ctx, JSValue func_obj, JSValueConst this_obj,
                            int argc, JSValueConst *argv);
 static JSValue JS_InvokeFree(JSContext *ctx, JSValue this_val, JSAtom atom,
@@ -1188,6 +1292,10 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt);
 static void js_dump_value_write(void *opaque, const char *buf, size_t len);
 static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv, int magic);
+static JSValue js_function_apply_internal(JSContext *ctx, JSValueConst func_obj,
+                                          JSValueConst this_arg,
+                                          JSValueConst array_arg,
+                                          int magic, int flags);
 static void js_array_finalizer(JSRuntime *rt, JSValue val);
 static void js_array_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 static void js_mapped_arguments_finalizer(JSRuntime *rt, JSValue val);
@@ -2338,6 +2446,7 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     JSJobEntry *e;
     JSValue res;
     int i, ret;
+    BOOL saved_in_job;
 
     if (list_empty(&rt->job_list)) {
         if (pctx)
@@ -2349,7 +2458,12 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     e = list_entry(rt->job_list.next, JSJobEntry, link);
     list_del(&e->link);
     ctx = e->realm;
+    /* code run by a job cannot be suspended: the job function is a
+       native continuation */
+    saved_in_job = rt->in_job;
+    rt->in_job = TRUE;
     res = e->job_func(ctx, e->argc, (JSValueConst *)e->argv);
+    rt->in_job = saved_in_job;
     for(i = 0; i < e->argc; i++)
         JS_FreeValue(ctx, e->argv[i]);
     if (JS_IsException(res))
@@ -2440,6 +2554,15 @@ void JS_FreeRuntime(JSRuntime *rt)
     int i;
 
     JS_FreeValueRT(rt, rt->current_exception);
+
+    JS_DropSnapshotBase(rt);
+
+    /* drop the suspended execution */
+    if (rt->suspended) {
+        JSAsyncFunctionState *s = rt->suspended;
+        rt->suspended = NULL;
+        async_func_free(rt, s);
+    }
 
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
@@ -6737,6 +6860,7 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
             if (!s->is_completed) {
                 JS_MarkValue(rt, sf->cur_func, mark_func);
                 JS_MarkValue(rt, s->this_val, mark_func);
+                JS_MarkValue(rt, s->new_target, mark_func);
                 /* sf->cur_sp = NULL if the function is running */
                 if (sf->cur_sp) {
                     /* if the function is running, cur_sp is not known so we
@@ -6747,6 +6871,8 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                         JS_MarkValue(rt, *sp, mark_func);
                 }
             }
+            if (s->suspended_child)
+                mark_func(rt, &s->suspended_child->header);
             JS_MarkValue(rt, s->resolving_funcs[0], mark_func);
             JS_MarkValue(rt, s->resolving_funcs[1], mark_func);
         }
@@ -7953,7 +8079,30 @@ static void JS_ThrowInterrupted(JSContext *ctx)
     JS_SetUncatchableException(ctx, TRUE);
 }
 
-static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
+/* Host code called by the engine outside of a class 'call' handler
+   (exotic behaviors, iterator_next functions called directly, module
+   loading, rejection tracker, interrupt handler) is a native
+   continuation, like a class 'call' handler: the JS code it runs is not
+   entered from the host (no suspension) and it cannot suspend a JS
+   caller with JS_SuspendCall(). Return the state to give to
+   js_host_callback_leave(). */
+static inline JSStackFrame *js_host_callback_enter(JSRuntime *rt)
+{
+    JSStackFrame *saved_caller = rt->native_caller_frame;
+    rt->native_caller_frame = NULL;
+    rt->native_call_depth++;
+    return saved_caller;
+}
+
+static inline void js_host_callback_leave(JSRuntime *rt,
+                                          JSStackFrame *saved_caller)
+{
+    rt->native_call_depth--;
+    rt->native_caller_frame = saved_caller;
+}
+
+/* call the interrupt handler and start a new polling period */
+static __exception int js_call_interrupt_handler(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
     ctx->interrupt_counter = JS_INTERRUPT_COUNTER_INIT;
@@ -7962,6 +8111,33 @@ static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
             JS_ThrowInterrupted(ctx);
             return -1;
         }
+    }
+    return 0;
+}
+
+/* slow path of the polls which are not suspension points (the
+   suspension points are polled by js_poll_safepoint()) */
+static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+
+    if (unlikely(ctx->suspend_poll_budget > 0)) {
+        /* early poll to reach a suspension point: the interrupt handler
+           is only called at the end of its regular period */
+        if (--ctx->suspend_poll_budget > 0 && rt->suspend_requested) {
+            ctx->interrupt_counter = 1;
+            return 0;
+        }
+        ctx->suspend_poll_budget = 0;
+    }
+    if (js_call_interrupt_handler(ctx))
+        return -1;
+    if (unlikely(rt->suspend_requested)) {
+        /* Poll again at the next instruction instead of waiting for the
+           counter to expire: in a periodic loop, it could always expire
+           out of a suspension point. */
+        ctx->suspend_poll_budget = JS_INTERRUPT_COUNTER_INIT;
+        ctx->interrupt_counter = 1;
     }
     return 0;
 }
@@ -16730,7 +16906,7 @@ static JSValue JS_GetIterator2(JSContext *ctx, JSValueConst obj,
 {
     JSValue enum_obj;
 
-    enum_obj = JS_Call(ctx, method, obj, 0, NULL);
+    enum_obj = js_call(ctx, method, obj, 0, NULL);
     if (JS_IsException(enum_obj))
         return enum_obj;
     if (!JS_IsObject(enum_obj)) {
@@ -16800,7 +16976,7 @@ static JSValue JS_IteratorNext2(JSContext *ctx, JSValueConst enum_obj,
                                       pdone, p->u.cfunc.magic);
         }
     }
-    obj = JS_Call(ctx, method, enum_obj, argc, argv);
+    obj = js_call(ctx, method, enum_obj, argc, argv);
     if (JS_IsException(obj))
         goto fail;
     if (!JS_IsObject(obj)) {
@@ -16947,7 +17123,7 @@ static __exception int js_for_await_of_next(JSContext *ctx, JSValue *sp)
                               exceptions do not close the iterator */
     iter = sp[-3];
     next = sp[-2];
-    obj = JS_Call(ctx, next, iter, 0, NULL);
+    obj = js_call(ctx, next, iter, 0, NULL);
     if (JS_IsException(obj))
         return -1;
     sp[0] = obj;
@@ -17787,6 +17963,21 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
 
 #define JS_CALL_FLAG_COPY_ARGV   (1 << 1)
 #define JS_CALL_FLAG_GENERATOR   (1 << 2)
+/* The function is called from an interpreter call site (OP_call0-3,
+   OP_call, OP_tail_call, OP_call_method, OP_tail_call_method,
+   OP_call_constructor, OP_apply), possibly through transparent wrappers
+   (bound functions, JS_CallConstructorInternal(),
+   js_function_apply_internal()) whose post-call logic is only cleanup
+   and 'return ret' or is redone when resuming (constructor result in
+   js_resume_frame()). It proves that no native continuation exists
+   between the caller frame and the callee frame, so that the callee
+   can be suspended (see JS_RequestSuspend()). */
+#define JS_CALL_FLAG_DIRECT      (1 << 3)
+/* The function is called by a public host entry point (JS_Call(),
+   JS_CallConstructor(), JS_CallConstructor2(), JS_Invoke(), script
+   evaluation by JS_Eval()/JS_EvalFunction(), JS_Resume()). It is not
+   propagated to class 'call' handlers. */
+#define JS_CALL_FLAG_HOST        (1 << 4)
 
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                   JSValueConst this_obj,
@@ -17941,16 +18132,311 @@ static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
     for(i = 0; i < argc; i++) {
         arg_buf[bf->argc + i] = argv[i];
     }
+    /* transparent wrapper: a direct call stays direct */
     if (flags & JS_CALL_FLAG_CONSTRUCTOR) {
         new_target = this_obj;
         if (js_same_value(ctx, func_obj, new_target))
             new_target = bf->func_obj;
-        return JS_CallConstructor2(ctx, bf->func_obj, new_target,
-                                   arg_count, arg_buf);
+        return JS_CallConstructorInternal(ctx, bf->func_obj, new_target,
+                                          arg_count, (JSValue *)arg_buf,
+                                          JS_CALL_FLAG_COPY_ARGV |
+                                          (flags & JS_CALL_FLAG_DIRECT));
     } else {
-        return JS_Call(ctx, bf->func_obj, bf->this_val,
-                       arg_count, arg_buf);
+        return JS_CallInternal(ctx, bf->func_obj, bf->this_val, JS_UNDEFINED,
+                               arg_count, (JSValue *)arg_buf,
+                               JS_CALL_FLAG_COPY_ARGV |
+                               (flags & JS_CALL_FLAG_DIRECT));
     }
+}
+
+/* Suspension (see JS_RequestSuspend()).
+
+   The branch instructions are the only suspension points
+   (js_poll_safepoint()). A suspension throws the uncatchable
+   JS_SUSPEND_MARKER exception. While it unwinds the stack, the
+   exception path of JS_CallInternal() moves each frame to a heap
+   JSAsyncFunctionState (js_suspend_frame()) linked to the frame of its
+   callee, and the outermost one becomes rt->suspended. JS_Resume()
+   resumes the outermost frame, which first resumes its callee frame
+   (recursively, rebuilding the C stack) and then completes its pending
+   call opcode with the callee result. */
+
+/* pending exception while a suspension unwinds the stack and while the
+   execution is suspended. It cannot be thrown by JS code. */
+#define JS_SUSPEND_MARKER JS_MKVAL(JS_TAG_CATCH_OFFSET, -1)
+
+static inline BOOL js_is_suspend_marker(JSValueConst val)
+{
+    return JS_VALUE_GET_TAG(val) == JS_TAG_CATCH_OFFSET &&
+        JS_VALUE_GET_INT(val) == -1;
+}
+
+static inline BOOL js_is_suspending(JSRuntime *rt)
+{
+    return rt->current_exception_is_uncatchable &&
+        js_is_suspend_marker(rt->current_exception);
+}
+
+static JSValue js_resume_frame(JSContext *ctx, JSAsyncFunctionState *s,
+                               int flags);
+static void async_func_free_frame(JSRuntime *rt, JSAsyncFunctionState *s);
+
+/* Terminate the saved frame 's' and its suspended callee frames, which
+   will never run again: their open closure variables are closed (the
+   escaped closures keep working) and their execution state is
+   released, like when a generator completes. The reference to 's' is
+   consumed. */
+static void js_abort_suspended_frames(JSRuntime *rt, JSAsyncFunctionState *s)
+{
+    JSAsyncFunctionState *child;
+    JSObject *p;
+
+    while (s != NULL) {
+        child = s->suspended_child;
+        s->suspended_child = NULL;
+        if (!s->is_completed) {
+            p = JS_VALUE_GET_OBJ(s->frame.cur_func);
+            s->is_completed = TRUE;
+            close_var_refs(rt, p->u.func.function_bytecode, &s->frame);
+            async_func_free_frame(rt, s);
+        }
+        async_func_free(rt, s);
+        /* the reference of the parent to 'child' is consumed */
+        s = child;
+    }
+}
+
+/* 'sf->prev_frame' must be set */
+static inline int js_frame_entry_kind(JSRuntime *rt, JSStackFrame *sf,
+                                      int flags)
+{
+    if (flags & JS_CALL_FLAG_DIRECT)
+        return JS_FRAME_ENTRY_DIRECT;
+    else if ((flags & JS_CALL_FLAG_HOST) && !sf->prev_frame &&
+             !rt->in_job && rt->native_call_depth == 0)
+        return JS_FRAME_ENTRY_HOST;
+    else
+        return JS_FRAME_ENTRY_NATIVE;
+}
+
+/* TRUE if the call stack from 'sf' can be suspended: it contains only
+   bytecode frames of normal functions, the outermost one called from
+   the host and each other one called directly by the previous one. */
+static BOOL js_can_suspend_from(JSRuntime *rt, JSStackFrame *sf)
+{
+    JSObject *p;
+
+    if (rt->suspended || !sf)
+        return FALSE; /* only one suspended execution at a time */
+    for(; sf != NULL; sf = sf->prev_frame) {
+        if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+            return FALSE;
+        p = JS_VALUE_GET_OBJ(sf->cur_func);
+        if (p->class_id != JS_CLASS_BYTECODE_FUNCTION ||
+            p->u.func.function_bytecode->func_kind != JS_FUNC_NORMAL)
+            return FALSE;
+        if (sf->entry_kind == JS_FRAME_ENTRY_HOST)
+            return (sf->prev_frame == NULL);
+        if (sf->entry_kind != JS_FRAME_ENTRY_DIRECT)
+            return FALSE;
+    }
+    return FALSE;
+}
+
+static BOOL js_can_suspend(JSRuntime *rt)
+{
+    return js_can_suspend_from(rt, rt->current_stack_frame);
+}
+
+/* Slow path of the interrupt polling of the branch instructions, the
+   only points where the running code can be suspended. If the
+   suspension is requested but the stack cannot be suspended,
+   rt->suspend_requested stays set so that a later safepoint (or the
+   host) honors it. */
+static no_inline __exception int js_poll_safepoint(JSContext *ctx,
+                                                   JSStackFrame *sf,
+                                                   const uint8_t *pc)
+{
+    JSRuntime *rt = ctx->rt;
+
+    sf->cur_pc = pc;
+    if (unlikely(ctx->suspend_poll_budget > 0)) {
+        /* early poll requested by __js_poll_interrupts(): continue the
+           regular period of the interrupt handler */
+        ctx->interrupt_counter = ctx->suspend_poll_budget;
+        ctx->suspend_poll_budget = 0;
+    } else if (js_call_interrupt_handler(ctx)) {
+        return -1;
+    }
+    if (unlikely(rt->suspend_requested) && js_can_suspend(rt)) {
+        rt->suspend_requested = FALSE;
+        JS_Throw(ctx, JS_SUSPEND_MARKER);
+        rt->current_exception_is_uncatchable = TRUE;
+        return -1;
+    }
+    return 0;
+}
+
+/* return the argument count of the call opcode ending at 'pc' (the
+   apply magic for OP_apply) or -1 if it is not a direct call opcode */
+static int js_call_opcode_argc(int opcode, const uint8_t *pc)
+{
+    switch(opcode) {
+#if SHORT_OPCODES
+    case OP_call0:
+    case OP_call1:
+    case OP_call2:
+    case OP_call3:
+        return opcode - OP_call0;
+#endif
+    case OP_call:
+    case OP_tail_call:
+    case OP_call_method:
+    case OP_tail_call_method:
+    case OP_call_constructor:
+    case OP_apply:
+        return get_u16(pc - 2);
+    default:
+        return -1;
+    }
+}
+
+/* Called by the exception path of JS_CallInternal() while a suspension
+   unwinds the stack: save the frame 'sf' (paused at 'pc' with the
+   operand stack top 'sp') in a heap JSAsyncFunctionState linked to the
+   frames saved so far, make it rt->suspended and pop it. 'opcode' is the
+   call opcode the frame is blocked in when an inner frame was saved.
+   Return 0 if OK. Otherwise return -1 with an uncatchable error
+   pending: the suspension is aborted and the frames saved so far are
+   released. */
+static no_inline int js_suspend_frame(JSContext *ctx, JSStackFrame *sf,
+                                      JSFunctionBytecode *b,
+                                      const uint8_t *pc, JSValue *sp,
+                                      JSValueConst this_obj,
+                                      JSValueConst new_target,
+                                      int argc, JSValueConst *argv,
+                                      int opcode)
+{
+    JSRuntime *rt = ctx->rt;
+    JSAsyncFunctionState *s, *child;
+    JSValue *stack_buf, *heap_args, *heap_vars, *heap_stack, *pvalue;
+    JSVarRef **heap_var_refs, *var_ref;
+    int i, arg_buf_len, stack_len, pending_argc;
+    BOOL native;
+
+    child = rt->suspended;
+    /* the first frame saved by JS_SuspendCall() is blocked in the call
+       of the native function */
+    native = rt->suspending_call;
+    rt->suspending_call = FALSE;
+    pending_argc = 0;
+    if (child || native) {
+        /* the frame is blocked in the direct call of 'child' or of the
+           native function */
+        pending_argc = js_call_opcode_argc(opcode, pc);
+        if (pending_argc < 0) {
+            JS_ThrowInternalError(ctx, "cannot suspend opcode %d", opcode);
+            goto fail;
+        }
+    }
+
+    if (sf->js_mode & JS_MODE_ASYNC) {
+        /* already a heap frame: resumed after a previous suspension */
+        s = container_of(sf, JSAsyncFunctionState, frame);
+        assert(s->is_suspended_frame);
+        /* the reference of the resumer is released by js_resume_frame() */
+        js_rc(s)->ref_count++;
+        sf->cur_pc = pc;
+        sf->cur_sp = sp;
+    } else {
+        arg_buf_len = max_int(b->arg_count, argc);
+        s = js_malloc_rt(rt, sizeof(*s) +
+                         sizeof(JSValue) * (arg_buf_len + b->var_count +
+                                            b->stack_size) +
+                         sizeof(JSVarRef *) * b->var_ref_count);
+        if (!s) {
+            JS_ThrowOutOfMemory(ctx);
+            goto fail;
+        }
+        memset(s, 0, sizeof(*s));
+        js_rc(s)->ref_count = 1;
+        add_gc_object(rt, &s->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
+        heap_args = (JSValue *)(s + 1);
+        heap_vars = heap_args + arg_buf_len;
+        heap_stack = heap_vars + b->var_count;
+        heap_var_refs = (JSVarRef **)(heap_stack + b->stack_size);
+
+        /* Move the values owned by the frame. When arg_buf aliases
+           argv, the arguments are duplicated because the caller keeps
+           its own references. The arguments beyond b->arg_count are
+           only in argv. */
+        i = 0;
+        if (sf->arg_buf != argv) {
+            /* b->arg_count arguments owned by the frame */
+            for(; i < b->arg_count; i++)
+                heap_args[i] = sf->arg_buf[i];
+        }
+        for(; i < argc; i++)
+            heap_args[i] = JS_DupValue(ctx, argv[i]);
+        for(i = 0; i < b->var_count; i++)
+            heap_vars[i] = sf->var_buf[i];
+        stack_buf = sf->var_buf + b->var_count;
+        stack_len = sp - stack_buf;
+        for(i = 0; i < stack_len; i++)
+            heap_stack[i] = stack_buf[i];
+
+        /* the open closure variables now reference the heap frame */
+        for(i = 0; i < b->var_ref_count; i++) {
+            var_ref = sf->var_refs[i];
+            heap_var_refs[i] = var_ref;
+            if (var_ref) {
+                pvalue = var_ref->pvalue;
+                if (pvalue >= sf->arg_buf &&
+                    pvalue < sf->arg_buf + sf->arg_count) {
+                    var_ref->pvalue = heap_args + (pvalue - sf->arg_buf);
+                } else {
+                    assert(pvalue >= sf->var_buf &&
+                           pvalue < sf->var_buf + b->var_count);
+                    var_ref->pvalue = heap_vars + (pvalue - sf->var_buf);
+                }
+                var_ref->stack_frame = &s->frame;
+                js_rc(s)->ref_count++;
+            }
+        }
+
+        s->frame.cur_func = JS_DupValue(ctx, sf->cur_func);
+        s->frame.arg_buf = heap_args;
+        s->frame.var_buf = heap_vars;
+        s->frame.var_refs = heap_var_refs;
+        s->frame.cur_pc = pc;
+        s->frame.arg_count = arg_buf_len;
+        s->frame.js_mode = sf->js_mode | JS_MODE_ASYNC;
+        s->frame.cur_sp = heap_stack + stack_len;
+        s->this_val = JS_DupValue(ctx, this_obj);
+        s->new_target = JS_DupValue(ctx, new_target);
+        s->argc = argc;
+        s->resolving_funcs[0] = JS_UNDEFINED;
+        s->resolving_funcs[1] = JS_UNDEFINED;
+        s->is_suspended_frame = TRUE;
+    }
+    s->suspended_child = child;
+    s->pending_native = native;
+    s->pending_opcode = (child || native) ? opcode : 0;
+    s->pending_argc = pending_argc;
+    rt->suspended = s;
+    rt->current_stack_frame = sf->prev_frame;
+    s->frame.prev_frame = NULL;
+    return 0;
+ fail:
+    /* abort the suspension like an interruption */
+    if (js_is_suspend_marker(rt->current_exception))
+        rt->current_exception = JS_NULL;
+    rt->current_exception_is_uncatchable = TRUE;
+    if (child) {
+        rt->suspended = NULL;
+        js_abort_suspended_frames(rt, child);
+    }
+    return -1;
 }
 
 /* argument of OP_special_object */
@@ -18015,6 +18501,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define DEFAULT         case_default
 #define BREAK           SWITCH(pc)
 #endif
+    /* interrupt polling of the branch instructions, the only points
+       where the code can be suspended. 'pc' must be the next
+       instruction. */
+#define SAFEPOINT()                                             \
+    do {                                                        \
+        if (unlikely(--ctx->interrupt_counter <= 0)) {          \
+            if (js_poll_safepoint(ctx, sf, pc))                 \
+                goto exception;                                 \
+        }                                                       \
+    } while (0)
 
     if (js_poll_interrupts(caller_ctx))
         return JS_EXCEPTION;
@@ -18036,6 +18532,59 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             pc = sf->cur_pc;
             sf->prev_frame = rt->current_stack_frame;
             rt->current_stack_frame = sf;
+            if (unlikely(s->is_suspended_frame)) {
+                /* frame suspended by JS_RequestSuspend(), resumed by
+                   js_resume_frame() */
+                sf->entry_kind = js_frame_entry_kind(rt, sf, flags);
+                /* not saved with the frame */
+                sf->is_constructor = !JS_IsUndefined(s->new_target);
+                func_obj = sf->cur_func;
+                if (s->suspended_child || s->pending_native) {
+                    /* resume the callee the frame is blocked on (or take
+                       the result of the native call given to
+                       JS_ResumeWith()), then complete the pending call
+                       opcode with its result */
+                    int n_pop;
+
+                    opcode = s->pending_opcode;
+                    if (s->suspended_child) {
+                        JSAsyncFunctionState *child = s->suspended_child;
+                        s->suspended_child = NULL;
+                        ret_val = js_resume_frame(ctx, child, JS_CALL_FLAG_DIRECT);
+                    } else {
+                        s->pending_native = FALSE;
+                        ret_val = rt->resume_value;
+                        rt->resume_value = JS_UNDEFINED;
+                        if (rt->resume_throw) {
+                            rt->resume_throw = FALSE;
+                            JS_Throw(ctx, ret_val);
+                            ret_val = JS_EXCEPTION;
+                        }
+                    }
+                    if (unlikely(JS_IsException(ret_val)))
+                        goto exception;
+                    switch(opcode) {
+                    case OP_tail_call:
+                    case OP_tail_call_method:
+                        goto done;
+                    case OP_call_method:
+                    case OP_call_constructor:
+                        n_pop = s->pending_argc + 2;
+                        break;
+                    case OP_apply:
+                        n_pop = 3;
+                        break;
+                    default: /* OP_call0-3, OP_call */
+                        n_pop = s->pending_argc + 1;
+                        break;
+                    }
+                    for(i = -n_pop; i < 0; i++)
+                        JS_FreeValue(ctx, sp[i]);
+                    sp -= n_pop;
+                    *sp++ = ret_val;
+                }
+                goto restart;
+            }
             if (s->throw_flag)
                 goto exception;
             else
@@ -18052,8 +18601,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         not_a_function:
             return JS_ThrowTypeError(caller_ctx, "not a function");
         }
-        return call_func(caller_ctx, func_obj, this_obj, argc,
-                         (JSValueConst *)argv, flags);
+        {
+            JSStackFrame *saved_caller = rt->native_caller_frame;
+            rt->native_caller_frame = (flags & JS_CALL_FLAG_DIRECT) ?
+                rt->current_stack_frame : NULL;
+            rt->native_call_depth++;
+            ret_val = call_func(caller_ctx, func_obj, this_obj, argc,
+                                (JSValueConst *)argv, flags & ~JS_CALL_FLAG_HOST);
+            rt->native_call_depth--;
+            rt->native_caller_frame = saved_caller;
+        }
+        return ret_val;
     }
     b = p->u.func.function_bytecode;
 
@@ -18099,6 +18657,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sp = stack_buf;
     pc = b->byte_code_buf;
     sf->prev_frame = rt->current_stack_frame;
+    sf->entry_kind = js_frame_entry_kind(rt, sf, flags);
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
 
@@ -18421,7 +18980,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
-                                          JS_UNDEFINED, call_argc, call_argv, 0);
+                                          JS_UNDEFINED, call_argc, call_argv,
+                                          JS_CALL_FLAG_DIRECT);
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
                 if (opcode == OP_tail_call)
@@ -18440,7 +19000,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sf->cur_pc = pc;
                 ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
                                                      call_argv[-1],
-                                                     call_argc, call_argv, 0);
+                                                     call_argc, call_argv,
+                                                     JS_CALL_FLAG_DIRECT);
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
                 for(i = -2; i < call_argc; i++)
@@ -18457,7 +19018,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
-                                          JS_UNDEFINED, call_argc, call_argv, 0);
+                                          JS_UNDEFINED, call_argc, call_argv,
+                                          JS_CALL_FLAG_DIRECT);
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
                 if (opcode == OP_tail_call_method)
@@ -18485,7 +19047,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 sf->cur_pc = pc;
 
-                ret_val = js_function_apply(ctx, sp[-3], 2, (JSValueConst *)&sp[-2], magic);
+                ret_val = js_function_apply_internal(ctx, sp[-3], sp[-2], sp[-1],
+                                                     magic, JS_CALL_FLAG_DIRECT);
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
                 JS_FreeValue(ctx, sp[-3]);
@@ -18531,7 +19094,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 super = JS_GetPrototype(ctx, func_obj);
                 if (JS_IsException(super))
                     goto exception;
-                ret = JS_CallConstructor2(ctx, super, new_target, argc, (JSValueConst *)argv);
+                ret = js_call_constructor2(ctx, super, new_target, argc, (JSValueConst *)argv);
                 JS_FreeValue(ctx, super);
                 if (JS_IsException(ret))
                     goto exception;
@@ -18646,7 +19209,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = JS_EvalObject(ctx, JS_UNDEFINED, obj,
                                             JS_EVAL_TYPE_DIRECT, scope_idx);
                 } else {
-                    ret_val = JS_Call(ctx, sp[-2], JS_UNDEFINED, len,
+                    ret_val = js_call(ctx, sp[-2], JS_UNDEFINED, len,
                                       (JSValueConst *)tab);
                 }
                 free_arg_list(ctx, tab, len);
@@ -19057,19 +19620,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_goto):
             pc += (int32_t)get_u32(pc);
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            SAFEPOINT();
             BREAK;
 #if SHORT_OPCODES
         CASE(OP_goto16):
             pc += (int16_t)get_u16(pc);
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            SAFEPOINT();
             BREAK;
         CASE(OP_goto8):
             pc += (int8_t)pc[0];
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            SAFEPOINT();
             BREAK;
 #endif
         CASE(OP_if_true):
@@ -19088,8 +19648,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (res) {
                     pc += (int32_t)get_u32(pc - 4) - 4;
                 }
-                if (unlikely(js_poll_interrupts(ctx)))
-                    goto exception;
+                SAFEPOINT();
             }
             BREAK;
         CASE(OP_if_false):
@@ -19109,8 +19668,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (!res) {
                     pc += (int32_t)get_u32(pc - 4) - 4;
                 }
-                if (unlikely(js_poll_interrupts(ctx)))
-                    goto exception;
+                SAFEPOINT();
             }
             BREAK;
 #if SHORT_OPCODES
@@ -19130,8 +19688,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (res) {
                     pc += (int8_t)pc[-1] - 1;
                 }
-                if (unlikely(js_poll_interrupts(ctx)))
-                    goto exception;
+                SAFEPOINT();
             }
             BREAK;
         CASE(OP_if_false8):
@@ -19150,8 +19707,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (!res) {
                     pc += (int8_t)pc[-1] - 1;
                 }
-                if (unlikely(js_poll_interrupts(ctx)))
-                    goto exception;
+                SAFEPOINT();
             }
             BREAK;
 #endif
@@ -19282,7 +19838,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSValue ret;
                 sf->cur_pc = pc;
-                ret = JS_Call(ctx, sp[-3], sp[-4],
+                ret = js_call(ctx, sp[-3], sp[-4],
                               1, (JSValueConst *)(sp - 1));
                 if (JS_IsException(ret))
                     goto exception;
@@ -20896,6 +21452,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
  exception:
+    if (unlikely(js_is_suspending(rt))) {
+        /* save the frame instead of freeing it */
+        if (!js_suspend_frame(ctx, sf, b, pc, sp, this_obj, new_target,
+                              argc, (JSValueConst *)argv, opcode))
+            return JS_EXCEPTION;
+        /* the suspension is aborted: unwind as an uncatchable error */
+    }
     if (is_backtrace_needed(ctx, rt->current_exception)) {
         /* add the backtrace information now (it is not done
            before if the exception happens in a bytecode
@@ -20941,20 +21504,142 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         for(pval = local_buf; pval < sp; pval++) {
             JS_FreeValue(ctx, *pval);
         }
+        if (unlikely(sf->js_mode & JS_MODE_ASYNC)) {
+            /* resumed suspended frame: its JSAsyncFunctionState is
+               released by js_resume_frame() */
+            JSAsyncFunctionState *s = container_of(sf, JSAsyncFunctionState, frame);
+            s->is_completed = TRUE;
+        }
     }
     rt->current_stack_frame = sf->prev_frame;
     return ret_val;
+#undef SAFEPOINT
 }
 
 #ifdef OPCODE_ASM_LABEL
 #pragma GCC diagnostic pop
 #endif
 
+/* Resume the suspended frame 's' and return its completion value. The
+   reference to 's' is consumed. 'flags' is JS_CALL_FLAG_HOST when
+   resuming the outermost frame from JS_Resume() and
+   JS_CALL_FLAG_DIRECT when resuming the callee of a resumed frame. */
+static JSValue js_resume_frame(JSContext *ctx, JSAsyncFunctionState *s,
+                               int flags)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue ret;
+
+    if (js_check_stack_overflow(rt, 0)) {
+        ret = JS_ThrowStackOverflow(ctx);
+    } else {
+        /* the tag does not matter provided it is not an object */
+        ret = JS_CallInternal(ctx, JS_MKPTR(JS_TAG_INT, s), s->this_val,
+                              s->new_target, s->argc, s->frame.arg_buf,
+                              JS_CALL_FLAG_GENERATOR | flags);
+        if (s->is_completed) {
+            JSObject *p = JS_VALUE_GET_OBJ(s->frame.cur_func);
+            /* result of JS_CallConstructorInternal() for a
+               non-derived constructor */
+            if (!JS_IsUndefined(s->new_target) &&
+                !p->u.func.function_bytecode->is_derived_class_constructor &&
+                !JS_IsException(ret) && !JS_IsObject(ret)) {
+                JS_FreeValue(ctx, ret);
+                ret = JS_DupValue(ctx, s->this_val);
+            }
+            JS_FreeValue(ctx, s->frame.cur_func);
+            JS_FreeValue(ctx, s->this_val);
+            JS_FreeValue(ctx, s->new_target);
+            s->frame.cur_func = JS_UNDEFINED;
+            s->this_val = JS_UNDEFINED;
+            s->new_target = JS_UNDEFINED;
+            async_func_free(rt, s);
+            return ret;
+        }
+        if (JS_IsException(ret) && js_is_suspending(rt)) {
+            /* suspended again: the suspended frame chain holds its own
+               reference */
+            async_func_free(rt, s);
+            return ret;
+        }
+    }
+    /* the frame could not be entered (stack overflow, interruption) */
+    js_abort_suspended_frames(rt, s);
+    return ret;
+}
+
+void JS_RequestSuspend(JSRuntime *rt)
+{
+    rt->suspend_requested = TRUE;
+}
+
+JS_BOOL JS_IsSuspended(JSRuntime *rt)
+{
+    return rt->suspended != NULL;
+}
+
+JS_BOOL JS_IsSuspendException(JSContext *ctx)
+{
+    return js_is_suspending(ctx->rt);
+}
+
+JSValue JS_SuspendCall(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+
+    if (!js_can_suspend_from(rt, rt->native_caller_frame))
+        return JS_ThrowTypeError(ctx, "this call cannot be suspended");
+    JS_Throw(ctx, JS_SUSPEND_MARKER);
+    rt->current_exception_is_uncatchable = TRUE;
+    rt->suspending_call = TRUE;
+    return JS_EXCEPTION;
+}
+
+JSValue JS_ResumeWith(JSContext *ctx, JSValue result, JS_BOOL throw_flag)
+{
+    JSRuntime *rt = ctx->rt;
+    JSAsyncFunctionState *s;
+    JSValue ret;
+
+    s = rt->suspended;
+    if (!s) {
+        JS_FreeValue(ctx, result);
+        return JS_ThrowTypeError(ctx, "no suspended execution");
+    }
+    rt->suspended = NULL;
+    if (js_is_suspend_marker(rt->current_exception)) {
+        rt->current_exception = JS_UNINITIALIZED;
+        rt->current_exception_is_uncatchable = FALSE;
+    }
+    rt->resume_value = result;
+    rt->resume_throw = throw_flag;
+    ret = js_resume_frame(ctx, s, JS_CALL_FLAG_HOST);
+    /* not consumed if no native call was suspended or if the frames
+       could not be resumed */
+    JS_FreeValue(ctx, rt->resume_value);
+    rt->resume_value = JS_UNDEFINED;
+    rt->resume_throw = FALSE;
+    return ret;
+}
+
+JSValue JS_Resume(JSContext *ctx)
+{
+    return JS_ResumeWith(ctx, JS_UNDEFINED, FALSE);
+}
+
+static JSValue js_call(JSContext *ctx, JSValueConst func_obj,
+                       JSValueConst this_obj, int argc, JSValueConst *argv)
+{
+    return JS_CallInternal(ctx, func_obj, this_obj, JS_UNDEFINED,
+                           argc, (JSValue *)argv, JS_CALL_FLAG_COPY_ARGV);
+}
+
 JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
                 int argc, JSValueConst *argv)
 {
     return JS_CallInternal(ctx, func_obj, this_obj, JS_UNDEFINED,
-                           argc, (JSValue *)argv, JS_CALL_FLAG_COPY_ARGV);
+                           argc, (JSValue *)argv,
+                           JS_CALL_FLAG_COPY_ARGV | JS_CALL_FLAG_HOST);
 }
 
 static JSValue JS_CallFree(JSContext *ctx, JSValue func_obj, JSValueConst this_obj,
@@ -21065,8 +21750,18 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
         not_a_function:
             return JS_ThrowTypeError(ctx, "not a function");
         }
-        return call_func(ctx, func_obj, new_target, argc,
-                         (JSValueConst *)argv, flags);
+        {
+            JSRuntime *rt = ctx->rt;
+            JSStackFrame *saved_caller = rt->native_caller_frame;
+            rt->native_caller_frame = (flags & JS_CALL_FLAG_DIRECT) ?
+                rt->current_stack_frame : NULL;
+            rt->native_call_depth++;
+            ret = call_func(ctx, func_obj, new_target, argc,
+                            (JSValueConst *)argv, flags & ~JS_CALL_FLAG_HOST);
+            rt->native_call_depth--;
+            rt->native_caller_frame = saved_caller;
+        }
+        return ret;
     }
 
     b = p->u.func.function_bytecode;
@@ -21090,11 +21785,29 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
     }
 }
 
+static JSValue js_call_constructor2(JSContext *ctx, JSValueConst func_obj,
+                                    JSValueConst new_target,
+                                    int argc, JSValueConst *argv)
+{
+    return JS_CallConstructorInternal(ctx, func_obj, new_target,
+                                      argc, (JSValue *)argv,
+                                      JS_CALL_FLAG_COPY_ARGV);
+}
+
 JSValue JS_CallConstructor2(JSContext *ctx, JSValueConst func_obj,
                             JSValueConst new_target,
                             int argc, JSValueConst *argv)
 {
     return JS_CallConstructorInternal(ctx, func_obj, new_target,
+                                      argc, (JSValue *)argv,
+                                      JS_CALL_FLAG_COPY_ARGV |
+                                      JS_CALL_FLAG_HOST);
+}
+
+static JSValue js_call_constructor(JSContext *ctx, JSValueConst func_obj,
+                                   int argc, JSValueConst *argv)
+{
+    return JS_CallConstructorInternal(ctx, func_obj, func_obj,
                                       argc, (JSValue *)argv,
                                       JS_CALL_FLAG_COPY_ARGV);
 }
@@ -21104,23 +21817,40 @@ JSValue JS_CallConstructor(JSContext *ctx, JSValueConst func_obj,
 {
     return JS_CallConstructorInternal(ctx, func_obj, func_obj,
                                       argc, (JSValue *)argv,
-                                      JS_CALL_FLAG_COPY_ARGV);
+                                      JS_CALL_FLAG_COPY_ARGV |
+                                      JS_CALL_FLAG_HOST);
+}
+
+static JSValue js_invoke2(JSContext *ctx, JSValueConst this_val, JSAtom atom,
+                          int argc, JSValueConst *argv, int flags)
+{
+    JSValue func_obj, ret;
+    func_obj = JS_GetProperty(ctx, this_val, atom);
+    if (JS_IsException(func_obj))
+        return func_obj;
+    ret = JS_CallInternal(ctx, func_obj, this_val, JS_UNDEFINED,
+                          argc, (JSValue *)argv,
+                          JS_CALL_FLAG_COPY_ARGV | flags);
+    JS_FreeValue(ctx, func_obj);
+    return ret;
+}
+
+static JSValue js_invoke(JSContext *ctx, JSValueConst this_val, JSAtom atom,
+                         int argc, JSValueConst *argv)
+{
+    return js_invoke2(ctx, this_val, atom, argc, argv, 0);
 }
 
 JSValue JS_Invoke(JSContext *ctx, JSValueConst this_val, JSAtom atom,
                   int argc, JSValueConst *argv)
 {
-    JSValue func_obj;
-    func_obj = JS_GetProperty(ctx, this_val, atom);
-    if (JS_IsException(func_obj))
-        return func_obj;
-    return JS_CallFree(ctx, func_obj, this_val, argc, argv);
+    return js_invoke2(ctx, this_val, atom, argc, argv, JS_CALL_FLAG_HOST);
 }
 
 static JSValue JS_InvokeFree(JSContext *ctx, JSValue this_val, JSAtom atom,
                              int argc, JSValueConst *argv)
 {
-    JSValue res = JS_Invoke(ctx, this_val, atom, argc, argv);
+    JSValue res = js_invoke(ctx, this_val, atom, argc, argv);
     JS_FreeValue(ctx, this_val);
     return res;
 }
@@ -21166,6 +21896,7 @@ static JSAsyncFunctionState *async_func_init(JSContext *ctx,
         sf->arg_buf[i] = JS_UNDEFINED;
     s->resolving_funcs[0] = JS_UNDEFINED;
     s->resolving_funcs[1] = JS_UNDEFINED;
+    s->new_target = JS_UNDEFINED;
     s->is_completed = FALSE;
     return s;
 }
@@ -21182,6 +21913,7 @@ static void async_func_free_frame(JSRuntime *rt, JSAsyncFunctionState *s)
     }
     JS_FreeValueRT(rt, sf->cur_func);
     JS_FreeValueRT(rt, s->this_val);
+    JS_FreeValueRT(rt, s->new_target);
 }
 
 static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
@@ -21227,6 +21959,10 @@ static void __async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
        potentially modify the object graph */
     if (!s->is_completed) {
         async_func_free_frame(rt, s);
+    }
+    if (s->suspended_child) {
+        async_func_free(rt, s->suspended_child);
+        s->suspended_child = NULL;
     }
 
     JS_FreeValueRT(rt, s->resolving_funcs[0]);
@@ -21481,13 +22217,13 @@ static void js_async_function_resume(JSContext *ctx, JSAsyncFunctionState *s)
             JSValue error;
         fail:
             error = JS_GetException(ctx);
-            ret2 = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED,
+            ret2 = js_call(ctx, s->resolving_funcs[1], JS_UNDEFINED,
                            1, (JSValueConst *)&error);
             JS_FreeValue(ctx, error);
             JS_FreeValue(ctx, ret2); /* XXX: what to do if exception ? */
         } else {
             /* normal return */
-            ret2 = JS_Call(ctx, s->resolving_funcs[0], JS_UNDEFINED,
+            ret2 = js_call(ctx, s->resolving_funcs[0], JS_UNDEFINED,
                            1, (JSValueConst *)&func_ret);
             JS_FreeValue(ctx, func_ret);
             JS_FreeValue(ctx, ret2); /* XXX: what to do if exception ? */
@@ -21724,7 +22460,7 @@ static void js_async_generator_resolve_or_reject(JSContext *ctx,
 
     next = list_entry(s->queue.next, JSAsyncGeneratorRequest, link);
     list_del(&next->link);
-    ret = JS_Call(ctx, next->resolving_funcs[is_reject], JS_UNDEFINED, 1,
+    ret = js_call(ctx, next->resolving_funcs[is_reject], JS_UNDEFINED, 1,
                   &result);
     JS_FreeValue(ctx, ret);
     JS_FreeValue(ctx, next->result);
@@ -21954,7 +22690,7 @@ static JSValue js_async_generator_next(JSContext *ctx, JSValueConst this_val,
         JSValue err, res2;
         JS_ThrowTypeError(ctx, "not an AsyncGenerator object");
         err = JS_GetException(ctx);
-        res2 = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED,
+        res2 = js_call(ctx, resolving_funcs[1], JS_UNDEFINED,
                        1, (JSValueConst *)&err);
         JS_FreeValue(ctx, err);
         JS_FreeValue(ctx, res2);
@@ -31076,7 +31812,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
         }
 
         /* initialize the global variables */
-        ret_val = JS_Call(ctx, m->func_obj, JS_TRUE, 0, NULL);
+        ret_val = js_call(ctx, m->func_obj, JS_TRUE, 0, NULL);
         if (JS_IsException(ret_val))
             goto fail;
         JS_FreeValue(ctx, ret_val);
@@ -31229,7 +31965,7 @@ static JSValue js_load_module_rejected(JSContext *ctx, JSValueConst this_val,
         error = argv[0];
     else
         error = JS_UNDEFINED;
-    ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED,
+    ret = js_call(ctx, resolving_funcs[1], JS_UNDEFINED,
                   1, &error);
     JS_FreeValue(ctx, ret);
     return JS_UNDEFINED;
@@ -31249,7 +31985,7 @@ static JSValue js_load_module_fulfilled(JSContext *ctx, JSValueConst this_val,
         js_load_module_rejected(ctx, JS_UNDEFINED, 1, (JSValueConst *)&err, 0, func_data);
         return JS_UNDEFINED;
     }
-    ret = JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED,
+    ret = js_call(ctx, resolving_funcs[0], JS_UNDEFINED,
                    1, (JSValueConst *)&ns);
     JS_FreeValue(ctx, ret);
     JS_FreeValue(ctx, ns);
@@ -31281,7 +32017,7 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
     if (JS_IsException(evaluate_promise)) {
     fail:
         err = JS_GetException(ctx);
-        ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED,
+        ret = js_call(ctx, resolving_funcs[1], JS_UNDEFINED,
                       1, (JSValueConst *)&err);
         JS_FreeValue(ctx, ret); /* XXX: what to do if exception ? */
         JS_FreeValue(ctx, err);
@@ -31348,7 +32084,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
     return JS_UNDEFINED;
  exception:
     err = JS_GetException(ctx);
-    ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED,
+    ret = js_call(ctx, resolving_funcs[1], JS_UNDEFINED,
                    1, (JSValueConst *)&err);
     JS_FreeValue(ctx, ret); /* XXX: what to do if exception ? */
     JS_FreeValue(ctx, err);
@@ -31449,7 +32185,7 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier, JSValue
  exception:
     JS_FreeValue(ctx, attributes_obj);
     err = JS_GetException(ctx);
-    ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED,
+    ret = js_call(ctx, resolving_funcs[1], JS_UNDEFINED,
                    1, (JSValueConst *)&err);
     JS_FreeValue(ctx, ret);
     JS_FreeValue(ctx, err);
@@ -31463,7 +32199,7 @@ static void js_set_module_evaluated(JSContext *ctx, JSModuleDef *m)
         JSValue value, ret_val;
         assert(m->cycle_root == m);
         value = JS_UNDEFINED;
-        ret_val = JS_Call(ctx, m->resolving_funcs[0], JS_UNDEFINED,
+        ret_val = js_call(ctx, m->resolving_funcs[0], JS_UNDEFINED,
                           1, (JSValueConst *)&value);
         JS_FreeValue(ctx, ret_val);
     }
@@ -31569,7 +32305,7 @@ static JSValue js_async_module_execution_rejected(JSContext *ctx, JSValueConst t
     if (!JS_IsUndefined(module->promise)) {
         JSValue ret_val;
         assert(module->cycle_root == module);
-        ret_val = JS_Call(ctx, module->resolving_funcs[1], JS_UNDEFINED,
+        ret_val = js_call(ctx, module->resolving_funcs[1], JS_UNDEFINED,
                           1, &error);
         JS_FreeValue(ctx, ret_val);
     }
@@ -31854,7 +32590,7 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
         JS_FreeValue(ctx, result);
         assert(m->status == JS_MODULE_STATUS_EVALUATED);
         assert(m->eval_has_exception);
-        ret_val = JS_Call(ctx, m->resolving_funcs[1], JS_UNDEFINED,
+        ret_val = js_call(ctx, m->resolving_funcs[1], JS_UNDEFINED,
                           1, (JSValueConst *)&m->eval_exception);
         JS_FreeValue(ctx, ret_val);
     } else {
@@ -31868,7 +32604,7 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
             JSValue value;
             assert(m->status == JS_MODULE_STATUS_EVALUATED);
             value = JS_UNDEFINED;
-            ret_val = JS_Call(ctx, m->resolving_funcs[0], JS_UNDEFINED,
+            ret_val = js_call(ctx, m->resolving_funcs[0], JS_UNDEFINED,
                               1, (JSValueConst *)&value);
             JS_FreeValue(ctx, ret_val);
         }
@@ -37461,9 +38197,15 @@ static void js_parse_init(JSContext *ctx, JSParseState *s,
     s->get_line_col_cache.col_num = 0;
 }
 
+/* internal JS_EvalInternal() flag: the evaluation is requested by the
+   host (JS_EvalThis()), see JS_CALL_FLAG_HOST */
+#define JS_EVAL_FLAG_HOST_CALL (1 << 30)
+
+/* 'call_flags' is JS_CALL_FLAG_HOST or 0 */
 static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
                                        JSValueConst this_obj,
-                                       JSVarRef **var_refs, JSStackFrame *sf)
+                                       JSVarRef **var_refs, JSStackFrame *sf,
+                                       int call_flags)
 {
     JSValue ret_val;
     uint32_t tag;
@@ -37473,7 +38215,9 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
         fun_obj = js_closure(ctx, fun_obj, var_refs, sf, TRUE);
         if (JS_IsException(fun_obj))
             return JS_EXCEPTION;
-        ret_val = JS_CallFree(ctx, fun_obj, this_obj, 0, NULL);
+        ret_val = JS_CallInternal(ctx, fun_obj, this_obj, JS_UNDEFINED,
+                                  0, NULL, JS_CALL_FLAG_COPY_ARGV | call_flags);
+        JS_FreeValue(ctx, fun_obj);
     } else if (tag == JS_TAG_MODULE) {
         JSModuleDef *m;
         m = JS_VALUE_GET_PTR(fun_obj);
@@ -37497,7 +38241,8 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
 
 JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj)
 {
-    return JS_EvalFunctionInternal(ctx, fun_obj, ctx->global_obj, NULL, NULL);
+    return JS_EvalFunctionInternal(ctx, fun_obj, ctx->global_obj, NULL, NULL,
+                                   JS_CALL_FLAG_HOST);
 }
 
 /* 'input' must be zero terminated i.e. input[input_len] = '\0'. */
@@ -37606,7 +38351,9 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     if (flags & JS_EVAL_FLAG_COMPILE_ONLY) {
         ret_val = fun_obj;
     } else {
-        ret_val = JS_EvalFunctionInternal(ctx, fun_obj, this_obj, var_refs, sf);
+        ret_val = JS_EvalFunctionInternal(ctx, fun_obj, this_obj, var_refs, sf,
+                                          (flags & JS_EVAL_FLAG_HOST_CALL) ?
+                                          JS_CALL_FLAG_HOST : 0);
     }
     return ret_val;
  fail1:
@@ -37666,7 +38413,7 @@ JSValue JS_EvalThis(JSContext *ctx, JSValueConst this_obj,
     assert(eval_type == JS_EVAL_TYPE_GLOBAL ||
            eval_type == JS_EVAL_TYPE_MODULE);
     ret = JS_EvalInternal(ctx, this_obj, input, input_len, filename,
-                          eval_flags, -1);
+                          eval_flags | JS_EVAL_FLAG_HOST_CALL, -1);
     return ret;
 }
 
@@ -40969,7 +41716,7 @@ static JSValue js_object_toString(JSContext *ctx, JSValueConst this_val,
 static JSValue js_object_toLocaleString(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv)
 {
-    return JS_Invoke(ctx, this_val, JS_ATOM_toString, 0, NULL);
+    return js_invoke(ctx, this_val, JS_ATOM_toString, 0, NULL);
 }
 
 static JSValue js_object_assign(JSContext *ctx, JSValueConst this_val,
@@ -41546,41 +42293,51 @@ static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
 }
 
 /* magic value: 0 = normal apply, 1 = apply for constructor, 2 =
-   Reflect.apply */
-static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv, int magic)
+   Reflect.apply. 'flags' is JS_CALL_FLAG_DIRECT when called by OP_apply
+   (the post-call logic is only cleanup). */
+static JSValue js_function_apply_internal(JSContext *ctx, JSValueConst func_obj,
+                                          JSValueConst this_arg,
+                                          JSValueConst array_arg,
+                                          int magic, int flags)
 {
-    JSValueConst this_arg, array_arg;
     uint32_t len;
     JSValue *tab, ret;
 
-    if (check_function(ctx, this_val))
+    if (check_function(ctx, func_obj))
         return JS_EXCEPTION;
-    this_arg = argv[0];
-    array_arg = argv[1];
     if ((JS_VALUE_GET_TAG(array_arg) == JS_TAG_UNDEFINED ||
          JS_VALUE_GET_TAG(array_arg) == JS_TAG_NULL) && magic != 2) {
-        return JS_Call(ctx, this_val, this_arg, 0, NULL);
+        return JS_CallInternal(ctx, func_obj, this_arg, JS_UNDEFINED, 0, NULL,
+                               JS_CALL_FLAG_COPY_ARGV | flags);
     }
     tab = build_arg_list(ctx, &len, array_arg);
     if (!tab)
         return JS_EXCEPTION;
     if (magic & 1) {
-        ret = JS_CallConstructor2(ctx, this_val, this_arg, len, (JSValueConst *)tab);
+        ret = JS_CallConstructorInternal(ctx, func_obj, this_arg, len, tab,
+                                         JS_CALL_FLAG_COPY_ARGV | flags);
     } else {
-        ret = JS_Call(ctx, this_val, this_arg, len, (JSValueConst *)tab);
+        ret = JS_CallInternal(ctx, func_obj, this_arg, JS_UNDEFINED, len, tab,
+                              JS_CALL_FLAG_COPY_ARGV | flags);
     }
     free_arg_list(ctx, tab, len);
     return ret;
+}
+
+static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv, int magic)
+{
+    return js_function_apply_internal(ctx, this_val, argv[0], argv[1],
+                                      magic, 0);
 }
 
 static JSValue js_function_call(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
     if (argc <= 0) {
-        return JS_Call(ctx, this_val, JS_UNDEFINED, 0, NULL);
+        return js_call(ctx, this_val, JS_UNDEFINED, 0, NULL);
     } else {
-        return JS_Call(ctx, this_val, argv[0], argc - 1, argv + 1);
+        return js_call(ctx, this_val, argv[0], argc - 1, argv + 1);
     }
 }
 
@@ -42072,7 +42829,7 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
             goto exception;
         }
         if (JS_IsConstructor(ctx, this_val))
-            r = JS_CallConstructor(ctx, this_val, 0, NULL);
+            r = js_call_constructor(ctx, this_val, 0, NULL);
         else
             r = JS_NewArray(ctx);
         if (JS_IsException(r))
@@ -42092,7 +42849,7 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
             if (mapping) {
                 args[0] = v;
                 args[1] = JS_NewInt32(ctx, k);
-                v2 = JS_Call(ctx, mapfn, this_arg, 2, args);
+                v2 = js_call(ctx, mapfn, this_arg, 2, args);
                 JS_FreeValue(ctx, v);
                 v = v2;
                 if (JS_IsException(v))
@@ -42111,7 +42868,7 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
         v = JS_NewInt64(ctx, len);
         args[0] = v;
         if (JS_IsConstructor(ctx, this_val)) {
-            r = JS_CallConstructor(ctx, this_val, 1, args);
+            r = js_call_constructor(ctx, this_val, 1, args);
         } else {
             r = js_array_constructor(ctx, JS_UNDEFINED, 1, args);
         }
@@ -42125,7 +42882,7 @@ static JSValue js_array_from(JSContext *ctx, JSValueConst this_val,
             if (mapping) {
                 args[0] = v;
                 args[1] = JS_NewInt32(ctx, k);
-                v2 = JS_Call(ctx, mapfn, this_arg, 2, args);
+                v2 = js_call(ctx, mapfn, this_arg, 2, args);
                 JS_FreeValue(ctx, v);
                 v = v2;
                 if (JS_IsException(v))
@@ -42236,7 +42993,7 @@ static void array_from_async_resolve(JSContext *ctx, JSArrayFromAsyncData *s,
 {
     JSValue ret;
 
-    ret = JS_Call(ctx, s->resolving_funcs[0], JS_UNDEFINED, 1, &value);
+    ret = js_call(ctx, s->resolving_funcs[0], JS_UNDEFINED, 1, &value);
     JS_FreeValue(ctx, ret);
 }
 
@@ -42245,7 +43002,7 @@ static void array_from_async_reject(JSContext *ctx, JSArrayFromAsyncData *s,
 {
     JSValue ret;
 
-    ret = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, &error);
+    ret = js_call(ctx, s->resolving_funcs[1], JS_UNDEFINED, 1, &error);
     JS_FreeValue(ctx, ret);
 }
 
@@ -42314,7 +43071,7 @@ static void array_from_async_fail(JSContext *ctx, JSValueConst obj,
         array_from_async_reject(ctx, s, error);
         return;
     }
-    ret = JS_Call(ctx, method, s->iterator, 0, NULL);
+    ret = js_call(ctx, method, s->iterator, 0, NULL);
     JS_FreeValue(ctx, method);
     if (JS_IsException(ret) || !JS_IsObject(ret)) {
         JS_FreeValue(ctx, ret);
@@ -42404,7 +43161,7 @@ static void js_array_from_async_resume(JSContext *ctx, JSValueConst obj,
                     goto throw_close;
                 }
                 if (JS_IsConstructor(ctx, s->ctor)) {
-                    val = JS_CallConstructor(ctx, s->ctor, 0, NULL);
+                    val = js_call_constructor(ctx, s->ctor, 0, NULL);
                 } else {
                     val = JS_NewArray(ctx);
                 }
@@ -42425,7 +43182,7 @@ static void js_array_from_async_resume(JSContext *ctx, JSValueConst obj,
             s->length = len;
             args[0] = JS_NewInt64(ctx, len);
             if (JS_IsConstructor(ctx, s->ctor)) {
-                val = JS_CallConstructor(ctx, s->ctor, 1, (JSValueConst *)args);
+                val = js_call_constructor(ctx, s->ctor, 1, (JSValueConst *)args);
             } else {
                 val = js_array_constructor(ctx, JS_UNDEFINED, 1, (JSValueConst *)args);
             }
@@ -42438,7 +43195,7 @@ static void js_array_from_async_resume(JSContext *ctx, JSValueConst obj,
             continue;
 
         case AFS_STATE_CALL_NEXT:
-            ret = JS_Call(ctx, s->next_method, s->iterator, 0, NULL);
+            ret = js_call(ctx, s->next_method, s->iterator, 0, NULL);
             if (JS_IsException(ret))
                 goto throw_close;
             done = array_from_async_await(ctx, obj, ret,
@@ -42477,7 +43234,7 @@ static void js_array_from_async_resume(JSContext *ctx, JSValueConst obj,
             if (s->mapping) {
                 args[0] = ret;
                 args[1] = JS_NewInt64(ctx, s->k);
-                val = JS_Call(ctx, s->mapper, s->this_arg, 2, (JSValueConst *)args);
+                val = js_call(ctx, s->mapper, s->this_arg, 2, (JSValueConst *)args);
                 JS_FreeValue(ctx, ret);
                 JS_FreeValue(ctx, args[1]);
                 if (JS_IsException(val))
@@ -42532,7 +43289,7 @@ static void js_array_from_async_resume(JSContext *ctx, JSValueConst obj,
             if (s->mapping) {
                 args[0] = val;
                 args[1] = JS_NewInt64(ctx, s->k);
-                ret = JS_Call(ctx, s->mapper, s->this_arg, 2, (JSValueConst *)args);
+                ret = js_call(ctx, s->mapper, s->this_arg, 2, (JSValueConst *)args);
                 JS_FreeValue(ctx, val);
                 JS_FreeValue(ctx, args[1]);
                 if (JS_IsException(ret))
@@ -42672,7 +43429,7 @@ static JSValue js_array_of(JSContext *ctx, JSValueConst this_val,
 
     if (JS_IsConstructor(ctx, this_val)) {
         args[0] = JS_NewInt32(ctx, argc);
-        obj = JS_CallConstructor(ctx, this_val, 1, (JSValueConst *)args);
+        obj = js_call_constructor(ctx, this_val, 1, (JSValueConst *)args);
     } else {
         obj = JS_NewArray(ctx);
     }
@@ -42762,7 +43519,7 @@ static JSValue JS_ArrayCreateFromCtor(JSContext *ctx, JSValueConst ctor, int64_t
     if (JS_IsUndefined(ctor)) {
         ret = js_array_constructor(ctx, JS_UNDEFINED, 1, (JSValueConst *)&len_val);
     } else {
-        ret = JS_CallConstructor(ctx, ctor, 1, (JSValueConst *)&len_val);
+        ret = js_call_constructor(ctx, ctor, 1, (JSValueConst *)&len_val);
     }
     JS_FreeValue(ctx, len_val);
     return ret;
@@ -43054,7 +43811,7 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
             args[0] = val;
             args[1] = index_val;
             args[2] = obj;
-            res = JS_Call(ctx, func, this_arg, 3, args);
+            res = js_call(ctx, func, this_arg, 3, args);
             JS_FreeValue(ctx, index_val);
             if (JS_IsException(res))
                 goto exception;
@@ -43107,7 +43864,7 @@ done:
         if (JS_IsException(arr))
             goto exception;
         args[0] = ret;
-        res = JS_Invoke(ctx, arr, JS_ATOM_set, 1, args);
+        res = js_invoke(ctx, arr, JS_ATOM_set, 1, args);
         if (check_exception_free(ctx, res)) {
             JS_FreeValue(ctx, arr);
             goto exception;
@@ -43200,7 +43957,7 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
             args[1] = val;
             args[2] = index_val;
             args[3] = obj;
-            acc1 = JS_Call(ctx, func, JS_UNDEFINED, 4, args);
+            acc1 = js_call(ctx, func, JS_UNDEFINED, 4, args);
             JS_FreeValue(ctx, index_val);
             JS_FreeValue(ctx, val);
             val = JS_UNDEFINED;
@@ -43448,7 +44205,7 @@ static JSValue js_array_find(JSContext *ctx, JSValueConst this_val,
         args[0] = val;
         args[1] = index_val;
         args[2] = this_val;
-        res = JS_Call(ctx, func, this_arg, 3, args);
+        res = js_call(ctx, func, this_arg, 3, args);
         if (JS_IsException(res))
             goto exception;
         if (JS_ToBoolFree(ctx, res)) {
@@ -44117,7 +44874,7 @@ static int64_t JS_FlattenIntoArray(JSContext *ctx, JSValueConst target,
             continue;
         if (!JS_IsUndefined(mapperFunction)) {
             JSValueConst args[3] = { element, JS_NewInt64(ctx, sourceIndex), source };
-            element = JS_Call(ctx, mapperFunction, thisArg, 3, args);
+            element = js_call(ctx, mapperFunction, thisArg, 3, args);
             JS_FreeValue(ctx, (JSValue)args[0]);
             JS_FreeValue(ctx, (JSValue)args[1]);
             if (JS_IsException(element))
@@ -44235,7 +44992,7 @@ static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
             goto cmp_same;
         argv[0] = ap->val;
         argv[1] = bp->val;
-        res = JS_Call(ctx, psc->method, JS_UNDEFINED, 2, argv);
+        res = js_call(ctx, psc->method, JS_UNDEFINED, 2, argv);
         if (JS_IsException(res))
             goto exception;
         if (JS_VALUE_GET_TAG(res) == JS_TAG_INT) {
@@ -45668,7 +46425,7 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
                 index_val = JS_NewInt64(ctx, idx);
                 args[0] = item;
                 args[1] = index_val;
-                ret = JS_Call(ctx, func, JS_UNDEFINED, countof(args), args);
+                ret = js_call(ctx, func, JS_UNDEFINED, countof(args), args);
                 JS_FreeValue(ctx, item);
                 JS_FreeValue(ctx, index_val);
                 if (JS_IsException(ret))
@@ -45697,7 +46454,7 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
                 index_val = JS_NewInt64(ctx, idx);
                 args[0] = item;
                 args[1] = index_val;
-                ret = JS_Call(ctx, func, JS_UNDEFINED, countof(args), args);
+                ret = js_call(ctx, func, JS_UNDEFINED, countof(args), args);
                 JS_FreeValue(ctx, index_val);
                 if (JS_IsException(ret)) {
                     JS_FreeValue(ctx, item);
@@ -45730,7 +46487,7 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
                 index_val = JS_NewInt64(ctx, idx);
                 args[0] = item;
                 args[1] = index_val;
-                ret = JS_Call(ctx, func, JS_UNDEFINED, countof(args), args);
+                ret = js_call(ctx, func, JS_UNDEFINED, countof(args), args);
                 JS_FreeValue(ctx, item);
                 JS_FreeValue(ctx, index_val);
                 if (JS_IsException(ret))
@@ -45754,7 +46511,7 @@ static JSValue js_iterator_proto_func(JSContext *ctx, JSValueConst this_val,
                 index_val = JS_NewInt64(ctx, idx);
                 args[0] = item;
                 args[1] = index_val;
-                ret = JS_Call(ctx, func, JS_UNDEFINED, countof(args), args);
+                ret = js_call(ctx, func, JS_UNDEFINED, countof(args), args);
                 JS_FreeValue(ctx, item);
                 JS_FreeValue(ctx, index_val);
                 if (JS_IsException(ret))
@@ -45895,7 +46652,7 @@ static JSValue js_iterator_proto_reduce(JSContext *ctx, JSValueConst this_val,
         args[0] = acc;
         args[1] = item;
         args[2] = index_val;
-        ret = JS_Call(ctx, func, JS_UNDEFINED, countof(args), args);
+        ret = js_call(ctx, func, JS_UNDEFINED, countof(args), args);
         JS_FreeValue(ctx, item);
         JS_FreeValue(ctx, index_val);
         if (JS_IsException(ret))
@@ -46227,7 +46984,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                 index_val = JS_NewInt64(ctx, it->count++);
                 args[0] = item;
                 args[1] = index_val;
-                selected = JS_Call(ctx, it->func, JS_UNDEFINED, countof(args), args);
+                selected = js_call(ctx, it->func, JS_UNDEFINED, countof(args), args);
                 JS_FreeValue(ctx, index_val);
                 if (JS_IsException(selected)) {
                     JS_FreeValue(ctx, item);
@@ -46257,7 +47014,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
                     index_val = JS_NewInt64(ctx, it->count++);
                     args[0] = item;
                     args[1] = index_val;
-                    ret = JS_Call(ctx, it->func, JS_UNDEFINED, countof(args), args);
+                    ret = js_call(ctx, it->func, JS_UNDEFINED, countof(args), args);
                     JS_FreeValue(ctx, item);
                     JS_FreeValue(ctx, index_val);
                     if (JS_IsException(ret))
@@ -46307,7 +47064,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
             index_val = JS_NewInt64(ctx, it->count++);
             args[0] = item;
             args[1] = index_val;
-            ret = JS_Call(ctx, it->func, JS_UNDEFINED, countof(args), args);
+            ret = js_call(ctx, it->func, JS_UNDEFINED, countof(args), args);
             JS_FreeValue(ctx, index_val);
             JS_FreeValue(ctx, item);
             if (JS_IsException(ret))
@@ -47522,7 +48279,7 @@ static JSValue js_string_match(JSContext *ctx, JSValueConst this_val,
             goto fail;
         args[args_len++] = (JSValueConst)str;
     }
-    rx = JS_CallConstructor(ctx, ctx->regexp_ctor, args_len, args);
+    rx = js_call_constructor(ctx, ctx->regexp_ctor, args_len, args);
     JS_FreeValue(ctx, str);
     if (JS_IsException(rx)) {
     fail:
@@ -47738,7 +48495,7 @@ static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
             args[0] = search_str;
             args[1] = JS_NewInt32(ctx, pos);
             args[2] = str;
-            repl_str = JS_ToStringFree(ctx, JS_Call(ctx, replaceValue, JS_UNDEFINED, 3, args));
+            repl_str = JS_ToStringFree(ctx, js_call(ctx, replaceValue, JS_UNDEFINED, 3, args));
             if (JS_IsException(repl_str))
                 goto exception;
             string_buffer_concat_value_free(b, repl_str);
@@ -50473,7 +51230,7 @@ static JSValue js_regexp_Symbol_matchAll(JSContext *ctx, JSValueConst this_val,
         goto exception;
     args[0] = R;
     args[1] = flags;
-    matcher = JS_CallConstructor(ctx, C, 2, args);
+    matcher = js_call_constructor(ctx, C, 2, args);
     if (JS_IsException(matcher))
         goto exception;
     if (JS_ToLengthFree(ctx, &lastIndex,
@@ -50938,7 +51695,7 @@ static JSValue js_regexp_Symbol_split(JSContext *ctx, JSValueConst this_val,
     }
     args[0] = rx;
     args[1] = flags;
-    splitter = JS_CallConstructor(ctx, ctor, 2, args);
+    splitter = js_call_constructor(ctx, ctor, 2, args);
     if (JS_IsException(splitter))
         goto exception;
     A = JS_NewArray(ctx);
@@ -51599,7 +52356,7 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
     args[0] = name_val;
     args[1] = val;
     args[2] = context;
-    res = JS_Call(ctx, reviver, holder, 3, args);
+    res = js_call(ctx, reviver, holder, 3, args);
     JS_FreeValue(ctx, name_val);
     JS_FreeValue(ctx, val);
     JS_FreeValue(ctx, context);
@@ -51824,7 +52581,7 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
     if (!JS_IsUndefined(jsc->replacer_func)) {
         args[0] = key;
         args[1] = val;
-        v = JS_Call(ctx, jsc->replacer_func, holder, 2, args);
+        v = js_call(ctx, jsc->replacer_func, holder, 2, args);
         JS_FreeValue(ctx, val);
         val = v;
         if (JS_IsException(val))
@@ -52234,7 +52991,7 @@ static JSValue js_reflect_construct(JSContext *ctx, JSValueConst this_val,
     tab = build_arg_list(ctx, &len, array_arg);
     if (!tab)
         return JS_EXCEPTION;
-    ret = JS_CallConstructor2(ctx, func, new_target, len, (JSValueConst *)tab);
+    ret = js_call_constructor2(ctx, func, new_target, len, (JSValueConst *)tab);
     free_arg_list(ctx, tab, len);
     return ret;
 }
@@ -53169,7 +53926,7 @@ static JSValue js_proxy_call_constructor(JSContext *ctx, JSValueConst func_obj,
     if (!JS_IsConstructor(ctx, s->target))
         return JS_ThrowTypeErrorNotAConstructor(ctx, s->target);
     if (JS_IsUndefined(method))
-        return JS_CallConstructor2(ctx, s->target, new_target, argc, argv);
+        return js_call_constructor2(ctx, s->target, new_target, argc, argv);
     arg_array = js_create_array(ctx, argc, argv);
     if (JS_IsException(arg_array)) {
         ret = JS_EXCEPTION;
@@ -53178,7 +53935,7 @@ static JSValue js_proxy_call_constructor(JSContext *ctx, JSValueConst func_obj,
     args[0] = s->target;
     args[1] = arg_array;
     args[2] = new_target;
-    ret = JS_Call(ctx, method, s->handler, 3, args);
+    ret = js_call(ctx, method, s->handler, 3, args);
     if (!JS_IsException(ret) && JS_VALUE_GET_TAG(ret) != JS_TAG_OBJECT) {
         JS_FreeValue(ctx, ret);
         ret = JS_ThrowTypeErrorNotAnObject(ctx);
@@ -53208,7 +53965,7 @@ static JSValue js_proxy_call(JSContext *ctx, JSValueConst func_obj,
         return JS_ThrowTypeError(ctx, "not a function");
     }
     if (JS_IsUndefined(method))
-        return JS_Call(ctx, s->target, this_obj, argc, argv);
+        return js_call(ctx, s->target, this_obj, argc, argv);
     arg_array = js_create_array(ctx, argc, argv);
     if (JS_IsException(arg_array)) {
         ret = JS_EXCEPTION;
@@ -53217,7 +53974,7 @@ static JSValue js_proxy_call(JSContext *ctx, JSValueConst func_obj,
     args[0] = s->target;
     args[1] = this_obj;
     args[2] = arg_array;
-    ret = JS_Call(ctx, method, s->handler, 3, args);
+    ret = js_call(ctx, method, s->handler, 3, args);
  fail:
     JS_FreeValue(ctx, method);
     JS_FreeValue(ctx, arg_array);
@@ -53645,7 +54402,7 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
             if (done)
                 break;
             if (is_set) {
-                ret = JS_Call(ctx, adder, obj, 1, (JSValueConst *)&item);
+                ret = js_call(ctx, adder, obj, 1, (JSValueConst *)&item);
                 if (JS_IsException(ret)) {
                     JS_FreeValue(ctx, item);
                     goto fail_close;
@@ -53667,7 +54424,7 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
                     goto fail1;
                 args[0] = key;
                 args[1] = value;
-                ret = JS_Call(ctx, adder, obj, 2, args);
+                ret = js_call(ctx, adder, obj, 2, args);
                 if (JS_IsException(ret)) {
                 fail1:
                     JS_FreeValue(ctx, item);
@@ -54044,7 +54801,7 @@ static JSValue js_map_getOrInsert(JSContext *ctx, JSValueConst this_val,
     mr = map_find_record(ctx, s, key);
     if (!mr) {
         if (computed) {
-            value = JS_Call(ctx, argv[1], JS_UNDEFINED, 1, &key);
+            value = js_call(ctx, argv[1], JS_UNDEFINED, 1, &key);
             if (JS_IsException(value))
                 return JS_EXCEPTION;
             map_delete_record(ctx, s, key);
@@ -54144,7 +54901,7 @@ static JSValue js_map_forEach(JSContext *ctx, JSValueConst this_val,
             else
                 args[0] = JS_DupValue(ctx, mr->value);
             args[2] = (JSValue)this_val;
-            ret = JS_Call(ctx, func, this_arg, 3, (JSValueConst *)args);
+            ret = js_call(ctx, func, this_arg, 3, (JSValueConst *)args);
             JS_FreeValue(ctx, args[0]);
             if (!magic)
                 JS_FreeValue(ctx, args[1]);
@@ -54209,7 +54966,7 @@ static JSValue js_object_groupBy(JSContext *ctx, JSValueConst this_val,
 
         args[0] = v;
         args[1] = JS_NewInt64(ctx, idx);
-        key = JS_Call(ctx, cb, ctx->global_obj, 2, args);
+        key = js_call(ctx, cb, ctx->global_obj, 2, args);
         if (JS_IsException(key))
             goto iterator_close_exception;
 
@@ -54592,7 +55349,7 @@ static JSValue js_set_isDisjointFrom(JSContext *ctx, JSValueConst this_val,
                 goto exception;
             if (done) // item is JS_UNDEFINED
                 break;
-            rv = JS_Call(ctx, has, argv[0], 1, (JSValueConst *)&item);
+            rv = js_call(ctx, has, argv[0], 1, (JSValueConst *)&item);
             JS_FreeValue(ctx, item);
             ok = JS_ToBoolFree(ctx, rv); // returns -1 if rv is JS_EXCEPTION
             if (ok < 0)
@@ -54600,7 +55357,7 @@ static JSValue js_set_isDisjointFrom(JSContext *ctx, JSValueConst this_val,
             found = (ok > 0);
         } while (!found);
     } else {
-        iter = JS_Call(ctx, keys, argv[0], 0, NULL);
+        iter = js_call(ctx, keys, argv[0], 0, NULL);
         if (JS_IsException(iter))
             goto exception;
         next = JS_GetProperty(ctx, iter, JS_ATOM_next);
@@ -54661,7 +55418,7 @@ static JSValue js_set_isSubsetOf(JSContext *ctx, JSValueConst this_val,
             goto exception;
         if (done) // item is JS_UNDEFINED
             break;
-        rv = JS_Call(ctx, has, argv[0], 1, (JSValueConst *)&item);
+        rv = js_call(ctx, has, argv[0], 1, (JSValueConst *)&item);
         JS_FreeValue(ctx, item);
         ok = JS_ToBoolFree(ctx, rv); // returns -1 if rv is JS_EXCEPTION
         if (ok < 0)
@@ -54698,7 +55455,7 @@ static JSValue js_set_isSupersetOf(JSContext *ctx, JSValueConst this_val,
     found = FALSE;
     if (s->record_count < size)
         goto fini;
-    iter = JS_Call(ctx, keys, argv[0], 0, NULL);
+    iter = js_call(ctx, keys, argv[0], 0, NULL);
     if (JS_IsException(iter))
         goto exception;
     next = JS_GetProperty(ctx, iter, JS_ATOM_next);
@@ -54747,7 +55504,7 @@ static JSValue js_set_intersection(JSContext *ctx, JSValueConst this_val,
     if (get_set_record(ctx, argv[0], &size, &has, &keys) < 0)
         goto exception;
     if (s->record_count > size) {
-        iter = JS_Call(ctx, keys, argv[0], 0, NULL);
+        iter = js_call(ctx, keys, argv[0], 0, NULL);
         if (JS_IsException(iter))
             goto exception;
         next = JS_GetProperty(ctx, iter, JS_ATOM_next);
@@ -54789,7 +55546,7 @@ static JSValue js_set_intersection(JSContext *ctx, JSValueConst this_val,
                 goto exception;
             if (done) // item is JS_UNDEFINED
                 break;
-            rv = JS_Call(ctx, has, argv[0], 1, (JSValueConst *)&item);
+            rv = js_call(ctx, has, argv[0], 1, (JSValueConst *)&item);
             ok = JS_ToBoolFree(ctx, rv); // returns -1 if rv is JS_EXCEPTION
             if (ok > 0) {
                 item = map_normalize_key(ctx, item);
@@ -54853,7 +55610,7 @@ static JSValue js_set_difference(JSContext *ctx, JSValueConst this_val,
                 goto exception;
             if (done) // item is JS_UNDEFINED
                 break;
-            rv = JS_Call(ctx, has, argv[0], 1, (JSValueConst *)&item);
+            rv = js_call(ctx, has, argv[0], 1, (JSValueConst *)&item);
             ok = JS_ToBoolFree(ctx, rv); // returns -1 if rv is JS_EXCEPTION
             if (ok < 0) {
                 JS_FreeValue(ctx, item);
@@ -54865,7 +55622,7 @@ static JSValue js_set_difference(JSContext *ctx, JSValueConst this_val,
             JS_FreeValue(ctx, item);
         }
     } else {
-        iter = JS_Call(ctx, keys, argv[0], 0, NULL);
+        iter = js_call(ctx, keys, argv[0], 0, NULL);
         if (JS_IsException(iter))
             goto exception;
         next = JS_GetProperty(ctx, iter, JS_ATOM_next);
@@ -54912,7 +55669,7 @@ static JSValue js_set_symmetricDifference(JSContext *ctx, JSValueConst this_val,
 
     next = JS_UNDEFINED;
     newset = JS_UNDEFINED;
-    iter = JS_Call(ctx, keys, argv[0], 0, NULL);
+    iter = js_call(ctx, keys, argv[0], 0, NULL);
     if (JS_IsException(iter))
         goto exception;
     next = JS_GetProperty(ctx, iter, JS_ATOM_next);
@@ -54979,7 +55736,7 @@ static JSValue js_set_union(JSContext *ctx, JSValueConst this_val,
 
     next = JS_UNDEFINED;
     newset = JS_UNDEFINED;
-    iter = JS_Call(ctx, keys, argv[0], 0, NULL);
+    iter = js_call(ctx, keys, argv[0], 0, NULL);
     if (JS_IsException(iter))
         goto exception;
     next = JS_GetProperty(ctx, iter, JS_ATOM_next);
@@ -55226,7 +55983,7 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
             res = JS_DupValue(ctx, arg);
         }
     } else {
-        res = JS_Call(ctx, handler, JS_UNDEFINED, 1, &arg);
+        res = js_call(ctx, handler, JS_UNDEFINED, 1, &arg);
     }
     is_reject = JS_IsException(res);
     if (is_reject)
@@ -55236,7 +55993,7 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
        creating a dummy promise in the 'await' implementation of async
        functions */
     if (!JS_IsUndefined(func)) {
-        res2 = JS_Call(ctx, func, JS_UNDEFINED,
+        res2 = js_call(ctx, func, JS_UNDEFINED,
                        1, (JSValueConst *)&res);
     } else {
         res2 = JS_UNDEFINED;
@@ -55317,10 +56074,14 @@ static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
     then = argv[2];
     if (js_create_resolving_functions(ctx, args, promise) < 0)
         return JS_EXCEPTION;
-    res = JS_Call(ctx, then, thenable, 2, (JSValueConst *)args);
+    if (unlikely(ctx->rt->promise_hook))
+        js_call_promise_hook(ctx, JS_PROMISE_HOOK_BEFORE, promise, JS_UNDEFINED);
+    res = js_call(ctx, then, thenable, 2, (JSValueConst *)args);
+    if (unlikely(ctx->rt->promise_hook))
+        js_call_promise_hook(ctx, JS_PROMISE_HOOK_AFTER, promise, JS_UNDEFINED);
     if (JS_IsException(res)) {
         JSValue error = JS_GetException(ctx);
-        res = JS_Call(ctx, args[1], JS_UNDEFINED, 1, (JSValueConst *)&error);
+        res = js_call(ctx, args[1], JS_UNDEFINED, 1, (JSValueConst *)&error);
         JS_FreeValue(ctx, error);
     }
     JS_FreeValue(ctx, args[0]);
@@ -55516,11 +56277,35 @@ static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target,
     JS_SetOpaque(obj, s);
     if (js_create_resolving_functions(ctx, args, obj))
         goto fail;
-    ret = JS_Call(ctx, executor, JS_UNDEFINED, 2, (JSValueConst *)args);
+    if (unlikely(rt->promise_hook)) {
+        js_call_promise_hook(ctx, JS_PROMISE_HOOK_INIT, obj,
+                             rt->parent_promise ? rt->parent_promise->value :
+                             JS_UNDEFINED);
+    }
+    return obj;
+ fail:
+    JS_FreeValue(ctx, obj);
+    return JS_EXCEPTION;
+}
+
+static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target,
+                                      int argc, JSValueConst *argv)
+{
+    JSValueConst executor;
+    JSValue obj;
+    JSValue args[2], ret;
+
+    executor = argv[0];
+    if (check_function(ctx, executor))
+        return JS_EXCEPTION;
+    obj = js_promise_new(ctx, new_target, args);
+    if (JS_IsException(obj))
+        return JS_EXCEPTION;
+    ret = js_call(ctx, executor, JS_UNDEFINED, 2, (JSValueConst *)args);
     if (JS_IsException(ret)) {
         JSValue ret2, error;
         error = JS_GetException(ctx);
-        ret2 = JS_Call(ctx, args[1], JS_UNDEFINED, 1, (JSValueConst *)&error);
+        ret2 = js_call(ctx, args[1], JS_UNDEFINED, 1, (JSValueConst *)&error);
         JS_FreeValue(ctx, error);
         if (JS_IsException(ret2))
             goto fail1;
@@ -55574,14 +56359,8 @@ static JSValue js_new_promise_capability(JSContext *ctx,
     executor = js_promise_executor_new(ctx);
     if (JS_IsException(executor))
         return executor;
-
-    if (JS_IsUndefined(ctor)) {
-        result_promise = js_promise_constructor(ctx, ctor, 1,
-                                                (JSValueConst *)&executor);
-    } else {
-        result_promise = JS_CallConstructor(ctx, ctor, 1,
-                                            (JSValueConst *)&executor);
-    }
+    result_promise = js_call_constructor(ctx, ctor, 1,
+                                         (JSValueConst *)&executor);
     if (JS_IsException(result_promise))
         goto fail;
     s = JS_GetOpaque(executor, JS_CLASS_C_FUNCTION_DATA);
@@ -55626,7 +56405,7 @@ static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
     result_promise = js_new_promise_capability(ctx, resolving_funcs, this_val);
     if (JS_IsException(result_promise))
         return result_promise;
-    ret = JS_Call(ctx, resolving_funcs[is_reject], JS_UNDEFINED, 1, argv);
+    ret = js_call(ctx, resolving_funcs[is_reject], JS_UNDEFINED, 1, argv);
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
     if (JS_IsException(ret)) {
@@ -55681,7 +56460,7 @@ static JSValue js_promise_try(JSContext *ctx, JSValueConst this_val,
     
     if (!JS_IsObject(this_val))
         return JS_ThrowTypeErrorNotAnObject(ctx);
-    ret = JS_Call(ctx, argv[0], JS_UNDEFINED, argc - 1, argv + 1);
+    ret = js_call(ctx, argv[0], JS_UNDEFINED, argc - 1, argv + 1);
     if (JS_IsException(ret)) {
         is_reject = 1;
         ret = JS_GetException(ctx);
@@ -55774,10 +56553,10 @@ static JSValue js_promise_all_resolve_element(JSContext *ctx,
             error = js_aggregate_error_constructor(ctx, values);
             if (JS_IsException(error))
                 return JS_EXCEPTION;
-            ret = JS_Call(ctx, resolve, JS_UNDEFINED, 1, (JSValueConst *)&error);
+            ret = js_call(ctx, resolve, JS_UNDEFINED, 1, (JSValueConst *)&error);
             JS_FreeValue(ctx, error);
         } else {
-            ret = JS_Call(ctx, resolve, JS_UNDEFINED, 1, (JSValueConst *)&values);
+            ret = js_call(ctx, resolve, JS_UNDEFINED, 1, (JSValueConst *)&values);
         }
         if (JS_IsException(ret))
             return ret;
@@ -55812,7 +56591,7 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
         JSValue error;
     fail_reject:
         error = JS_GetException(ctx);
-        ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1,
+        ret = js_call(ctx, resolving_funcs[1], JS_UNDEFINED, 1,
                        (JSValueConst *)&error);
         JS_FreeValue(ctx, error);
         if (JS_IsException(ret))
@@ -55843,7 +56622,7 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
                 goto fail_reject;
             if (done)
                 break;
-            next_promise = JS_Call(ctx, promise_resolve,
+            next_promise = js_call(ctx, promise_resolve,
                                    this_val, 1, (JSValueConst *)&item);
             JS_FreeValue(ctx, item);
             if (JS_IsException(next_promise)) {
@@ -55911,7 +56690,7 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
                 JS_FreeValue(ctx, values);
                 values = error;
             }
-            ret = JS_Call(ctx, resolving_funcs[is_promise_any], JS_UNDEFINED,
+            ret = js_call(ctx, resolving_funcs[is_promise_any], JS_UNDEFINED,
                           1, (JSValueConst *)&values);
             if (check_exception_free(ctx, ret))
                 goto fail_reject;
@@ -56048,7 +56827,7 @@ static JSValue js_promise_allKeyed_resolve_element(JSContext *ctx,
         result = promise_keyed_result_object(ctx, keys, values);
         if (JS_IsException(result))
             return JS_EXCEPTION;
-        ret = JS_Call(ctx, handler, JS_UNDEFINED, 1, (JSValueConst *)&result);
+        ret = js_call(ctx, handler, JS_UNDEFINED, 1, (JSValueConst *)&result);
         JS_FreeValue(ctx, result);
         if (JS_IsException(ret))
             return ret;
@@ -56144,7 +56923,7 @@ static JSValue js_promise_allKeyed(JSContext *ctx, JSValueConst this_val,
             goto fail_reject;
         }
 
-        next_promise = JS_Call(ctx, promise_resolve, this_val, 1,
+        next_promise = js_call(ctx, promise_resolve, this_val, 1,
                                (JSValueConst *)&propertyValue);
         JS_FreeValue(ctx, propertyValue);
         if (JS_IsException(next_promise))
@@ -56215,7 +56994,7 @@ static JSValue js_promise_allKeyed(JSContext *ctx, JSValueConst this_val,
         ret = promise_keyed_result_object(ctx, keys, values);
         if (JS_IsException(ret))
             goto fail_reject;
-        error = JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1,
+        error = js_call(ctx, resolving_funcs[0], JS_UNDEFINED, 1,
                         (JSValueConst *)&ret);
         JS_FreeValue(ctx, ret);
         if (check_exception_free(ctx, error))
@@ -56234,7 +57013,7 @@ static JSValue js_promise_allKeyed(JSContext *ctx, JSValueConst this_val,
 
  fail_reject:
     error = JS_GetException(ctx);
-    ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1,
+    ret = js_call(ctx, resolving_funcs[1], JS_UNDEFINED, 1,
                   (JSValueConst *)&error);
     JS_FreeValue(ctx, error);
     if (JS_IsException(ret))
@@ -56269,7 +57048,7 @@ static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
         JSValue error;
     fail_reject:
         error = JS_GetException(ctx);
-        ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1,
+        ret = js_call(ctx, resolving_funcs[1], JS_UNDEFINED, 1,
                        (JSValueConst *)&error);
         JS_FreeValue(ctx, error);
         if (JS_IsException(ret))
@@ -56288,7 +57067,7 @@ static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
                 goto fail_reject;
             if (done)
                 break;
-            next_promise = JS_Call(ctx, promise_resolve,
+            next_promise = js_call(ctx, promise_resolve,
                                    this_val, 1, (JSValueConst *)&item);
             JS_FreeValue(ctx, item);
             if (JS_IsException(next_promise)) {
@@ -56406,7 +57185,7 @@ static JSValue js_promise_catch(JSContext *ctx, JSValueConst this_val,
     JSValueConst args[2];
     args[0] = JS_UNDEFINED;
     args[1] = argv[0];
-    return JS_Invoke(ctx, this_val, JS_ATOM_then, 2, args);
+    return js_invoke(ctx, this_val, JS_ATOM_then, 2, args);
 }
 
 static JSValue js_promise_finally_value_thunk(JSContext *ctx, JSValueConst this_val,
@@ -56431,7 +57210,7 @@ static JSValue js_promise_then_finally_func(JSContext *ctx, JSValueConst this_va
     JSValueConst onFinally = func_data[1];
     JSValue res, promise, ret, then_func;
 
-    res = JS_Call(ctx, onFinally, JS_UNDEFINED, 0, NULL);
+    res = js_call(ctx, onFinally, JS_UNDEFINED, 0, NULL);
     if (JS_IsException(res))
         return res;
     promise = js_promise_resolve(ctx, ctor, 1, (JSValueConst *)&res, 0);
@@ -56483,7 +57262,7 @@ static JSValue js_promise_finally(JSContext *ctx, JSValueConst this_val,
         }
     }
     JS_FreeValue(ctx, ctor);
-    ret = JS_Invoke(ctx, this_val, JS_ATOM_then, 2, (JSValueConst *)then_funcs);
+    ret = js_invoke(ctx, this_val, JS_ATOM_then, 2, (JSValueConst *)then_funcs);
     JS_FreeValue(ctx, then_funcs[0]);
     JS_FreeValue(ctx, then_funcs[1]);
     return ret;
@@ -56681,7 +57460,7 @@ static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst thi
             err = JS_GetException(ctx);
             is_reject = 1;
         done_resolve:
-            res2 = JS_Call(ctx, resolving_funcs[is_reject], JS_UNDEFINED,
+            res2 = js_call(ctx, resolving_funcs[is_reject], JS_UNDEFINED,
                            1, (JSValueConst *)&err);
             JS_FreeValue(ctx, err);
             JS_FreeValue(ctx, res2);
@@ -59475,7 +60254,7 @@ static JSValue js_array_buffer_slice(JSContext *ctx,
     } else {
         JSValue args[1];
         args[0] = JS_NewInt64(ctx, new_len);
-        new_obj = JS_CallConstructor(ctx, ctor, 1, (JSValueConst *)args);
+        new_obj = js_call_constructor(ctx, ctor, 1, (JSValueConst *)args);
         JS_FreeValue(ctx, ctor);
         JS_FreeValue(ctx, args[0]);
     }
@@ -59891,7 +60670,7 @@ static JSValue js_typed_array_create(JSContext *ctx, JSValueConst ctor,
     int new_len;
     int64_t len;
 
-    ret = JS_CallConstructor(ctx, ctor, argc, argv);
+    ret = js_call_constructor(ctx, ctor, argc, argv);
     if (JS_IsException(ret))
         return ret;
     /* validate the typed array */
@@ -60008,7 +60787,7 @@ static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val,
         if (mapping) {
             args[0] = v;
             args[1] = JS_NewInt32(ctx, k);
-            v2 = JS_Call(ctx, mapfn, this_arg, 2, args);
+            v2 = js_call(ctx, mapfn, this_arg, 2, args);
             JS_FreeValue(ctx, v);
             v = v2;
             if (JS_IsException(v))
@@ -60220,7 +60999,7 @@ static JSValue js_typed_array_find(JSContext *ctx, JSValueConst this_val,
         args[0] = val;
         args[1] = index_val;
         args[2] = this_val;
-        res = JS_Call(ctx, func, this_arg, 3, args);
+        res = js_call(ctx, func, this_arg, 3, args);
         if (JS_IsException(res))
             goto exception;
         if (JS_ToBoolFree(ctx, res)) {
@@ -60955,7 +61734,7 @@ static int js_TA_cmp_generic(const void *a, const void *b, void *opaque) {
                               a_idx * (size_t)psc->elt_size);
         argv[1] = psc->getfun(ctx, psc->array +
                               b_idx * (size_t)(psc->elt_size));
-        res = JS_Call(ctx, psc->cmp, JS_UNDEFINED, 2, argv);
+        res = js_call(ctx, psc->cmp, JS_UNDEFINED, 2, argv);
         if (JS_IsException(res)) {
             psc->exception = 1;
             goto done;
@@ -63438,7 +64217,7 @@ static void js_finrec_mark(JSRuntime *rt, JSValueConst val,
 
 static JSValue js_finrec_job(JSContext *ctx, int argc, JSValueConst *argv)
 {
-    return JS_Call(ctx, argv[0], JS_UNDEFINED, 1, &argv[1]);
+    return js_call(ctx, argv[0], JS_UNDEFINED, 1, &argv[1]);
 }
 
 static void finrec_delete_weakref(JSRuntime *rt, JSWeakRefHeader *wh)

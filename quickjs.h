@@ -960,6 +960,87 @@ void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRejectionTrac
 /* return != 0 if the JS code needs to be interrupted */
 typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
+/* return the current interrupt handler (NULL if none) and store its
+   opaque in '*popaque' if 'popaque' is not NULL. Used to chain
+   handlers. */
+JSInterruptHandler *JS_GetInterruptHandler(JSRuntime *rt, void **popaque);
+
+/* Suspension
+
+   A running synchronous execution can be suspended in-process, then
+   resumed (or saved with JS_WriteSnapshot()). The suspension happens at
+   a backward or conditional branch of the bytecode, when the interrupt
+   counter expires (i.e. at the next interrupt handler call), and only
+   if the whole call stack is suspendable:
+   - every frame is a normal (non generator, non async) JS function,
+   - the outermost frame is the JS function called directly by
+     JS_Call(), JS_CallConstructor(), JS_CallConstructor2(), JS_Invoke()
+     or the script run by JS_Eval()/JS_EvalThis()/JS_EvalFunction(),
+     with no JS or native code running (in particular not from a C
+     function, a class call handler or JS_ExecutePendingJob()),
+   - every other frame was called by the previous one through a plain
+     call, method call, 'new', spread call or tail call, possibly
+     through bound functions.
+   JS code run by the engine on behalf of native code is not
+   suspendable: getters, setters, conversions (valueOf, toString...),
+   Proxy traps, promise resolution (thenable 'then'), callbacks of
+   native functions (Array.prototype.forEach, JSON.stringify,
+   DisposableStack.prototype.dispose...), eval code and
+   Function.prototype.call/apply calls, including when they
+   are reached from host API calls such as JS_GetProperty(),
+   JS_ToString() or a JS_Call() of a bound function or of a native
+   function. Otherwise the request stays pending until a later
+   safepoint where the stack is suspendable.
+
+   When the suspension happens, the host API call that started the
+   execution returns JS_EXCEPTION and JS_IsSuspended() returns TRUE. The
+   pending exception is an internal uncatchable marker which is
+   cleared by JS_Resume(). The 'catch' and 'finally' clauses are not
+   executed during the suspension, nor the disposal of the 'using'
+   declarations (the dispose methods called when leaving the scope of
+   a 'using' declaration are method calls of the frame: they are
+   suspendable). Only one execution can be suspended at a time.
+   JS_FreeRuntime() releases a suspended execution.
+
+   If a suspended frame cannot be resumed (stack overflow, interruption
+   by the interrupt handler), it and its suspended callees are
+   terminated: their 'catch' and 'finally' clauses are not executed
+   and their 'using' resources are not disposed, but the closures
+   they created keep working. The error is thrown at the
+   call site of the frame (JS_Resume() returns it for the outermost
+   frame). An out of memory error while suspending terminates the
+   execution in the same way with an uncatchable error. */
+
+/* Ask the engine to suspend the running JS at the next safepoint.
+   Typically called from an interrupt handler. */
+void JS_RequestSuspend(JSRuntime *rt);
+/* TRUE if a suspended execution is pending. */
+JS_BOOL JS_IsSuspended(JSRuntime *rt);
+/* TRUE if the pending exception is the marker of a suspension, i.e. the
+   host call which returned JS_EXCEPTION was suspended (other host calls
+   can run and fail while an execution is suspended). */
+JS_BOOL JS_IsSuspendException(JSContext *ctx);
+/* Continue a suspended execution. Returns the completion value of the
+   host call that was suspended (JS_Eval(), JS_Call()...), or
+   JS_EXCEPTION (check JS_IsSuspended() first: it may have been
+   suspended again). */
+JSValue JS_Resume(JSContext *ctx);
+
+/* Suspend the JS code which called the running C function (or class
+   'call' handler), at the call. The C function must return the result
+   of JS_SuspendCall(), JS_EXCEPTION: the execution is suspended as with
+   JS_RequestSuspend() and the call completes when it is resumed, with
+   the value given to JS_ResumeWith() (undefined with JS_Resume()). The
+   stack must be suspendable from the caller (see JS_RequestSuspend()),
+   which must call the C function directly: otherwise a TypeError is
+   thrown. The suspended execution can be saved with JS_WriteSnapshot(),
+   e.g. to complete the call in another process. */
+JSValue JS_SuspendCall(JSContext *ctx);
+/* Same as JS_Resume() but the call suspended by JS_SuspendCall()
+   returns 'result', or throws it if 'throw_flag' is TRUE. 'result' is
+   freed (it is ignored if no call was suspended by JS_SuspendCall()). */
+JSValue JS_ResumeWith(JSContext *ctx, JSValue result, JS_BOOL throw_flag);
+
 /* if can_block is TRUE, Atomics.wait() can be used */
 void JS_SetCanBlock(JSRuntime *rt, JS_BOOL can_block);
 /* select which debug info is stripped from the compiled code */
