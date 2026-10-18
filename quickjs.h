@@ -429,6 +429,10 @@ int JS_AddIntrinsicMapSet(JSContext *ctx);
 int JS_AddIntrinsicTypedArrays(JSContext *ctx);
 int JS_AddIntrinsicPromise(JSContext *ctx);
 int JS_AddIntrinsicWeakRef(JSContext *ctx);
+/* DOMException constructor (WebIDL), also needed by JS_AddIntrinsicAToB() */
+int JS_AddIntrinsicDOMException(JSContext *ctx);
+/* btoa() and atob() */
+int JS_AddIntrinsicAToB(JSContext *ctx);
 #ifdef CONFIG_TEMPORAL_INTL
 int JS_AddIntrinsicTemporal(JSContext *ctx);
 int JS_AddIntrinsicIntl(JSContext *ctx);
@@ -478,6 +482,7 @@ JSAtom JS_NewAtomLen(JSContext *ctx, const char *str, size_t len);
 JSAtom JS_NewAtom(JSContext *ctx, const char *str);
 JSAtom JS_NewAtomUInt32(JSContext *ctx, uint32_t n);
 JSAtom JS_DupAtom(JSContext *ctx, JSAtom v);
+JSAtom JS_DupAtomRT(JSRuntime *rt, JSAtom v);
 void JS_FreeAtom(JSContext *ctx, JSAtom v);
 void JS_FreeAtomRT(JSRuntime *rt, JSAtom v);
 JSValue JS_AtomToValue(JSContext *ctx, JSAtom atom);
@@ -613,6 +618,18 @@ static js_force_inline JSValue JS_NewUint32(JSContext *ctx, uint32_t val)
     return v;
 }
 
+/* a Number (rounded if > 2^53) */
+static js_force_inline JSValue JS_NewUint64(JSContext *ctx, uint64_t val)
+{
+    JSValue v;
+    if (val <= 0x7fffffff) {
+        v = JS_NewInt32(ctx, val);
+    } else {
+        v = __JS_NewFloat64(ctx, val);
+    }
+    return v;
+}
+
 JSValue JS_NewBigInt64(JSContext *ctx, int64_t v);
 JSValue JS_NewBigUint64(JSContext *ctx, uint64_t v);
 
@@ -702,6 +719,11 @@ JSValue __js_printf_like(2, 3) JS_ThrowTypeError(JSContext *ctx, const char *fmt
 JSValue __js_printf_like(2, 3) JS_ThrowReferenceError(JSContext *ctx, const char *fmt, ...);
 JSValue __js_printf_like(2, 3) JS_ThrowRangeError(JSContext *ctx, const char *fmt, ...);
 JSValue __js_printf_like(2, 3) JS_ThrowInternalError(JSContext *ctx, const char *fmt, ...);
+/* throw an 'Error' object */
+JSValue __js_printf_like(2, 3) JS_ThrowPlainError(JSContext *ctx, const char *fmt, ...);
+/* throw a DOMException of the given name (e.g. "InvalidCharacterError");
+   needs JS_AddIntrinsicDOMException() */
+JSValue __js_printf_like(3, 4) JS_ThrowDOMException(JSContext *ctx, const char *name, const char *fmt, ...);
 JSValue JS_ThrowOutOfMemory(JSContext *ctx);
 
 void __JS_FreeValue(JSContext *ctx, JSValue v);
@@ -772,6 +794,8 @@ int JS_ToIndex(JSContext *ctx, uint64_t *plen, JSValueConst val);
 int JS_ToFloat64(JSContext *ctx, double *pres, JSValueConst val);
 /* return an exception if 'val' is a Number */
 int JS_ToBigInt64(JSContext *ctx, int64_t *pres, JSValueConst val);
+/* same as JS_ToBigInt64() with the result as unsigned (modulo 2^64) */
+int JS_ToBigUint64(JSContext *ctx, uint64_t *pres, JSValueConst val);
 /* same as JS_ToInt64() but allow BigInt */
 int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val);
 JSValue JS_NewBigInt128(JSContext *ctx, uint64_t low, uint64_t high);
@@ -797,6 +821,7 @@ static inline const char *JS_ToCString(JSContext *ctx, JSValueConst val1)
 }
 const char *JS_ToCStringNZ(JSContext *ctx, JSValueConst val1);
 void JS_FreeCString(JSContext *ctx, const char *ptr);
+void JS_FreeCStringRT(JSRuntime *rt, const char *ptr);
 int JS_ToUTF32String(JSContext *ctx, uint32_t **pbuf, JSValueConst val);
 
 JSValue JS_NewSymbol(JSContext *ctx, const char *description, JS_BOOL is_global);
@@ -805,17 +830,35 @@ JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto, JSClassID cla
 JSValue JS_NewObjectClass(JSContext *ctx, int class_id);
 JSValue JS_NewObjectProto(JSContext *ctx, JSValueConst proto);
 JSValue JS_NewObject(JSContext *ctx);
+/* new object with the 'count' enumerable properties props[i] = values[i].
+   The values are freed, even in case of exception. */
+JSValue JS_NewObjectFrom(JSContext *ctx, int count, const JSAtom *props,
+                         const JSValue *values);
+/* same as JS_NewObjectFrom() with property names as UTF-8 strings */
+JSValue JS_NewObjectFromStr(JSContext *ctx, int count, const char **props,
+                            const JSValue *values);
 JSValue JS_CreateFromConstructor(JSContext *ctx, JSValueConst ctor, 
                                  int class_id);
 
 JS_BOOL JS_IsFunction(JSContext* ctx, JSValueConst val);
 JS_BOOL JS_IsConstructor(JSContext* ctx, JSValueConst val);
+JS_BOOL JS_IsAsyncFunction(JSValueConst val);
 JS_BOOL JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, JS_BOOL val);
 
 JSValue JS_NewArray(JSContext *ctx);
 int JS_IsArray(JSContext *ctx, JSValueConst val);
+/* new array with the 'count' elements values[]. The values are freed,
+   even in case of exception. */
+JSValue JS_NewArrayFrom(JSContext *ctx, int count, const JSValue *values);
+/* ToLength(obj.length): return -1 if exception */
+int JS_GetLength(JSContext *ctx, JSValueConst obj, int64_t *pres);
+JS_BOOL JS_IsRegExp(JSValueConst val);
+JS_BOOL JS_IsMap(JSValueConst val);
+JS_BOOL JS_IsSet(JSValueConst val);
+JS_BOOL JS_IsWeakRef(JSValueConst val);
 
 JSValue JS_NewDate(JSContext *ctx, double epoch_ms);
+JS_BOOL JS_IsDate(JSValueConst val);
 int JS_ThisDateValue(JSContext *ctx, double *valp, JSValueConst this_val);
 
 JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
@@ -923,6 +966,8 @@ JSValue JS_NewArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len,
 JSValue JS_NewArrayBufferCopy(JSContext *ctx, const uint8_t *buf, size_t len);
 void JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj);
 uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst obj);
+/* TRUE for an ArrayBuffer (not a SharedArrayBuffer) */
+JS_BOOL JS_IsArrayBuffer(JSValueConst val);
 
 typedef enum JSTypedArrayEnum {
     JS_TYPED_ARRAY_UINT8C = 0,
@@ -968,6 +1013,31 @@ JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValue promise);
    so if it was not) */
 void JS_PromiseMarkAsHandled(JSContext *ctx, JSValueConst promise);
 JSValue JS_PromiseResult(JSContext *ctx, JSValue promise);
+JS_BOOL JS_IsPromise(JSValueConst val);
+/* same as Promise.resolve(value) or Promise.reject(value) */
+JSValue JS_NewSettledPromise(JSContext *ctx, JS_BOOL is_reject,
+                             JSValueConst value);
+/* same as promise.then(on_fulfilled, on_rejected) for a promise object,
+   but neither 'then' nor Symbol.species are looked up: the result is a
+   new %Promise% */
+JSValue JS_PromiseThen(JSContext *ctx, JSValueConst promise,
+                       JSValueConst on_fulfilled, JSValueConst on_rejected);
+
+typedef enum JSPromiseHookType {
+    JS_PROMISE_HOOK_INIT, /* a promise is created */
+    JS_PROMISE_HOOK_BEFORE, /* before the 'then' of a thenable resolution is called */
+    JS_PROMISE_HOOK_AFTER, /* after the 'then' of a thenable resolution is called */
+    JS_PROMISE_HOOK_RESOLVE, /* a promise is fulfilled (not when rejected) */
+} JSPromiseHookType;
+
+/* 'parent_promise' is only set for JS_PROMISE_HOOK_INIT: the promise
+   whose then() created 'promise', JS_UNDEFINED otherwise. The hook must
+   not run JS code that throws: its exceptions are ignored. */
+typedef void JSPromiseHook(JSContext *ctx, JSPromiseHookType type,
+                           JSValueConst promise, JSValueConst parent_promise,
+                           void *opaque);
+/* NULL removes the hook */
+void JS_SetPromiseHook(JSRuntime *rt, JSPromiseHook *promise_hook, void *opaque);
 
 /* is_handled = TRUE means that the rejection is handled */
 typedef void JSHostPromiseRejectionTracker(JSContext *ctx, JSValueConst promise,
@@ -1109,6 +1179,8 @@ typedef JSValue JSJobFunc(JSContext *ctx, int argc, JSValueConst *argv);
 int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv);
 
 JS_BOOL JS_IsJobPending(JSRuntime *rt);
+/* the realm of the next pending job, NULL if none */
+JSContext *JS_GetPendingJobContext(JSRuntime *rt);
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
 
 /* Object Writer/Reader (currently only used to handle precompiled code) */
@@ -1458,6 +1530,14 @@ void JS_PrintValue(JSContext *ctx, JSPrintValueWrite *write_func, void *write_op
 
 #undef js_unlikely
 #undef js_force_inline
+
+/* engine version (the VERSION file): JS_GetVersion() returns
+   QJS_VERSION_STRING */
+#define QJS_VERSION_YEAR 2026
+#define QJS_VERSION_MONTH 6
+#define QJS_VERSION_DAY 4
+#define QJS_VERSION_STRING "2026-06-04"
+const char *JS_GetVersion(void);
 
 #ifdef __cplusplus
 } /* extern "C" { */

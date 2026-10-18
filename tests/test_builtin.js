@@ -1173,6 +1173,121 @@ function test_line_column_numbers()
     eval_error('var a;\n 1 + (a @+= poisoned_number);', Error, 1);
 }
 
+function test_sort_identical_values()
+{
+    var calls, o = {};
+    calls = 0;
+    [o, o, o].sort(function(a, b) { calls++; return 0; });
+    assert(calls >= 2);
+    calls = 0;
+    [1, 1].toSorted(function(a, b) { calls++; return 0; });
+    assert(calls >= 1);
+}
+
+function test_queue_microtask()
+{
+    var log = [];
+    assert(typeof queueMicrotask, "function");
+    assert(queueMicrotask.length, 1);
+    assert_throws(TypeError, () => queueMicrotask());
+    assert_throws(TypeError, () => queueMicrotask({}));
+    Promise.resolve().then(() => log.push("p1"));
+    queueMicrotask(function() {
+        log.push(this === undefined ? "m1" : "bad this");
+        queueMicrotask(() => log.push("m3"));
+    });
+    Promise.resolve().then(() => log.push("p2"));
+    assert(queueMicrotask(() => log.push("m2")), undefined);
+    log.push("sync");
+    os.setTimeout(() => {
+        assert(log.join(), "sync,p1,m1,p2,m2,m3");
+    }, 0);
+}
+
+function test_base64()
+{
+    assert(btoa(""), "");
+    assert(btoa("f"), "Zg==");
+    assert(btoa("fo"), "Zm8=");
+    assert(btoa("foo"), "Zm9v");
+    assert(btoa("\xff\xfe\x00"), "//4A");
+    assert(btoa(123), "MTIz");
+    assert(atob(""), "");
+    assert(atob("Zm9v"), "foo");
+    assert(atob("Zg=="), "f");
+    assert(atob("Zg"), "f");
+    assert(atob(" Zm 9v\n\t\f\r"), "foo");
+    assert(atob("Zh=="), "f"); /* non zero trailing bits are ignored */
+    assert(atob("//4A"), "\xff\xfe\x00");
+    assert(atob(btoa("\x00\x80\xff")), "\x00\x80\xff");
+    assert(atob(null), "\x9e\xe9e"); /* "null" */
+    for (var s of ["Z", "Zg=", "Zm9v=", "Zg==Zg==", "Z===", "Zm-v", "Zm9\u0100", "Zm9v\u00e9"]) {
+        try {
+            atob(s);
+            throw_error("atob: expected exception for " + JSON.stringify(s));
+        } catch (e) {
+            assert(e instanceof DOMException, true, s);
+            assert(e.name, "InvalidCharacterError");
+            assert(e.code, DOMException.INVALID_CHARACTER_ERR);
+        }
+    }
+    try {
+        btoa("\u0100");
+        throw_error("btoa: expected exception");
+    } catch (e) {
+        assert(e instanceof DOMException);
+        assert(e.code, 5);
+    }
+    assert_throws(TypeError, () => btoa());
+    assert_throws(TypeError, () => atob());
+}
+
+function test_dom_exception()
+{
+    var e, d;
+    e = new DOMException();
+    assert(e.name, "Error");
+    assert(e.message, "");
+    assert(e.code, 0);
+    assert(e instanceof Error);
+    assert(Error.isError(e), true);
+    assert(Error.isError(DOMException.prototype), false);
+    assert(Object.getPrototypeOf(DOMException.prototype), Error.prototype);
+    assert(Object.prototype.toString.call(e), "[object DOMException]");
+    assert(String(e), "Error");
+    e = new DOMException("msg", "NotFoundError");
+    assert(e.name, "NotFoundError");
+    assert(e.message, "msg");
+    assert(e.code, 8);
+    assert(String(e), "NotFoundError: msg");
+    assert(typeof e.stack, "string");
+    assert(Object.keys(e).length, 0);
+    assert(new DOMException("m", "Custom").code, 0);
+    assert(new DOMException(undefined, undefined).name, "Error");
+    assert(new DOMException(1, 2).name, "2");
+    assert(DOMException.length, 0);
+    assert(DOMException.name, "DOMException");
+    assert_throws(TypeError, () => DOMException());
+    assert(DOMException.DATA_CLONE_ERR, 25);
+    assert(DOMException.prototype.ABORT_ERR, 20);
+    assert(e.TIMEOUT_ERR, 23);
+    d = Object.getOwnPropertyDescriptor(DOMException, "INDEX_SIZE_ERR");
+    assert(d.value === 1 && d.enumerable && !d.writable && !d.configurable);
+    d = Object.getOwnPropertyDescriptor(DOMException.prototype, "name");
+    assert(typeof d.get === "function" && d.enumerable && d.configurable && d.set === undefined);
+    d = Object.getOwnPropertyDescriptor(globalThis, "DOMException");
+    assert(d.writable && !d.enumerable && d.configurable);
+    assert_throws(TypeError, () => DOMException.prototype.name);
+    assert_throws(TypeError, () => Object.getOwnPropertyDescriptor(DOMException.prototype, "code").get.call({}));
+    class MyError extends DOMException {
+        constructor() { super("sub", "AbortError"); }
+    }
+    e = new MyError();
+    assert(e instanceof MyError && e instanceof DOMException);
+    assert(e.name, "AbortError");
+    assert(e.code, 20);
+}
+
 test();
 test_function();
 test_enum();
@@ -1194,3 +1309,7 @@ test_finalization_registry();
 test_generator();
 test_rope();
 test_line_column_numbers();
+test_sort_identical_values();
+test_queue_microtask();
+test_base64();
+test_dom_exception();
