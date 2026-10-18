@@ -9,19 +9,13 @@ This crate is a low level unsafe raw bindings for the [QuickJS](https://bellard.
 
 __NOTE:__ Usually you shouldn't use this crate directly, instead use [rquickjs](https://crates.io/crates/rquickjs) crate which provides high level safe bindings.
 
-## Patches
+## Engine
 
-In order to fix bugs and get support for some unimplemented features the series of patches applies to released sources.
-
-Hot fixes:
-- Fix for _check stack overflow_ (important for Rust)
-- Atomic support for `JS_NewClassID` (important for Rust)
-- Infinity handling (replacement `1.0 / 0.0` to `INFINITY` constant)
-
-Special patches:
-- Reading module exports (`exports` feature)
-- Reset stack function (`parallel` feature)
-- MSVC support
+The build script compiles the QuickJS sources two directories above this crate (`quickjs.c`
+with its snapshot code, `libregexp.c`, `libunicode.c`, `cutils.c`, `dtoa.c`), without Intl,
+Temporal and `quickjs-libc`. The bundled bindings of `src/bindings` are generated from its
+`quickjs.h` by `scripts/gen-bindings.sh`; other targets need the `bindgen` feature. The `dump-*`
+features define the engine `DUMP_*` debug options.
 
 ## Environment Variables
 

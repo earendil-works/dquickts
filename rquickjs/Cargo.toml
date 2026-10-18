@@ -10,22 +10,12 @@ description = "High level bindings to the QuickJS JavaScript engine"
 keywords = ["quickjs", "ecmascript", "javascript", "es6", "es2020"]
 categories = ["api-bindings"]
 repository = "https://github.com/DelSkayn/rquickjs.git"
+# vendored: rquickjs-sys builds the QuickJS tree it lives in
+publish = false
 
 
 [workspace]
-members = [
-  "sys",
-  "core",
-  "macro",
-  "examples/native-module",
-  "examples/module-loader",
-  "examples/import-attributes",
-  "examples/rquickjs-cli",
-  "examples/class-methods",
-  "examples/exotic",
-]
-# builds only for wasm32-unknown-unknown and is driven by wasm-test/runner.ts
-exclude = ["wasm-test"]
+members = ["sys", "core", "macro"]
 
 [workspace.dependencies]
 rquickjs-core = { version = "0.14.0", path = "core", default-features = false }

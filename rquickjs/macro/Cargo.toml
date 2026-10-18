@@ -9,6 +9,7 @@ description = "Procedural macros for rquickjs"
 keywords = ["quickjs", "ecmascript", "javascript", "es6", "es2020"]
 categories = ["api-bindings"]
 repository = "https://github.com/DelSkayn/rquickjs.git"
+publish = false
 
 [lib]
 proc-macro = true

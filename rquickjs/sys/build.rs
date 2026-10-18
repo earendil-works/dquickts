@@ -95,9 +95,9 @@ fn main() {
     #[cfg(feature = "logging")]
     pretty_env_logger::init();
 
-    let features = [
-        "bindgen",
-        "update-bindings",
+    // Engine dump options (debug output of the C engine), see the DUMP_x
+    // defines at the top of quickjs.c.
+    let dump_features = [
         "dump-bytecode",
         "dump-gc",
         "dump-gc-free",
@@ -110,23 +110,26 @@ fn main() {
         "dump-module-resolve",
         "dump-promise",
         "dump-read-object",
-        "disable-assertions",
     ];
 
-    for feature in &features {
+    for feature in dump_features
+        .iter()
+        .chain(&["bindgen", "update-bindings", "disable-assertions"])
+    {
         println!("cargo:rerun-if-env-changed={}", feature_to_cargo(feature));
     }
     println!("cargo:rerun-if-env-changed=CARGO_CFG_SANITIZE");
 
-    let src_dir = Path::new("quickjs");
+    // The engine is the QuickJS tree this crate is vendored in.
+    let src_dir = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("../..");
+    let src_dir = src_dir
+        .canonicalize()
+        .expect("the QuickJS sources must be two directories above rquickjs-sys");
 
     let out_dir = env::var("OUT_DIR").expect("No OUT_DIR env var is set by cargo");
     let out_dir = Path::new(&out_dir);
 
     let header_files = [
-        "builtin-array-fromasync.h",
-        "builtin-iterator-zip-keyed.h",
-        "builtin-iterator-zip.h",
         "cutils.h",
         "dtoa.h",
         "libregexp-opcode.h",
@@ -136,13 +139,40 @@ fn main() {
         "list.h",
         "quickjs-atom.h",
         "quickjs-opcode.h",
-        "quickjs-c-atomics.h",
         "quickjs.h",
+        // included by quickjs.c
+        "quickjs-snapshot.c",
+        "quickjs-snapshot-data.c",
+        "quickjs-snapshot-control.c",
+        "VERSION",
     ];
 
-    let source_files = ["libregexp.c", "libunicode.c", "quickjs.c", "dtoa.c"];
+    let source_files = [
+        "quickjs.c",
+        "libregexp.c",
+        "libunicode.c",
+        "cutils.c",
+        "dtoa.c",
+    ];
 
-    let mut defines: Vec<(String, Option<&str>)> = vec![("_GNU_SOURCE".into(), None)];
+    for file in source_files.iter().chain(header_files.iter()) {
+        println!("cargo:rerun-if-changed={}", src_dir.join(file).display());
+    }
+    println!("cargo:rerun-if-changed=quickjs.bind.h");
+
+    let version = fs::read_to_string(src_dir.join("VERSION")).expect("Unable to read VERSION");
+    let version = format!("\"{}\"", version.trim());
+
+    let mut defines: Vec<(String, Option<&str>)> = vec![
+        ("_GNU_SOURCE".into(), None),
+        ("CONFIG_VERSION".into(), Some(version.as_str())),
+    ];
+
+    for feature in &dump_features {
+        if env::var(feature_to_cargo(feature)).is_ok() {
+            defines.push((feature_to_define(feature), Some("1")));
+        }
+    }
 
     #[cfg(feature = "disable-assertions")]
     defines.push(("NDEBUG".into(), None));
@@ -153,10 +183,13 @@ fn main() {
     let mut builder = cc::Build::new();
     builder
         .extra_warnings(false)
+        .include(&src_dir)
+        // same code generation options as the engine Makefile
+        .flag_if_supported("-funsigned-char")
+        .flag_if_supported("-fwrapv")
         .flag_if_supported("-Wno-implicit-const-int-float-conversion")
-        //.flag("-Wno-array-bounds")
-        //.flag("-Wno-format-truncation")
-        ;
+        .flag_if_supported("-Wno-unused-parameter")
+        .flag_if_supported("-Wno-sign-compare");
 
     match env::var("CARGO_CFG_SANITIZE").as_deref() {
         Ok("address") => {
@@ -181,7 +214,7 @@ fn main() {
         _ => {}
     }
 
-    let mut bindgen_cflags = vec![];
+    let mut bindgen_cflags = vec![format!("-I{}", src_dir.display())];
 
     if target_os == "windows" {
         if target_env == "msvc" {
@@ -190,40 +223,18 @@ fn main() {
                 "/DWIN32_LEAN_AND_MEAN /std:c11 /experimental:c11atomics",
             );
         } else {
-            env::set_var("CFLAGS", "-DWIN32_LEAN_AND_MEAN -std=c11");
+            // GNU C: the engine uses `asm`
+            env::set_var("CFLAGS", "-DWIN32_LEAN_AND_MEAN -std=gnu11");
         }
     }
 
-    // wasm32-unknown-unknown takes the same emscripten-flavoured config as
-    // wasi, but ships no libc: headers and the prebuilt libc.a come from
-    // vendor/wasi-libc (see scripts/vendor-wasm-libc.sh), and the OS tail
-    // (clock, stdio, abort) is supplied by wasm-shim/shim.c.
-    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
-    let is_wasm_unknown = target_arch == "wasm32" && target_os == "unknown";
-
-    if target_os == "wasi" || is_wasm_unknown {
+    if target_os == "wasi" {
         // pretend we're emscripten - there are already ifdefs that match
         // also, wasi doesn't ahve FE_DOWNWARD or FE_UPWARD
         defines.push(("EMSCRIPTEN".into(), Some("1")));
         defines.push(("FE_DOWNWARD".into(), Some("0")));
         defines.push(("FE_UPWARD".into(), Some("0")));
     }
-
-    if is_wasm_unknown {
-        println!("cargo:rerun-if-changed=vendor/wasi-libc/include");
-        let vendor_include = Path::new("vendor/wasi-libc/include")
-            .canonicalize()
-            .expect("vendor/wasi-libc/include is missing; run scripts/vendor-wasm-libc.sh");
-        let flag = format!("-isystem{}", vendor_include.display());
-        builder.flag(&flag);
-        bindgen_cflags.push(flag);
-    }
-
-    for file in source_files.iter().chain(header_files.iter()) {
-        fs::copy(src_dir.join(file), out_dir.join(file))
-            .expect("Unable to copy source; try 'git submodule update --init'");
-    }
-    fs::copy("quickjs.bind.h", out_dir.join("quickjs.bind.h")).expect("Unable to copy source");
 
     if target_os == "wasi" && !matches!(env::var("RQUICKJS_SYS_NO_WASI_SDK").as_deref(), Ok("1")) {
         let wasi_sdk_path = get_wasi_sdk_path();
@@ -246,7 +257,7 @@ fn main() {
     // generating bindings
     bindgen(
         out_dir,
-        out_dir.join("quickjs.bind.h"),
+        Path::new("quickjs.bind.h"),
         &defines,
         bindgen_cflags,
     );
@@ -256,30 +267,10 @@ fn main() {
     }
 
     for src in &source_files {
-        builder.file(out_dir.join(src));
-    }
-
-    if is_wasm_unknown {
-        // The shim goes into libquickjs.a rather than its own archive: lld
-        // resolves an archive to a fixpoint, so every definition here is
-        // picked up before libc.a is reached and the matching libc.a member
-        // (and whatever WASI import it would have needed) is never
-        // extracted.
-        println!("cargo:rerun-if-changed=wasm-shim/shim.c");
-        builder.file("wasm-shim/shim.c");
+        builder.file(src_dir.join(src));
     }
 
     builder.compile("libquickjs.a");
-
-    // Emitted after `compile` so `-lquickjs` precedes `-lc` on the link line.
-    if is_wasm_unknown {
-        println!("cargo:rerun-if-changed=vendor/wasi-libc/lib/libc.a");
-        let vendor_lib = Path::new("vendor/wasi-libc/lib")
-            .canonicalize()
-            .expect("vendor/wasi-libc/lib is missing; run scripts/vendor-wasm-libc.sh");
-        println!("cargo:rustc-link-search=native={}", vendor_lib.display());
-        println!("cargo:rustc-link-lib=static=c");
-    }
 }
 
 fn feature_to_cargo(name: impl AsRef<str>) -> String {

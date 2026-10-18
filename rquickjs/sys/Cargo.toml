@@ -9,6 +9,7 @@ description = "QuickJS bindings for rquickjs"
 keywords = ["quickjs", "ecmascript", "javascript", "es6", "es2020"]
 categories = ["external-ffi-bindings"]
 repository = "https://github.com/DelSkayn/rquickjs.git"
+publish = false
 
 [build-dependencies]
 cc = "1"

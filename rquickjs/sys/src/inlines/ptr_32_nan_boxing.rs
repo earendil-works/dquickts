@@ -14,6 +14,11 @@ pub unsafe fn JS_VALUE_GET_BOOL(v: JSValue) -> bool {
 }
 
 #[inline]
+pub unsafe fn JS_VALUE_GET_SHORT_BIG_INT(v: JSValue) -> i64 {
+    v as i32 as i64
+}
+
+#[inline]
 pub unsafe fn JS_VALUE_GET_PTR(v: JSValue) -> *mut c_void {
     v as isize as *mut c_void
 }
