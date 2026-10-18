@@ -256,6 +256,14 @@ DEF(             or, 1, 2, 1, none)
 DEF(is_undefined_or_null, 1, 1, 1, none)
 DEF(     private_in, 1, 2, 1, none)
 DEF(push_bigint_i32, 5, 0, 1, i32)
+/* explicit resource management */
+DEF(    using_check, 2, 1, 2, u8) /* value -> value method, u8 = 'await using' */
+DEF(  dispose_start, 1, 0, 1, none) /* -> error (none) */
+DEF(  dispose_merge, 1, 2, 1, none) /* error exception -> error */
+DEF(    dispose_end, 1, 1, 0, none) /* error -> (throws the error if any) */
+/* decorators */
+DEF(apply_decorators, 2, 5, 1, u8) /* target key value decorators state -> result */
+DEF(decorator_helper, 2, 3, 1, u8) /* a b c -> result */
 /* must be the last non short and non temporary opcode */
 DEF(            nop, 1, 0, 0, none)
 
@@ -283,6 +291,8 @@ def(scope_in_private_field, 7, 1, 1, atom_u16) /* obj -> res emitted in phase 1,
 def(get_field_opt_chain, 5, 1, 1, atom) /* emitted in phase 1, removed in phase 2 */
 def(get_array_el_opt_chain, 1, 2, 1, none) /* emitted in phase 1, removed in phase 2 */
 def( set_class_name, 5, 1, 1, u32) /* emitted in phase 1, removed in phase 2 */
+
+def(  dispose_scope, 3, 1, 1, u16) /* error -> error, emitted in phase 1, removed in phase 2 */
 
 def(       line_num, 5, 0, 0, u32) /* emitted in phase 1, removed in phase 3 */
 

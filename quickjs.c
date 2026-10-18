@@ -165,6 +165,8 @@ enum {
     JS_CLASS_ITERATOR_WRAP,     /* u.iterator_wrap_data */
     JS_CLASS_ITERATOR_ZIP,      /* u.iterator_zip_data */
     JS_CLASS_ARRAY_FROM_ASYNC,  /* u.array_from_async_data */
+    JS_CLASS_DISPOSABLE_STACK,  /* u.disposable_stack */
+    JS_CLASS_ASYNC_DISPOSABLE_STACK, /* u.disposable_stack */
     JS_CLASS_MAP_ITERATOR,      /* u.map_iterator_data */
     JS_CLASS_SET_ITERATOR,      /* u.map_iterator_data */
     JS_CLASS_ARRAY_ITERATOR,    /* u.array_iterator_data */
@@ -205,6 +207,7 @@ typedef enum JSErrorEnum {
     JS_URI_ERROR,
     JS_INTERNAL_ERROR,
     JS_AGGREGATE_ERROR,
+    JS_SUPPRESSED_ERROR,
 
     JS_NATIVE_ERROR_COUNT, /* number of different NativeError objects */
     JS_PLAIN_ERROR = JS_NATIVE_ERROR_COUNT, /* 'Error', only for JS_ThrowError() */
@@ -720,6 +723,11 @@ typedef enum {
     JS_VAR_PRIVATE_SETTER, /* must come after JS_VAR_PRIVATE_GETTER */
     JS_VAR_PRIVATE_GETTER_SETTER, /* must come after JS_VAR_PRIVATE_SETTER */
     JS_VAR_GLOBAL_FUNCTION_DECL, /* global function definition, only in JSVarDef */
+    /* hidden local holding the dispose method of a 'using' (resp.
+       'await using') resource, undefined until the declaration is
+       evaluated. The resource value is in the previous local. */
+    JS_VAR_USING,
+    JS_VAR_AWAIT_USING,
 } JSVarKindEnum;
 
 typedef struct JSBytecodeVarDef {
@@ -1143,6 +1151,7 @@ struct JSObject {
         struct JSIteratorWrapData *iterator_wrap_data; /* JS_CLASS_ITERATOR_WRAP */
         struct JSIteratorZipData *iterator_zip_data; /* JS_CLASS_ITERATOR_ZIP */
         struct JSArrayFromAsyncData *array_from_async_data; /* JS_CLASS_ARRAY_FROM_ASYNC */
+        struct JSDisposableStack *disposable_stack; /* JS_CLASS_DISPOSABLE_STACK, JS_CLASS_ASYNC_DISPOSABLE_STACK */
         struct JSProxyData *proxy_data; /* JS_CLASS_PROXY */
         struct JSPromiseData *promise_data; /* JS_CLASS_PROMISE */
         struct JSPromiseFunctionData *promise_function_data; /* JS_CLASS_PROMISE_RESOLVE_FUNCTION, JS_CLASS_PROMISE_REJECT_FUNCTION */
@@ -1363,6 +1372,9 @@ static void js_iterator_wrap_mark(JSRuntime *rt, JSValueConst val,
 static void js_iterator_zip_finalizer(JSRuntime *rt, JSValue val);
 static void js_iterator_zip_mark(JSRuntime *rt, JSValueConst val,
                                  JS_MarkFunc *mark_func);
+static void js_disposable_stack_finalizer(JSRuntime *rt, JSValue val);
+static void js_disposable_stack_mark(JSRuntime *rt, JSValueConst val,
+                                     JS_MarkFunc *mark_func);
 static void js_array_from_async_finalizer(JSRuntime *rt, JSValue val);
 static void js_array_from_async_mark(JSRuntime *rt, JSValueConst val,
                                      JS_MarkFunc *mark_func);
@@ -1466,6 +1478,10 @@ static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
 static JSValue js_import_meta(JSContext *ctx);
 static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier, JSValueConst options);
 static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
+static JSValue js_using_get_dispose_method(JSContext *ctx, JSValueConst val,
+                                           BOOL is_async);
+static JSValue js_dispose_merge_error(JSContext *ctx, JSValue error,
+                                      JSValue exc);
 static JSValue js_new_promise_capability(JSContext *ctx,
                                          JSValue *resolving_funcs,
                                          JSValueConst ctor);
@@ -2156,6 +2172,8 @@ static JSClassShortDef const js_std_class_def[] = {
     { JS_ATOM_IteratorWrap, js_iterator_wrap_finalizer, js_iterator_wrap_mark }, /* JS_CLASS_ITERATOR_WRAP */
     { JS_ATOM_IteratorZip, js_iterator_zip_finalizer, js_iterator_zip_mark }, /* JS_CLASS_ITERATOR_ZIP */
     { JS_ATOM_ArrayFromAsync, js_array_from_async_finalizer, js_array_from_async_mark }, /* JS_CLASS_ARRAY_FROM_ASYNC */
+    { JS_ATOM_DisposableStack, js_disposable_stack_finalizer, js_disposable_stack_mark }, /* JS_CLASS_DISPOSABLE_STACK */
+    { JS_ATOM_AsyncDisposableStack, js_disposable_stack_finalizer, js_disposable_stack_mark }, /* JS_CLASS_ASYNC_DISPOSABLE_STACK */
     { JS_ATOM_Map_Iterator, js_map_iterator_finalizer, js_map_iterator_mark }, /* JS_CLASS_MAP_ITERATOR */
     { JS_ATOM_Set_Iterator, js_map_iterator_finalizer, js_map_iterator_mark }, /* JS_CLASS_SET_ITERATOR */
     { JS_ATOM_Array_Iterator, js_array_iterator_finalizer, js_array_iterator_mark }, /* JS_CLASS_ARRAY_ITERATOR */
@@ -20390,6 +20408,66 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        CASE(OP_using_check):
+            {
+                BOOL is_async = *pc++;
+                JSValue method;
+                sf->cur_pc = pc;
+                method = js_using_get_dispose_method(ctx, sp[-1], is_async);
+                if (JS_IsException(method))
+                    goto exception;
+                *sp++ = method;
+            }
+            BREAK;
+        CASE(OP_dispose_start):
+            *sp++ = JS_UNINITIALIZED; /* no error */
+            BREAK;
+        CASE(OP_dispose_merge):
+            sp[-2] = js_dispose_merge_error(ctx, sp[-2], sp[-1]);
+            sp--;
+            BREAK;
+        CASE(OP_dispose_end):
+            if (!JS_IsUninitialized(sp[-1])) {
+                JS_Throw(ctx, *--sp);
+                goto exception;
+            }
+            sp--;
+            BREAK;
+
+        CASE(OP_apply_decorators):
+            {
+                JSValue ret;
+                int flags = *pc++;
+                sf->cur_pc = pc;
+                ret = js_apply_decorators(ctx, sp[-5], sp[-4], sp[-3],
+                                          sp[-2], sp[-1], flags);
+                JS_FreeValue(ctx, sp[-5]);
+                JS_FreeValue(ctx, sp[-4]);
+                JS_FreeValue(ctx, sp[-3]);
+                JS_FreeValue(ctx, sp[-2]);
+                JS_FreeValue(ctx, sp[-1]);
+                sp -= 5;
+                if (JS_IsException(ret))
+                    goto exception;
+                *sp++ = ret;
+            }
+            BREAK;
+        CASE(OP_decorator_helper):
+            {
+                JSValue ret;
+                int op = *pc++;
+                sf->cur_pc = pc;
+                ret = js_decorator_helper(ctx, sp[-3], sp[-2], sp[-1], op);
+                JS_FreeValue(ctx, sp[-3]);
+                JS_FreeValue(ctx, sp[-2]);
+                JS_FreeValue(ctx, sp[-1]);
+                sp -= 3;
+                if (JS_IsException(ret))
+                    goto exception;
+                *sp++ = ret;
+            }
+            BREAK;
+
         CASE(OP_iterator_next):
             /* stack: iter_obj next catch_offset val */
             {
@@ -23433,6 +23511,10 @@ typedef struct BlockEnv {
     int drop_count; /* number of stack elements to drop */
     int label_finally; /* -1 if none */
     int scope_level;
+    /* if >= 0, scope whose 'using' resources are disposed when exiting
+       the entry. drop_count = 1 (catch offset of 'label_using'). */
+    int using_scope;
+    int label_using; /* catch label of the disposal on exception */
     uint8_t has_iterator : 1;
     uint8_t is_async_iterator : 1; /* for await: the close is awaited */
     uint8_t is_regular_stmt : 1; /* i.e. not a loop statement */
@@ -23504,6 +23586,13 @@ typedef enum JSParseExportEnum {
 typedef struct JSVarScope {
     int parent;  /* index into fd->scopes of the enclosing scope */
     int first;   /* index into fd->vars of the last variable in this scope */
+    /* if not NULL, 'using' declarations are allowed directly in the
+       scope: break entry of the disposal of their resources, owned by
+       the statement which created the scope (see using_scope_init()) */
+    struct BlockEnv *using_be;
+    /* local holding the await state of the disposal of the 'await
+       using' resources (see OP_dispose_scope), -1 if none */
+    int using_await_idx;
 } JSVarScope;
 
 typedef struct JSVarDef {
@@ -25876,6 +25965,8 @@ static int push_scope(JSParseState *s) {
         fd->scope_count++;
         fd->scopes[scope].parent = fd->scope_level;
         fd->scopes[scope].first = fd->scope_first;
+        fd->scopes[scope].using_be = NULL;
+        fd->scopes[scope].using_await_idx = -1;
         emit_op(s, OP_enter_scope);
         emit_u16(s, scope);
         return fd->scope_level = scope;
@@ -28183,6 +28274,13 @@ static __exception int js_parse_object_literal(JSParseState *s)
 #define PF_POW_ALLOWED  (1 << 2)
 /* forbid the exponentiation operator in js_parse_unary() */
 #define PF_POW_FORBIDDEN (1 << 3)
+/* js_parse_var(): 'using' declaration (tok = TOK_CONST) */
+#define PF_USING        (1 << 4)
+/* js_parse_var(): 'await using' declaration (with PF_USING) */
+#define PF_AWAIT_USING  (1 << 5)
+/* decorator expression: no '[', '?.' or tagged template in
+   js_parse_postfix_expr() */
+#define PF_DECORATOR    (1 << 6)
 
 static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags);
 static void emit_class_field_init(JSParseState *s);
@@ -31689,6 +31787,8 @@ static void push_break_entry(JSFunctionDef *fd, BlockEnv *be,
     be->drop_count = drop_count;
     be->label_finally = -1;
     be->scope_level = fd->scope_level;
+    be->using_scope = -1;
+    be->label_using = -1;
     be->has_iterator = FALSE;
     be->is_async_iterator = FALSE;
     be->is_regular_stmt = FALSE;
@@ -31893,6 +31993,8 @@ static __exception int emit_break(JSParseState *s, JSAtom name, int is_cont)
         }
         for(; i < top->drop_count; i++)
             emit_op(s, OP_drop);
+        if (top->using_scope >= 0)
+            emit_using_dispose(s, top->using_scope, FALSE);
         if (top->label_finally != -1) {
             /* must push dummy value to keep same stack depth */
             emit_op(s, OP_undefined);
@@ -31930,7 +32032,8 @@ static void emit_return(JSParseState *s, BOOL hasval)
 
     top = s->cur_func->top_break;
     while (top != NULL) {
-        if (top->has_iterator || top->label_finally != -1) {
+        if (top->has_iterator || top->label_finally != -1 ||
+            top->using_scope >= 0) {
             if (!hasval) {
                 emit_op(s, OP_undefined);
                 hasval = TRUE;
@@ -31999,16 +32102,20 @@ static __exception int js_parse_statement(JSParseState *s)
 
 static __exception int js_parse_block(JSParseState *s)
 {
+    BlockEnv using_be;
+
     if (js_parse_expect(s, '{'))
         return -1;
     if (s->token.val != '}') {
         push_scope(s);
+        using_scope_init(s, &using_be);
         for(;;) {
             if (js_parse_statement_or_decl(s, DECL_MASK_ALL))
                 return -1;
             if (s->token.val == '}')
                 break;
         }
+        emit_using_scope_end(s, &using_be);
         pop_scope(s);
     }
     if (next_token(s))
@@ -32016,14 +32123,20 @@ static __exception int js_parse_block(JSParseState *s)
     return 0;
 }
 
-/* allowed parse_flags: PF_IN_ACCEPTED */
+/* allowed parse_flags: PF_IN_ACCEPTED, PF_USING, PF_AWAIT_USING */
 static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                                     BOOL export_flag)
 {
     JSContext *ctx = s->ctx;
     JSFunctionDef *fd = s->cur_func;
     JSAtom name = JS_ATOM_NULL;
+    BOOL is_using = (parse_flags & PF_USING) != 0;
+    BOOL is_await = (parse_flags & PF_AWAIT_USING) != 0;
+    int method_idx = -1;
 
+    parse_flags &= PF_IN_ACCEPTED;
+    if (is_using && js_parse_using_start(s, is_await))
+        return -1;
     for (;;) {
         if (s->token.val == TOK_IDENT) {
             if (s->token.u.ident.is_reserved) {
@@ -32049,6 +32162,7 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                     goto var_error;
             } else if (js_define_var(s, name, tok)) {
                 goto var_error;
+            }
             if (export_flag) {
                 if (!add_export_entry(s, s->cur_func->module, name, name,
                                       JS_EXPORT_TYPE_LOCAL))
@@ -32082,14 +32196,19 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                         goto var_error;
                     set_object_name(s, name);
                     emit_source_pos(s, source_ptr);
-                    emit_op(s, (tok == TOK_CONST || tok == TOK_LET) ?
-                        OP_scope_put_var_init : OP_scope_put_var);
-                    emit_atom(s, name);
-                    emit_u16(s, fd->scope_level);
+                    if (is_using) {
+                        emit_using_init(s, name, method_idx, is_await);
+                    } else {
+                        emit_op(s, (tok == TOK_CONST || tok == TOK_LET) ?
+                                OP_scope_put_var_init : OP_scope_put_var);
+                        emit_atom(s, name);
+                        emit_u16(s, fd->scope_level);
+                    }
                 }
             } else {
                 if (tok == TOK_CONST) {
-                    js_parse_error(s, "missing initializer for const variable");
+                    js_parse_error(s, "missing initializer for %s",
+                                   is_using ? "using declaration" : "const variable");
                     goto var_error;
                 }
                 if (tok == TOK_LET &&
@@ -32181,6 +32300,49 @@ static int is_let(JSParseState *s, int decl_mask)
     return res;
 }
 
+/* test if the current token starts a 'using' declaration: 'using'
+   followed by a binding identifier on the same line. In the head of a
+   for-in/of statement, 'using of' is not a declaration. Return -1 if
+   error. */
+static int is_using_decl(JSParseState *s, BOOL in_for_head)
+{
+    JSParsePos pos;
+    int res;
+
+    if (!token_is_pseudo_keyword(s, JS_ATOM_using))
+        return FALSE;
+    js_parse_get_pos(s, &pos);
+    if (next_token(s))
+        return -1;
+    res = (s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved &&
+           !s->got_lf &&
+           !(in_for_head && s->token.u.ident.atom == JS_ATOM_of));
+    if (js_parse_seek_token(s, &pos))
+        return -1;
+    return res;
+}
+
+/* test if the current token starts an 'await using' declaration (no
+   line terminator after 'await'). Return -1 if error. */
+static int is_await_using_decl(JSParseState *s)
+{
+    JSParsePos pos;
+    int res;
+
+    if (s->token.val != TOK_AWAIT ||
+        !(s->cur_func->func_kind & JS_FUNC_ASYNC))
+        return FALSE;
+    js_parse_get_pos(s, &pos);
+    if (next_token(s))
+        return -1;
+    res = FALSE;
+    if (!s->got_lf)
+        res = is_using_decl(s, FALSE);
+    if (js_parse_seek_token(s, &pos))
+        return -1;
+    return res;
+}
+
 /* XXX: handle IteratorClose when exiting the loop before the
    enumeration is done */
 static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
@@ -32192,10 +32354,14 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     BOOL has_initializer, is_for_of, has_destructuring;
     int tok, tok1, opcode, scope, block_scope_level;
     int label_next, label_expr, label_cont, label_body, label_break;
-    int pos_next, pos_expr;
-    BlockEnv break_entry;
+    int pos_next, pos_expr, method_idx, res;
+    BlockEnv break_entry, using_be;
+    BOOL is_using, is_await_using;
 
     has_initializer = FALSE;
+    is_using = FALSE;
+    is_await_using = FALSE;
+    method_idx = -1;
     has_destructuring = FALSE;
     is_for_of = FALSE;
     block_scope_level = fd->scope_level;
@@ -32230,12 +32396,31 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     default:
         return -1;
     }
+    res = is_await_using_decl(s);
+    if (res < 0)
+        return -1;
+    if (res) {
+        is_await_using = TRUE;
+        fd->has_await = TRUE;
+        if (next_token(s)) /* 'await' */
+            return -1;
+    } else {
+        res = is_using_decl(s, TRUE);
+        if (res < 0)
+            return -1;
+    }
+    if (res) {
+        is_using = TRUE;
+        tok = TOK_CONST;
+    }
     if (tok == TOK_VAR || tok == TOK_LET || tok == TOK_CONST) {
         if (next_token(s))
             return -1;
 
         if (!(s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved)) {
-            if (s->token.val == '[' || s->token.val == '{') {
+            if (is_using) {
+                return js_parse_error(s, "binding patterns are not allowed in using declarations");
+            } else if (s->token.val == '[' || s->token.val == '{') {
                 if (js_parse_destructuring_element(s, tok, 0, TRUE, -1, FALSE, FALSE) < 0)
                     return -1;
                 has_destructuring = TRUE;
@@ -32249,14 +32434,23 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
                 JS_FreeAtom(s->ctx, var_name);
                 return -1;
             }
-            if (js_define_var(s, var_name, tok)) {
-                JS_FreeAtom(s->ctx, var_name);
-                return -1;
+            if (is_using) {
+                method_idx = js_define_using_var(s, var_name, is_await_using);
+                if (method_idx < 0) {
+                    JS_FreeAtom(s->ctx, var_name);
+                    return -1;
+                }
+                emit_using_init(s, var_name, method_idx, is_await_using);
+            } else {
+                if (js_define_var(s, var_name, tok)) {
+                    JS_FreeAtom(s->ctx, var_name);
+                    return -1;
+                }
+                emit_op(s, (tok == TOK_CONST || tok == TOK_LET) ?
+                        OP_scope_put_var_init : OP_scope_put_var);
+                emit_atom(s, var_name);
+                emit_u16(s, fd->scope_level);
             }
-            emit_op(s, (tok == TOK_CONST || tok == TOK_LET) ?
-                    OP_scope_put_var_init : OP_scope_put_var);
-            emit_atom(s, var_name);
-            emit_u16(s, fd->scope_level);
         }
     } else if (!is_async && token_is_pseudo_keyword(s, JS_ATOM_async) &&
                peek_token(s, FALSE) == TOK_OF) {
@@ -32311,6 +32505,8 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     } else if (s->token.val == TOK_IN) {
         if (is_async)
             return js_parse_error(s, "'for await' loop should be used with 'of'");
+        if (is_using)
+            return js_parse_error(s, "using declaration not allowed in for-in loop");
         if (has_initializer &&
             (tok != TOK_VAR || (fd->js_mode & JS_MODE_STRICT) ||
              has_destructuring)) {
@@ -32375,8 +32571,16 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     }
 
     emit_label(s, label_body);
+    if (is_using) {
+        /* the resource of each iteration is disposed at its end */
+        using_scope_init(s, &using_be);
+        if (js_parse_using_start(s, is_await_using))
+            return -1;
+    }
     if (js_parse_statement(s))
         return -1;
+    if (is_using)
+        emit_using_scope_end(s, &using_be);
 
     close_scopes(s, s->cur_func->scope_level, block_scope_level);
 
@@ -33713,10 +33917,31 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 goto fail;
         }
         break;
+    case TOK_AWAIT:
+        switch (is_await_using_decl(s)) {
+        case TRUE:
+            if (!(decl_mask & DECL_MASK_OTHER))
+                goto lexical_decl_error;
+            s->cur_func->has_await = TRUE;
+            if (next_token(s) || next_token(s)) /* 'await using' */
+                goto fail;
+            if (js_parse_var(s, PF_IN_ACCEPTED | PF_USING | PF_AWAIT_USING,
+                             TOK_CONST, FALSE))
+                goto fail;
+            if (js_parse_expect_semi(s))
+                goto fail;
+            break;
+        case FALSE:
+            goto hasexpr;
+        default:
+            goto fail;
+        }
+        break;
     case TOK_LET:
     case TOK_CONST:
     haslet:
         if (!(decl_mask & DECL_MASK_OTHER)) {
+        lexical_decl_error:
             js_parse_error(s, "lexical declarations can't appear in single-statement context");
             goto fail;
         }
@@ -33835,8 +34060,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
     case TOK_FOR:
         {
             int label_cont, label_break, label_body, label_test;
-            int pos_cont, pos_body, block_scope_level;
-            BlockEnv break_entry;
+            int pos_cont, pos_body, block_scope_level, res;
+            BlockEnv break_entry, using_be;
             int tok, bits;
             BOOL is_async;
 
@@ -33872,6 +34097,9 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             /* create scope for the lexical variables declared in the initial,
                test and increment expressions */
             push_scope(s);
+            /* the resources of a 'using' declaration are disposed
+               at the end of the loop */
+            using_scope_init(s, &using_be);
             /* initial expression */
             tok = s->token.val;
             if (tok != ';') {
@@ -33884,7 +34112,21 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 default:
                     goto fail;
                 }
-                if (tok == TOK_VAR || tok == TOK_LET || tok == TOK_CONST) {
+                res = is_await_using_decl(s);
+                if (res < 0)
+                    goto fail;
+                if (res) {
+                    s->cur_func->has_await = TRUE;
+                    if (next_token(s) || next_token(s)) /* 'await using' */
+                        goto fail;
+                    if (js_parse_var(s, PF_USING | PF_AWAIT_USING, TOK_CONST, FALSE))
+                        goto fail;
+                } else if ((res = is_using_decl(s, FALSE)) != 0) {
+                    if (res < 0 || next_token(s))
+                        goto fail;
+                    if (js_parse_var(s, PF_USING, TOK_CONST, FALSE))
+                        goto fail;
+                } else if (tok == TOK_VAR || tok == TOK_LET || tok == TOK_CONST) {
                     if (next_token(s))
                         goto fail;
                     if (js_parse_var(s, FALSE, tok, FALSE))
@@ -33975,6 +34217,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             emit_label(s, label_break);
 
             pop_break_entry(s->cur_func);
+            emit_using_scope_end(s, &using_be);
             pop_scope(s);
         }
         break;
@@ -34308,6 +34551,22 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         case TRUE:
             tok = TOK_LET;
             goto haslet;
+        case FALSE:
+            break;
+        default:
+            goto fail;
+        }
+        switch (is_using_decl(s, FALSE)) {
+        case TRUE:
+            if (!(decl_mask & DECL_MASK_OTHER))
+                goto lexical_decl_error;
+            if (next_token(s))
+                goto fail;
+            if (js_parse_var(s, PF_IN_ACCEPTED | PF_USING, TOK_CONST, FALSE))
+                goto fail;
+            if (js_parse_expect_semi(s))
+                goto fail;
+            goto done;
         case FALSE:
             break;
         default:
@@ -37285,6 +37544,8 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
     fd->scope_count = 1;
     fd->scopes[0].first = -1;
     fd->scopes[0].parent = -1;
+    fd->scopes[0].using_be = NULL;
+    fd->scopes[0].using_await_idx = -1;
     fd->scope_level = 0;  /* 0: var/arg scope */
     fd->scope_first = -1;
     fd->body_scope = -1;
@@ -39716,6 +39977,141 @@ static int get_label_pos(JSFunctionDef *s, int label)
     return pos;
 }
 
+/* phase 2 code generation helpers */
+static void rv_emit_loc(DynBuf *bc, int op, int idx)
+{
+    dbuf_putc(bc, op);
+    dbuf_put_u16(bc, idx);
+}
+
+static void rv_emit_push_i32(DynBuf *bc, int val)
+{
+    dbuf_putc(bc, OP_push_i32);
+    dbuf_put_u32(bc, val);
+}
+
+static void rv_emit_goto(JSFunctionDef *s, DynBuf *bc, int op, int label)
+{
+    dbuf_putc(bc, op);
+    dbuf_put_u32(bc, label);
+    update_label(s, label, 1);
+    s->jump_size++;
+}
+
+static void rv_emit_label(JSFunctionDef *s, DynBuf *bc, int label)
+{
+    dbuf_putc(bc, OP_label);
+    dbuf_put_u32(bc, label);
+    s->label_slots[label].pos2 = bc->size;
+}
+
+/* await undefined if the local 'idx' is 1 */
+static int rv_emit_await_if_needed(JSFunctionDef *s, DynBuf *bc, int idx,
+                                   BOOL reset)
+{
+    int label = new_label_fd(s);
+    if (label < 0)
+        return -1;
+    rv_emit_loc(bc, OP_get_loc, idx);
+    rv_emit_push_i32(bc, 1);
+    dbuf_putc(bc, OP_strict_eq);
+    rv_emit_goto(s, bc, OP_if_false, label);
+    dbuf_putc(bc, OP_undefined);
+    dbuf_putc(bc, OP_await);
+    dbuf_putc(bc, OP_drop);
+    if (reset) {
+        rv_emit_push_i32(bc, 0);
+        rv_emit_loc(bc, OP_put_loc, idx);
+    }
+    rv_emit_label(s, bc, label);
+    return 0;
+}
+
+/* Expansion of OP_dispose_scope: DisposeResources() of the 'using'
+   resources of 'scope', in reverse declaration order. Stack: error ->
+   error, where error is the pending error or JS_UNINITIALIZED if none.
+
+   A resource is the pair of locals (value, method) defined by
+   js_define_using_var(). The method is undefined if the declaration
+   was not evaluated or if the value of a 'using' declaration is null
+   or undefined, and null if the value of an 'await using' declaration
+   is null or undefined (see OP_using_check). The dispose methods are
+   called with plain method calls, so that the disposal of a normal
+   function can be suspended like the rest of its code. The exceptions
+   are merged into the error by OP_dispose_merge.
+
+   For 'await using', the local 'using_await_idx' holds the needsAwait
+   and hasAwaited flags of DisposeResources(): 0 = none, 1 = needsAwait
+   and not hasAwaited, 2 = hasAwaited. */
+static int resolve_dispose_scope(JSFunctionDef *s, DynBuf *bc, int scope)
+{
+    int idx, await_idx, label_skip, label_call, label_catch;
+    JSVarDef *vd;
+
+    await_idx = s->scopes[scope].using_await_idx;
+    if (await_idx >= 0) {
+        rv_emit_push_i32(bc, 0);
+        rv_emit_loc(bc, OP_put_loc, await_idx);
+    }
+    for(idx = s->scopes[scope].first; idx >= 0; idx = vd->scope_next) {
+        vd = &s->vars[idx];
+        if (vd->scope_level != scope)
+            break;
+        if (vd->var_kind != JS_VAR_USING && vd->var_kind != JS_VAR_AWAIT_USING)
+            continue;
+        label_skip = new_label_fd(s);
+        label_catch = new_label_fd(s);
+        if (label_skip < 0 || label_catch < 0)
+            return -1;
+        /* no resource */
+        rv_emit_loc(bc, OP_get_loc, idx);
+        dbuf_putc(bc, OP_undefined);
+        dbuf_putc(bc, OP_strict_eq);
+        rv_emit_goto(s, bc, OP_if_true, label_skip);
+        if (vd->var_kind == JS_VAR_AWAIT_USING) {
+            label_call = new_label_fd(s);
+            if (label_call < 0)
+                return -1;
+            rv_emit_loc(bc, OP_get_loc, idx);
+            dbuf_putc(bc, OP_null);
+            dbuf_putc(bc, OP_strict_eq);
+            rv_emit_goto(s, bc, OP_if_false, label_call);
+            /* null or undefined value: set needsAwait */
+            rv_emit_loc(bc, OP_get_loc, await_idx);
+            rv_emit_goto(s, bc, OP_if_true, label_skip);
+            rv_emit_push_i32(bc, 1);
+            rv_emit_loc(bc, OP_put_loc, await_idx);
+            rv_emit_goto(s, bc, OP_goto, label_skip);
+            rv_emit_label(s, bc, label_call);
+        } else if (await_idx >= 0) {
+            /* a sync disposal is preceded by the pending Await */
+            if (rv_emit_await_if_needed(s, bc, await_idx, TRUE))
+                return -1;
+        }
+        rv_emit_goto(s, bc, OP_catch, label_catch);
+        rv_emit_loc(bc, OP_get_loc, idx - 1);
+        rv_emit_loc(bc, OP_get_loc, idx);
+        rv_emit_loc(bc, OP_call_method, 0);
+        if (vd->var_kind == JS_VAR_AWAIT_USING) {
+            /* hasAwaited is set even if the Await throws */
+            rv_emit_push_i32(bc, 2);
+            rv_emit_loc(bc, OP_put_loc, await_idx);
+            dbuf_putc(bc, OP_await);
+        }
+        dbuf_putc(bc, OP_drop);
+        dbuf_putc(bc, OP_drop); /* catch offset */
+        rv_emit_goto(s, bc, OP_goto, label_skip);
+        rv_emit_label(s, bc, label_catch);
+        dbuf_putc(bc, OP_dispose_merge);
+        rv_emit_label(s, bc, label_skip);
+    }
+    if (await_idx >= 0) {
+        if (rv_emit_await_if_needed(s, bc, await_idx, FALSE))
+            return -1;
+    }
+    return 0;
+}
+
 /* convert global variable accesses to local variables or closure
    variables when necessary */
 static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
@@ -39958,6 +40354,12 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
                                 dbuf_put_u32(&bc_out, vd->func_pool_idx);
                                 dbuf_putc(&bc_out, OP_put_loc);
                                 dbuf_put_u16(&bc_out, scope_idx);
+                            } else if (vd->var_kind == JS_VAR_USING ||
+                                       vd->var_kind == JS_VAR_AWAIT_USING) {
+                                /* no resource yet */
+                                dbuf_putc(&bc_out, OP_undefined);
+                                dbuf_putc(&bc_out, OP_put_loc);
+                                dbuf_put_u16(&bc_out, scope_idx);
                             } else {
                                 /* XXX: should check if variable can be used
                                    before initialization */
@@ -39990,6 +40392,11 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
                     }
                 }
             }
+            break;
+
+        case OP_dispose_scope:
+            if (resolve_dispose_scope(s, &bc_out, get_u16(bc_buf + pos + 1)))
+                dbuf_set_error(&bc_out);
             break;
 
         case OP_set_name:
@@ -42121,6 +42528,9 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     int func_idx, lexical_func_idx = -1;
     BOOL has_opt_arg;
     BOOL create_func_var = FALSE;
+    BlockEnv using_be;
+    /* legacy decorators of the parameters (class methods) */
+    DecParams *dp = s->dec_params;
 
     is_expr = (func_type != JS_PARSE_FUNC_STATEMENT &&
                func_type != JS_PARSE_FUNC_VAR);
@@ -42596,10 +43006,12 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     if (js_parse_function_check_names(s, fd, func_name))
         goto fail;
 
+    using_scope_init(s, &using_be);
     while (s->token.val != '}') {
         if (js_parse_source_element(s))
             goto fail;
     }
+    emit_using_scope_end(s, &using_be);
     if (!fd->strip_source) {
         /* save the function source code */
         fd->source_len = s->buf_ptr - ptr;
@@ -42749,6 +43161,7 @@ static __exception int js_parse_function_decl(JSParseState *s,
 static __exception int js_parse_program(JSParseState *s)
 {
     JSFunctionDef *fd = s->cur_func;
+    BlockEnv using_be;
     int idx;
 
     if (next_token(s))
@@ -42768,10 +43181,15 @@ static __exception int js_parse_program(JSParseState *s)
             return -1;
     }
 
+    /* 'using' declarations are not allowed at the top level of scripts */
+    if (s->is_module)
+        using_scope_init(s, &using_be);
     while (s->token.val != TOK_EOF) {
         if (js_parse_source_element(s))
             return -1;
     }
+    if (s->is_module)
+        emit_using_scope_end(s, &using_be);
 
     if (!s->is_module) {
         /* return the value of the hidden variable eval_ret_idx  */
@@ -43195,7 +43613,7 @@ typedef enum BCTagEnum {
     BC_TAG_OBJECT_REFERENCE,
 } BCTagEnum;
 
-#define BC_VERSION 5
+#define BC_VERSION 6
 
 typedef struct BCWriterState {
     JSContext *ctx;
@@ -47287,7 +47705,12 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
     JS_FreeValue(ctx, proto);
     if (JS_IsException(obj))
         return obj;
-    arg_index = (magic == JS_AGGREGATE_ERROR);
+    if (magic == JS_AGGREGATE_ERROR)
+        arg_index = 1;
+    else if (magic == JS_SUPPRESSED_ERROR)
+        arg_index = 2;
+    else
+        arg_index = 0;
 
     message = argv[arg_index++];
     if (!JS_IsUndefined(message)) {
@@ -47298,7 +47721,8 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     }
 
-    if (arg_index < argc) {
+    /* SuppressedError has no options argument */
+    if (arg_index < argc && magic != JS_SUPPRESSED_ERROR) {
         options = argv[arg_index];
         if (JS_IsObject(options)) {
             int present = JS_HasProperty(ctx, options, JS_ATOM_cause);
@@ -47319,6 +47743,13 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
         if (JS_IsException(error_list))
             goto exception;
         JS_DefinePropertyValue(ctx, obj, JS_ATOM_errors, error_list,
+                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    } else if (magic == JS_SUPPRESSED_ERROR) {
+        JS_DefinePropertyValue(ctx, obj, JS_ATOM_error,
+                               JS_DupValue(ctx, argv[0]),
+                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+        JS_DefinePropertyValue(ctx, obj, JS_ATOM_suppressed,
+                               JS_DupValue(ctx, argv[1]),
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     }
 
@@ -47426,6 +47857,7 @@ static const JSCFunctionListEntry js_native_error_proto_funcs[] = {
     DEF(JS_ATOM_URIError)
     DEF(JS_ATOM_InternalError)
     DEF(JS_ATOM_AggregateError)
+    DEF(JS_ATOM_SuppressedError)
 #undef DEF    
 };
 
@@ -52025,6 +52457,24 @@ static const JSCFunctionListEntry js_iterator_funcs[] = {
     JS_CFUNC_MAGIC_DEF("zipKeyed", 1, js_iterator_zip, 1 ),
 };
 
+/* Iterator.prototype[Symbol.dispose]() */
+static JSValue js_iterator_proto_dispose(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv)
+{
+    JSValue method, ret;
+
+    method = JS_GetProperty(ctx, this_val, JS_ATOM_return);
+    if (JS_IsException(method))
+        return method;
+    if (JS_IsUndefined(method) || JS_IsNull(method))
+        return JS_UNDEFINED;
+    ret = JS_CallFree(ctx, method, this_val, 0, NULL);
+    if (JS_IsException(ret))
+        return ret;
+    JS_FreeValue(ctx, ret);
+    return JS_UNDEFINED;
+}
+
 static const JSCFunctionListEntry js_iterator_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("chunks", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_CHUNKS ),
     JS_CFUNC_MAGIC_DEF("drop", 1, js_create_iterator_helper, JS_ITERATOR_HELPER_KIND_DROP ),
@@ -52042,6 +52492,7 @@ static const JSCFunctionListEntry js_iterator_proto_funcs[] = {
     JS_CFUNC_DEF("reduce", 1, js_iterator_proto_reduce ),
     JS_CFUNC_DEF("toArray", 0, js_iterator_proto_toArray ),
     JS_CFUNC_DEF("[Symbol.iterator]", 0, js_iterator_proto_iterator ),
+    JS_CFUNC_DEF("[Symbol.dispose]", 0, js_iterator_proto_dispose ),
     JS_CGETSET_DEF("[Symbol.toStringTag]", js_iterator_proto_get_toStringTag, js_iterator_proto_set_toStringTag),
 };
 
@@ -59270,6 +59721,9 @@ static const JSCFunctionListEntry js_symbol_funcs[] = {
     JS_PROP_ATOM_DEF("species", JS_ATOM_Symbol_species, 0),
     JS_PROP_ATOM_DEF("unscopables", JS_ATOM_Symbol_unscopables, 0),
     JS_PROP_ATOM_DEF("asyncIterator", JS_ATOM_Symbol_asyncIterator, 0),
+    JS_PROP_ATOM_DEF("dispose", JS_ATOM_Symbol_dispose, 0),
+    JS_PROP_ATOM_DEF("asyncDispose", JS_ATOM_Symbol_asyncDispose, 0),
+    JS_PROP_ATOM_DEF("metadata", JS_ATOM_Symbol_metadata, 0),
 };
 
 /* Set/Map/WeakSet/WeakMap */
@@ -62415,10 +62869,654 @@ static const JSCFunctionListEntry js_async_function_proto_funcs[] = {
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "AsyncFunction", JS_PROP_CONFIGURABLE ),
 };
 
+/* Explicit resource management: DisposableStack, AsyncDisposableStack
+   and the runtime support of the 'using' and 'await using'
+   declarations (the disposal of the declarations is compiled to
+   bytecode, see OP_dispose_scope). */
+
+/* how the dispose method of a resource is called */
+typedef enum {
+    JS_DISPOSE_CALL_USE,   /* method.call(value) */
+    JS_DISPOSE_CALL_ADOPT, /* method(value): DisposableStack.prototype.adopt() */
+    JS_DISPOSE_CALL_DEFER, /* method(): DisposableStack.prototype.defer() */
+} JSDisposeCallEnum;
+
+typedef struct JSDisposableResource {
+    JSValue value;
+    /* JS_UNDEFINED for a null or undefined value added to an
+       AsyncDisposableStack: it is only awaited */
+    JSValue method;
+    uint8_t call_kind; /* JSDisposeCallEnum */
+} JSDisposableResource;
+
+typedef struct JSDisposableStack {
+    BOOL disposed;
+    int count;
+    int size;
+    JSDisposableResource *resources;
+    /* state of a running AsyncDisposableStack.prototype.disposeAsync():
+       the resources are popped from 'resources' as they are disposed */
+    BOOL needs_await;
+    BOOL has_awaited;
+    JSValue error; /* JS_UNINITIALIZED if no error */
+    /* of the disposeAsync() promise, JS_UNDEFINED when not running */
+    JSValue resolving_funcs[2];
+} JSDisposableStack;
+
+/* Return the error of a disposal which threw 'exc' when the error
+   'error' was already pending (JS_UNINITIALIZED if none): 'exc' or a
+   SuppressedError. 'error' and 'exc' are freed. */
+static JSValue js_dispose_merge_error(JSContext *ctx, JSValue error,
+                                      JSValue exc)
+{
+    JSValue obj;
+
+    if (JS_IsUninitialized(error))
+        return exc;
+    obj = JS_NewObjectProtoClass(ctx, ctx->native_error_proto[JS_SUPPRESSED_ERROR],
+                                 JS_CLASS_ERROR);
+    if (JS_IsException(obj))
+        goto fail;
+    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_error, exc,
+                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0) {
+        exc = JS_UNDEFINED;
+        goto fail;
+    }
+    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_suppressed, error,
+                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0) {
+        exc = error = JS_UNDEFINED;
+        goto fail;
+    }
+    build_backtrace(ctx, obj, NULL, 0, 0, 0);
+    return obj;
+ fail:
+    /* out of memory: the new error replaces the others */
+    JS_FreeValue(ctx, obj);
+    JS_FreeValue(ctx, exc);
+    JS_FreeValue(ctx, error);
+    return JS_GetException(ctx);
+}
+
+/* Closure created by GetDisposeMethod() when the Symbol.dispose method
+   'func_data[0]' of an async disposable resource is used: its result is
+   not awaited and its exception rejects the returned promise. */
+static JSValue js_dispose_sync_method(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv,
+                                      int magic, JSValue *func_data)
+{
+    JSValue ret, exc;
+    JSValueConst undef = JS_UNDEFINED;
+
+    ret = js_call(ctx, func_data[0], this_val, 0, NULL);
+    if (JS_IsException(ret)) {
+        exc = JS_GetException(ctx);
+        ret = js_promise_resolve(ctx, ctx->promise_ctor, 1,
+                                 (JSValueConst *)&exc, TRUE);
+        JS_FreeValue(ctx, exc);
+        return ret;
+    }
+    JS_FreeValue(ctx, ret);
+    return js_promise_resolve(ctx, ctx->promise_ctor, 1, &undef, FALSE);
+}
+
+/* GetDisposeMethod() of the resource 'val' (neither null nor
+   undefined) with the checks of CreateDisposableResource(): the
+   returned method is a function. */
+static JSValue js_get_dispose_method(JSContext *ctx, JSValueConst val,
+                                     BOOL is_async)
+{
+    JSValue method, wrapper;
+
+    if (!JS_IsObject(val))
+        return JS_ThrowTypeError(ctx, "using: value is not an object");
+    if (is_async) {
+        method = JS_GetProperty(ctx, val, JS_ATOM_Symbol_asyncDispose);
+        if (JS_IsException(method))
+            return method;
+        if (!JS_IsUndefined(method) && !JS_IsNull(method))
+            goto check;
+        method = JS_GetProperty(ctx, val, JS_ATOM_Symbol_dispose);
+        if (JS_IsException(method))
+            return method;
+        if (JS_IsUndefined(method) || JS_IsNull(method))
+            goto not_disposable;
+        if (!JS_IsFunction(ctx, method))
+            goto not_function;
+        wrapper = JS_NewCFunctionData(ctx, js_dispose_sync_method, 0, 0,
+                                      1, (JSValueConst *)&method);
+        JS_FreeValue(ctx, method);
+        return wrapper;
+    }
+    method = JS_GetProperty(ctx, val, JS_ATOM_Symbol_dispose);
+    if (JS_IsException(method))
+        return method;
+ check:
+    if (JS_IsUndefined(method) || JS_IsNull(method)) {
+    not_disposable:
+        return JS_ThrowTypeError(ctx, "using: value has no %s method",
+                                 is_async ? "Symbol.asyncDispose or Symbol.dispose" :
+                                 "Symbol.dispose");
+    }
+    if (!JS_IsFunction(ctx, method)) {
+    not_function:
+        JS_FreeValue(ctx, method);
+        return JS_ThrowTypeError(ctx, "using: dispose method is not a function");
+    }
+    return method;
+}
+
+/* OP_using_check: dispose method of the value of a 'using' ('is_async'
+   = FALSE) or 'await using' declaration. A null or undefined value
+   has no dispose method: JS_UNDEFINED is returned, or JS_NULL for
+   'await using' because the disposal must still be awaited. */
+static JSValue js_using_get_dispose_method(JSContext *ctx, JSValueConst val,
+                                           BOOL is_async)
+{
+    if (JS_IsUndefined(val) || JS_IsNull(val))
+        return is_async ? JS_NULL : JS_UNDEFINED;
+    return js_get_dispose_method(ctx, val, is_async);
+}
+
+static void js_disposable_stack_finalizer(JSRuntime *rt, JSValue val)
+{
+    JSDisposableStack *s = JS_VALUE_GET_OBJ(val)->u.disposable_stack;
+    int i;
+
+    if (!s)
+        return;
+    for(i = 0; i < s->count; i++) {
+        JS_FreeValueRT(rt, s->resources[i].value);
+        JS_FreeValueRT(rt, s->resources[i].method);
+    }
+    js_free_rt(rt, s->resources);
+    JS_FreeValueRT(rt, s->error);
+    JS_FreeValueRT(rt, s->resolving_funcs[0]);
+    JS_FreeValueRT(rt, s->resolving_funcs[1]);
+    js_free_rt(rt, s);
+}
+
+static void js_disposable_stack_mark(JSRuntime *rt, JSValueConst val,
+                                     JS_MarkFunc *mark_func)
+{
+    JSDisposableStack *s = JS_VALUE_GET_OBJ(val)->u.disposable_stack;
+    int i;
+
+    if (!s)
+        return;
+    for(i = 0; i < s->count; i++) {
+        JS_MarkValue(rt, s->resources[i].value, mark_func);
+        JS_MarkValue(rt, s->resources[i].method, mark_func);
+    }
+    JS_MarkValue(rt, s->error, mark_func);
+    JS_MarkValue(rt, s->resolving_funcs[0], mark_func);
+    JS_MarkValue(rt, s->resolving_funcs[1], mark_func);
+}
+
+/* allocate the state of a new stack object 'obj' (consumed: freed if
+   error) */
+static JSValue js_disposable_stack_init(JSContext *ctx, JSValue obj)
+{
+    JSDisposableStack *s;
+
+    if (JS_IsException(obj))
+        return obj;
+    s = js_mallocz(ctx, sizeof(*s));
+    if (!s) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    s->error = JS_UNINITIALIZED;
+    s->resolving_funcs[0] = JS_UNDEFINED;
+    s->resolving_funcs[1] = JS_UNDEFINED;
+    JS_VALUE_GET_OBJ(obj)->u.disposable_stack = s;
+    return obj;
+}
+
+/* magic = class ID */
+static JSValue js_disposable_stack_constructor(JSContext *ctx,
+                                               JSValueConst new_target,
+                                               int argc, JSValueConst *argv,
+                                               int magic)
+{
+    return js_disposable_stack_init(ctx, JS_CreateFromConstructor(ctx, new_target, magic));
+}
+
+/* the stack 'this_val' of class 'class_id' which must not be disposed */
+static JSDisposableStack *js_disposable_stack_get(JSContext *ctx,
+                                                  JSValueConst this_val,
+                                                  int class_id)
+{
+    JSDisposableStack *s = JS_GetOpaque2(ctx, this_val, class_id);
+    if (s && s->disposed) {
+        JS_ThrowReferenceError(ctx, "%s is disposed",
+                               class_id == JS_CLASS_DISPOSABLE_STACK ?
+                               "DisposableStack" : "AsyncDisposableStack");
+        return NULL;
+    }
+    return s;
+}
+
+/* AddDisposableResource() with a known method */
+static int js_disposable_stack_add(JSContext *ctx, JSDisposableStack *s,
+                                   JSValueConst value, JSValueConst method,
+                                   JSDisposeCallEnum call_kind)
+{
+    JSDisposableResource *r;
+
+    if (js_resize_array(ctx, (void **)&s->resources, sizeof(s->resources[0]),
+                        &s->size, s->count + 1))
+        return -1;
+    r = &s->resources[s->count++];
+    r->value = JS_DupValue(ctx, value);
+    r->method = JS_DupValue(ctx, method);
+    r->call_kind = call_kind;
+    return 0;
+}
+
+/* magic = class ID */
+static JSValue js_disposable_stack_use(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv, int magic)
+{
+    JSDisposableStack *s;
+    JSValueConst value = argv[0];
+    JSValue method;
+    BOOL is_async = (magic == JS_CLASS_ASYNC_DISPOSABLE_STACK);
+    int ret;
+
+    s = js_disposable_stack_get(ctx, this_val, magic);
+    if (!s)
+        return JS_EXCEPTION;
+    if (JS_IsUndefined(value) || JS_IsNull(value)) {
+        /* only an async disposal awaits it */
+        if (is_async &&
+            js_disposable_stack_add(ctx, s, JS_UNDEFINED, JS_UNDEFINED,
+                                    JS_DISPOSE_CALL_USE))
+            return JS_EXCEPTION;
+        return JS_DupValue(ctx, value);
+    }
+    method = js_get_dispose_method(ctx, value, is_async);
+    if (JS_IsException(method))
+        return method;
+    ret = js_disposable_stack_add(ctx, s, value, method, JS_DISPOSE_CALL_USE);
+    JS_FreeValue(ctx, method);
+    if (ret)
+        return JS_EXCEPTION;
+    return JS_DupValue(ctx, value);
+}
+
+/* magic = class ID */
+static JSValue js_disposable_stack_adopt(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv, int magic)
+{
+    JSDisposableStack *s;
+
+    s = js_disposable_stack_get(ctx, this_val, magic);
+    if (!s)
+        return JS_EXCEPTION;
+    if (check_function(ctx, argv[1]))
+        return JS_EXCEPTION;
+    if (js_disposable_stack_add(ctx, s, argv[0], argv[1],
+                                JS_DISPOSE_CALL_ADOPT))
+        return JS_EXCEPTION;
+    return JS_DupValue(ctx, argv[0]);
+}
+
+/* magic = class ID */
+static JSValue js_disposable_stack_defer(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv, int magic)
+{
+    JSDisposableStack *s;
+
+    s = js_disposable_stack_get(ctx, this_val, magic);
+    if (!s)
+        return JS_EXCEPTION;
+    if (check_function(ctx, argv[0]))
+        return JS_EXCEPTION;
+    if (js_disposable_stack_add(ctx, s, JS_UNDEFINED, argv[0],
+                                JS_DISPOSE_CALL_DEFER))
+        return JS_EXCEPTION;
+    return JS_UNDEFINED;
+}
+
+/* magic = class ID */
+static JSValue js_disposable_stack_move(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv, int magic)
+{
+    JSDisposableStack *s, *s1;
+    JSValue obj;
+
+    s = js_disposable_stack_get(ctx, this_val, magic);
+    if (!s)
+        return JS_EXCEPTION;
+    /* %DisposableStack.prototype%, not the prototype of a subclass */
+    obj = js_disposable_stack_init(ctx, JS_NewObjectClass(ctx, magic));
+    if (JS_IsException(obj))
+        return obj;
+    s1 = JS_VALUE_GET_OBJ(obj)->u.disposable_stack;
+    s1->resources = s->resources;
+    s1->count = s->count;
+    s1->size = s->size;
+    s->resources = NULL;
+    s->count = 0;
+    s->size = 0;
+    s->disposed = TRUE;
+    return obj;
+}
+
+/* magic = class ID */
+static JSValue js_disposable_stack_get_disposed(JSContext *ctx,
+                                                JSValueConst this_val,
+                                                int magic)
+{
+    JSDisposableStack *s = JS_GetOpaque2(ctx, this_val, magic);
+    if (!s)
+        return JS_EXCEPTION;
+    return JS_NewBool(ctx, s->disposed);
+}
+
+/* pop the last resource of 's' and call its dispose method */
+static JSValue js_disposable_stack_call_last(JSContext *ctx,
+                                             JSDisposableStack *s)
+{
+    JSDisposableResource r;
+    JSValue ret;
+
+    /* popped first: the method may run the GC or use the stack */
+    r = s->resources[--s->count];
+    switch(r.call_kind) {
+    case JS_DISPOSE_CALL_ADOPT:
+        ret = js_call(ctx, r.method, JS_UNDEFINED, 1, (JSValueConst *)&r.value);
+        break;
+    case JS_DISPOSE_CALL_DEFER:
+        ret = js_call(ctx, r.method, JS_UNDEFINED, 0, NULL);
+        break;
+    default:
+        ret = js_call(ctx, r.method, r.value, 0, NULL);
+        break;
+    }
+    JS_FreeValue(ctx, r.value);
+    JS_FreeValue(ctx, r.method);
+    return ret;
+}
+
+static JSValue js_disposable_stack_dispose(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv)
+{
+    JSDisposableStack *s;
+    JSValue ret, error;
+
+    s = JS_GetOpaque2(ctx, this_val, JS_CLASS_DISPOSABLE_STACK);
+    if (!s)
+        return JS_EXCEPTION;
+    if (s->disposed)
+        return JS_UNDEFINED;
+    s->disposed = TRUE;
+    error = JS_UNINITIALIZED;
+    while (s->count > 0) {
+        ret = js_disposable_stack_call_last(ctx, s);
+        if (JS_IsException(ret))
+            error = js_dispose_merge_error(ctx, error, JS_GetException(ctx));
+        else
+            JS_FreeValue(ctx, ret);
+    }
+    if (!JS_IsUninitialized(error))
+        return JS_Throw(ctx, error);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_async_disposable_stack_handler(JSContext *ctx,
+                                                 JSValueConst this_val,
+                                                 int argc, JSValueConst *argv,
+                                                 int magic, JSValue *func_data);
+
+/* Await(value) in disposeAsync(): resume the disposal of 'obj' when it
+   settles */
+static int js_async_disposable_stack_await(JSContext *ctx, JSValueConst obj,
+                                           JSValueConst value)
+{
+    JSValue promise, funcs[2];
+    JSValueConst undef[2] = { JS_UNDEFINED, JS_UNDEFINED };
+    int i, res;
+
+    promise = js_promise_resolve(ctx, ctx->promise_ctor, 1, &value, FALSE);
+    if (JS_IsException(promise))
+        return -1;
+    for(i = 0; i < 2; i++) {
+        funcs[i] = JS_NewCFunctionData(ctx, js_async_disposable_stack_handler,
+                                       1, i, 1, &obj);
+        if (JS_IsException(funcs[i])) {
+            while (--i >= 0)
+                JS_FreeValue(ctx, funcs[i]);
+            JS_FreeValue(ctx, promise);
+            return -1;
+        }
+    }
+    res = perform_promise_then(ctx, promise, (JSValueConst *)funcs, undef);
+    JS_FreeValue(ctx, promise);
+    JS_FreeValue(ctx, funcs[0]);
+    JS_FreeValue(ctx, funcs[1]);
+    return res;
+}
+
+/* Merge 'exc' into the pending error of the running disposeAsync().
+   The pending error is detached first: building a SuppressedError
+   runs JS (Error.prepareStackTrace), and a GC there must not see it
+   both in 's' and in the new error. */
+static void js_async_disposable_stack_merge(JSContext *ctx,
+                                            JSDisposableStack *s,
+                                            JSValue exc)
+{
+    JSValue error = s->error;
+
+    s->error = JS_UNINITIALIZED;
+    s->error = js_dispose_merge_error(ctx, error, exc);
+}
+
+/* DisposeResources() of disposeAsync(), run until the next Await or
+   the completion */
+static void js_async_disposable_stack_run(JSContext *ctx, JSValueConst obj,
+                                          JSDisposableStack *s)
+{
+    JSDisposableResource *r;
+    JSValue ret, error, func;
+
+    for(;;) {
+        if (s->count == 0) {
+            if (s->needs_await && !s->has_awaited) {
+                s->needs_await = FALSE;
+                if (js_async_disposable_stack_await(ctx, obj, JS_UNDEFINED) == 0)
+                    return;
+                js_async_disposable_stack_merge(ctx, s, JS_GetException(ctx));
+            }
+            break;
+        }
+        r = &s->resources[s->count - 1];
+        if (JS_IsUndefined(r->method)) {
+            /* null or undefined resource */
+            JS_FreeValue(ctx, r->value);
+            s->count--;
+            s->needs_await = TRUE;
+            continue;
+        }
+        ret = js_disposable_stack_call_last(ctx, s);
+        if (JS_IsException(ret)) {
+            js_async_disposable_stack_merge(ctx, s, JS_GetException(ctx));
+            continue;
+        }
+        s->has_awaited = TRUE;
+        if (js_async_disposable_stack_await(ctx, obj, ret) == 0) {
+            JS_FreeValue(ctx, ret);
+            return;
+        }
+        JS_FreeValue(ctx, ret);
+        /* the Await threw */
+        js_async_disposable_stack_merge(ctx, s, JS_GetException(ctx));
+    }
+    /* settle the promise */
+    error = s->error;
+    s->error = JS_UNINITIALIZED;
+    if (JS_IsUninitialized(error)) {
+        func = s->resolving_funcs[0];
+        error = JS_UNDEFINED;
+    } else {
+        func = s->resolving_funcs[1];
+    }
+    ret = js_call(ctx, func, JS_UNDEFINED, 1, (JSValueConst *)&error);
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, error);
+    JS_FreeValue(ctx, s->resolving_funcs[0]);
+    JS_FreeValue(ctx, s->resolving_funcs[1]);
+    s->resolving_funcs[0] = JS_UNDEFINED;
+    s->resolving_funcs[1] = JS_UNDEFINED;
+}
+
+/* magic = 1 if the awaited promise is rejected */
+static JSValue js_async_disposable_stack_handler(JSContext *ctx,
+                                                 JSValueConst this_val,
+                                                 int argc, JSValueConst *argv,
+                                                 int magic, JSValue *func_data)
+{
+    JSDisposableStack *s = JS_GetOpaque(func_data[0],
+                                        JS_CLASS_ASYNC_DISPOSABLE_STACK);
+
+    if (!s || JS_IsUndefined(s->resolving_funcs[0]))
+        return JS_UNDEFINED; /* not running */
+    if (magic)
+        js_async_disposable_stack_merge(ctx, s, JS_DupValue(ctx, argv[0]));
+    js_async_disposable_stack_run(ctx, func_data[0], s);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_async_disposable_stack_dispose_async(JSContext *ctx,
+                                                       JSValueConst this_val,
+                                                       int argc,
+                                                       JSValueConst *argv)
+{
+    JSDisposableStack *s;
+    JSValue promise, resolving_funcs[2], ret, exc;
+
+    promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise))
+        return promise;
+    s = JS_GetOpaque2(ctx, this_val, JS_CLASS_ASYNC_DISPOSABLE_STACK);
+    if (!s) {
+        exc = JS_GetException(ctx);
+        ret = js_call(ctx, resolving_funcs[1], JS_UNDEFINED, 1,
+                      (JSValueConst *)&exc);
+        JS_FreeValue(ctx, exc);
+        goto done;
+    }
+    if (s->disposed) {
+        ret = js_call(ctx, resolving_funcs[0], JS_UNDEFINED, 0, NULL);
+        goto done;
+    }
+    s->disposed = TRUE;
+    s->resolving_funcs[0] = resolving_funcs[0];
+    s->resolving_funcs[1] = resolving_funcs[1];
+    /* run synchronously until the first Await */
+    js_async_disposable_stack_run(ctx, this_val, s);
+    return promise;
+ done:
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+    return promise;
+}
+
+static const JSCFunctionListEntry js_disposable_stack_proto_funcs[] = {
+    JS_CFUNC_MAGIC_DEF("adopt", 2, js_disposable_stack_adopt, JS_CLASS_DISPOSABLE_STACK ),
+    JS_CFUNC_MAGIC_DEF("defer", 1, js_disposable_stack_defer, JS_CLASS_DISPOSABLE_STACK ),
+    JS_CFUNC_DEF("dispose", 0, js_disposable_stack_dispose ),
+    JS_CGETSET_MAGIC_DEF("disposed", js_disposable_stack_get_disposed, NULL, JS_CLASS_DISPOSABLE_STACK ),
+    JS_CFUNC_MAGIC_DEF("move", 0, js_disposable_stack_move, JS_CLASS_DISPOSABLE_STACK ),
+    JS_CFUNC_MAGIC_DEF("use", 1, js_disposable_stack_use, JS_CLASS_DISPOSABLE_STACK ),
+    JS_ALIAS_DEF("[Symbol.dispose]", "dispose" ),
+    JS_PROP_STRING_DEF("[Symbol.toStringTag]", "DisposableStack", JS_PROP_CONFIGURABLE ),
+};
+
+static const JSCFunctionListEntry js_async_disposable_stack_proto_funcs[] = {
+    JS_CFUNC_MAGIC_DEF("adopt", 2, js_disposable_stack_adopt, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
+    JS_CFUNC_MAGIC_DEF("defer", 1, js_disposable_stack_defer, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
+    JS_CFUNC_DEF("disposeAsync", 0, js_async_disposable_stack_dispose_async ),
+    JS_CGETSET_MAGIC_DEF("disposed", js_disposable_stack_get_disposed, NULL, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
+    JS_CFUNC_MAGIC_DEF("move", 0, js_disposable_stack_move, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
+    JS_CFUNC_MAGIC_DEF("use", 1, js_disposable_stack_use, JS_CLASS_ASYNC_DISPOSABLE_STACK ),
+    JS_ALIAS_DEF("[Symbol.asyncDispose]", "disposeAsync" ),
+    JS_PROP_STRING_DEF("[Symbol.toStringTag]", "AsyncDisposableStack", JS_PROP_CONFIGURABLE ),
+};
+
 /* AsyncIteratorPrototype */
+
+static JSValue js_async_iterator_dispose_unwrap(JSContext *ctx,
+                                                JSValueConst this_val,
+                                                int argc, JSValueConst *argv,
+                                                int magic, JSValue *func_data)
+{
+    return JS_UNDEFINED;
+}
+
+/* %AsyncIteratorPrototype%[Symbol.asyncDispose]() */
+static JSValue js_async_iterator_proto_async_dispose(JSContext *ctx,
+                                                     JSValueConst this_val,
+                                                     int argc,
+                                                     JSValueConst *argv)
+{
+    JSValue promise, resolving_funcs[2], method, ret, wrapper, unwrap;
+    JSValueConst undef = JS_UNDEFINED;
+    int res;
+
+    promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise))
+        return promise;
+    method = JS_GetProperty(ctx, this_val, JS_ATOM_return);
+    if (JS_IsException(method))
+        goto reject;
+    if (JS_IsUndefined(method) || JS_IsNull(method)) {
+        ret = js_call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, &undef);
+        goto done;
+    }
+    ret = JS_CallFree(ctx, method, this_val, 0, NULL);
+    if (JS_IsException(ret))
+        goto reject;
+    wrapper = js_promise_resolve(ctx, ctx->promise_ctor, 1,
+                                 (JSValueConst *)&ret, FALSE);
+    JS_FreeValue(ctx, ret);
+    if (JS_IsException(wrapper))
+        goto reject;
+    unwrap = JS_NewCFunctionData(ctx, js_async_iterator_dispose_unwrap,
+                                 1, 0, 0, NULL);
+    if (JS_IsException(unwrap)) {
+        JS_FreeValue(ctx, wrapper);
+        goto reject;
+    }
+    {
+        JSValueConst funcs[2] = { unwrap, JS_UNDEFINED };
+        res = perform_promise_then(ctx, wrapper, funcs,
+                                   (JSValueConst *)resolving_funcs);
+    }
+    JS_FreeValue(ctx, unwrap);
+    JS_FreeValue(ctx, wrapper);
+    if (res)
+        goto reject;
+    ret = JS_UNDEFINED;
+    goto done;
+ reject:
+    {
+        JSValue exc = JS_GetException(ctx);
+        ret = js_call(ctx, resolving_funcs[1], JS_UNDEFINED, 1,
+                      (JSValueConst *)&exc);
+        JS_FreeValue(ctx, exc);
+    }
+ done:
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+    return promise;
+}
 
 static const JSCFunctionListEntry js_async_iterator_proto_funcs[] = {
     JS_CFUNC_DEF("[Symbol.asyncIterator]", 0, js_iterator_proto_iterator ),
+    JS_CFUNC_DEF("[Symbol.asyncDispose]", 0, js_async_iterator_proto_async_dispose ),
 };
 
 /* AsyncFromSyncIteratorPrototype */
@@ -62713,6 +63811,27 @@ int JS_AddIntrinsicPromise(JSContext *ctx)
         return -1;
     JS_FreeValue(ctx, obj1);
     
+    /* DisposableStack, AsyncDisposableStack */
+    ft.constructor_magic = js_disposable_stack_constructor;
+    obj1 = JS_NewCConstructor(ctx, JS_CLASS_DISPOSABLE_STACK, "DisposableStack",
+                              ft.generic, 0, JS_CFUNC_constructor_magic,
+                              JS_CLASS_DISPOSABLE_STACK, JS_UNDEFINED,
+                              NULL, 0,
+                              js_disposable_stack_proto_funcs,
+                              countof(js_disposable_stack_proto_funcs), 0);
+    if (JS_IsException(obj1))
+        return -1;
+    JS_FreeValue(ctx, obj1);
+    obj1 = JS_NewCConstructor(ctx, JS_CLASS_ASYNC_DISPOSABLE_STACK, "AsyncDisposableStack",
+                              ft.generic, 0, JS_CFUNC_constructor_magic,
+                              JS_CLASS_ASYNC_DISPOSABLE_STACK, JS_UNDEFINED,
+                              NULL, 0,
+                              js_async_disposable_stack_proto_funcs,
+                              countof(js_async_disposable_stack_proto_funcs), 0);
+    if (JS_IsException(obj1))
+        return -1;
+    JS_FreeValue(ctx, obj1);
+
     /* AsyncIteratorPrototype */
     ctx->async_iterator_proto =
         JS_NewObjectProtoList(ctx,  ctx->class_proto[JS_CLASS_OBJECT],
@@ -64538,7 +65657,12 @@ static int JS_AddIntrinsicBasicObjects(JSContext *ctx)
         char buf[ATOM_GET_STR_BUF_SIZE];
         const char *name = JS_AtomGetStr(ctx, buf, sizeof(buf),
                                          JS_ATOM_EvalError + i);
-        n_args = 1 + (i == JS_AGGREGATE_ERROR);
+        if (i == JS_AGGREGATE_ERROR)
+            n_args = 2;
+        else if (i == JS_SUPPRESSED_ERROR)
+            n_args = 3;
+        else
+            n_args = 1;
         funcs = js_native_error_proto_funcs + 2 * i;
         func_obj = JS_NewCConstructor(ctx, -1, name,
                                       ft.generic, n_args, JS_CFUNC_constructor_or_func_magic, i,
