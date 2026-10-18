@@ -5,7 +5,7 @@
 [![docs](https://img.shields.io/badge/docs.rs-rquickjs-66c2a5?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyByb2xlPSJpbWciIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgdmlld0JveD0iMCAwIDUxMiA1MTIiPjxwYXRoIGZpbGw9IiNmNWY1ZjUiIGQ9Ik00ODguNiAyNTAuMkwzOTIgMjE0VjEwNS41YzAtMTUtOS4zLTI4LjQtMjMuNC0zMy43bC0xMDAtMzcuNWMtOC4xLTMuMS0xNy4xLTMuMS0yNS4zIDBsLTEwMCAzNy41Yy0xNC4xIDUuMy0yMy40IDE4LjctMjMuNCAzMy43VjIxNGwtOTYuNiAzNi4yQzkuMyAyNTUuNSAwIDI2OC45IDAgMjgzLjlWMzk0YzAgMTMuNiA3LjcgMjYuMSAxOS45IDMyLjJsMTAwIDUwYzEwLjEgNS4xIDIyLjEgNS4xIDMyLjIgMGwxMDMuOS01MiAxMDMuOSA1MmMxMC4xIDUuMSAyMi4xIDUuMSAzMi4yIDBsMTAwLTUwYzEyLjItNi4xIDE5LjktMTguNiAxOS45LTMyLjJWMjgzLjljMC0xNS05LjMtMjguNC0yMy40LTMzLjd6TTM1OCAyMTQuOGwtODUgMzEuOXYtNjguMmw4NS0zN3Y3My4zek0xNTQgMTA0LjFsMTAyLTM4LjIgMTAyIDM4LjJ2LjZsLTEwMiA0MS40LTEwMi00MS40di0uNnptODQgMjkxLjFsLTg1IDQyLjV2LTc5LjFsODUtMzguOHY3NS40em0wLTExMmwtMTAyIDQxLjQtMTAyLTQxLjR2LS42bDEwMi0zOC4yIDEwMiAzOC4ydi42em0yNDAgMTEybC04NSA0Mi41di03OS4xbDg1LTM4Ljh2NzUuNHptMC0xMTJsLTEwMiA0MS40LTEwMi00MS40di0uNmwxMDItMzguMiAxMDIgMzguMnYuNnoiPjwvcGF0aD48L3N2Zz4K)](https://docs.rs/rquickjs)
 [![status](https://img.shields.io/github/actions/workflow/status/DelSkayn/rquickjs/ci.yml?branch=master&style=for-the-badge&logo=github-actions&logoColor=white)](https://github.com/DelSkayn/rquickjs/actions/workflows/ci.yml)
 
-This library is a high level bindings of the [QuickJS-NG](https://quickjs-ng.github.io/quickjs/) JavaScript engine, a fork of the [QuickJS](https://bellard.org/quickjs/) Javascript engine.
+This library is a high level bindings of the [QuickJS](https://bellard.org/quickjs/) Javascript engine.
 Its goal is to be an easy to use, and safe wrapper similar to the rlua library.
 
 **QuickJS** is a small and embeddable JavaScript engine. It supports the _ES2020_ specification including modules, asynchronous generators, proxies and BigInt.
@@ -72,78 +72,21 @@ Rquickjs needs to compile a C-library which has it's own limitation on supported
 As a result rquickjs might not compile on all platforms which rust supports.
 In general you can allways try to compile rquickjs with the `bindgen` feature, this should work for most platforms.
 Rquickjs ships bindings for a limited set of platforms, for these platforms you don't have to enable the `bindgen` feature.
-See below for a list of supported platforms.
+See below for the platforms of this copy ("builds": the engine compiles with `cargo zigbuild`).
 
-| **platform**                   | **shipped bindings** | **tested** | **supported by quickjs** |
-| ------------------------------ | :------------------: | :--------: | :----------------------: |
-|                                |                      |            |                          |
-| x86_64-unknown-linux-gnu       |          ✅          |     ✅     |            ✅            |
-| i686-unknown-linux-gnu         |          ✅          |     ✅     |            ✅            |
-| aarch64-unknown-linux-gnu      |          ✅          |     ✅     |            ✅            |
-| loongarch64-unknown-linux-gnu  |          ✅          |     ✅     |            ✅            |
-| x86_64-unknown-linux-musl      |          ✅          |     ✅     |            ✅            |
-| aarch64-unknown-linux-musl     |          ✅          |     ✅     |            ✅            |
-| loongarch64-unknown-linux-musl |          ✅          |     ✅     |            ✅            |
-| x86_64-pc-windows-gnu          |          ✅          |     ✅     |            ✅            |
-| i686-pc-windows-gnu            |          ✅          |     ✅     |            ✅            |
-| x86_64-pc-windows-msvc         |          ✅          |     ✅     |     ❌ experimental!     |
-| aarch64-pc-windows-msvc        |          ✅          |     ❌     |     ❌ experimental!     |
-| x86_64-apple-darwin            |          ✅          |     ✅     |            ✅            |
-| aarch64-apple-darwin           |          ✅          |     ❌     |            ✅            |
-| wasm32-wasip1                  |          ✅          |     ✅     |            ✅            |
-| wasm32-wasip2                  |          ✅          |     ✅     |            ✅            |
-| wasm32-unknown-unknown         |          ✅          |     ✅     |            ✅            |
-| other                          |          ❌          |     ❌     |         Unknown          |
-
-## wasm32-unknown-unknown
-
-`wasm32-unknown-unknown` is supported out of the box: add rquickjs as a dependency and build for the target. No feature flag, no extra crate, no wasi runtime.
-
-The target ships no libc, so `rquickjs-sys` supplies the whole OS tail itself:
-
-- quickjs is compiled with the same `EMSCRIPTEN` / `FE_DOWNWARD` / `FE_UPWARD` defines already used for wasi, against a vendored subset of wasi-libc's headers.
-- the pure-compute members of wasi-libc (`snprintf`, `strtod`, libm, dlmalloc) are linked statically from a vendored `libc.a`.
-- `sys/wasm-shim/shim.c` replaces every member that would otherwise reach for the host: the clock, `localtime_r`, `abort`/`__assert_fail`, and the stdio backends.
-
-The result imports **exactly one** host function and nothing else.
-
-### The `__rquickjs_host_now_us` import
-
-The embedder must supply a single import, `env.__rquickjs_host_now_us`, returning microseconds since the unix epoch as an `f64`. It backs `Date.now()`, `new Date()` and `performance`-adjacent internals.
-
-```js
-const instance = new WebAssembly.Instance(module, {
-  env: { __rquickjs_host_now_us: () => Date.now() * 1000 },
-});
-```
-
-Time zone data does not exist here, so scripts observe UTC: `getTimezoneOffset()` is always `0`.
-
-### `Runtime::set_max_stack_size` is mandatory
-
-`JS_DEFAULT_STACK_SIZE` is 1MB, which is exactly the size of the wasm shadow stack. The default computation of `stack_top - 1MB` therefore wraps, and stack-overflow detection is silently lost: deep recursion becomes a hard trap instead of a catchable `RangeError`. Always set an explicit limit:
-
-```rust
-let runtime = Runtime::new()?;
-runtime.set_max_stack_size(256 * 1024);
-```
-
-(Defining `__wasi__` would also stop the wrap, but quickjs's `__wasi__` path pins `stack_limit = 0`, disabling stack checking outright. That is why the header is patched instead.)
-
-### The vendored libc
-
-Rather than downloading a wasi-sysroot at build time, `sys/vendor/wasi-libc/` commits the subset actually needed: the prebuilt `libc.a` from the [wasi-sdk-24 release](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-24), plus the headers required to compile quickjs against it. It's populated (and updated, after bumping the pinned wasi-sdk version in the script) by `scripts/vendor-wasm-libc.sh`; see `sys/vendor/wasi-libc/NOTICE.md` for provenance and licensing.
-
-`wasi/api.h` guards itself with `#ifndef __wasi__` / `#error`, so the vendoring script writes a copy with that one `#error` commented out. The rest of the vendored headers are unmodified.
-
-### Testing
-
-`wasm-test/` builds the safe API as a cdylib and `wasm-test/runner.ts` drives a battery through it under [deno](https://deno.com), asserting the import list along the way:
-
-```sh
-cargo build --manifest-path wasm-test/Cargo.toml --release --target wasm32-unknown-unknown
-deno run --allow-read wasm-test/runner.ts
-```
+| **platform**                   | **shipped bindings** | **builds** | **tested** |
+| ------------------------------ | :------------------: | :--------: | :--------: |
+| aarch64-apple-darwin           |          ✅          |     ✅     |     ✅     |
+| x86_64-apple-darwin            |          ✅          |     ❓     |     ❌     |
+| x86_64-unknown-linux-gnu       |          ✅          |     ✅     |     ❌     |
+| aarch64-unknown-linux-gnu      |          ✅          |     ❓     |     ❌     |
+| i686-unknown-linux-gnu         |          ✅          |     ✅     |     ❌     |
+| armv7-unknown-linux-gnueabihf  |          ✅          |     ✅     |     ❌     |
+| riscv64gc-unknown-linux-gnu    |          ✅          |     ✅     |     ❌     |
+| x86_64-pc-windows-gnu          |          ✅          |     ✅     |     ❌     |
+| \*-musl, loongarch64, msvc     |          ✅          |     ❓     |     ❌     |
+| wasm32-wasip1, wasm32-wasip2   |          ✅          |  ❌ (setjmp) |     ❌     |
+| other                          |          ❌          |     ❓     |     ❌     |
 
 ## License
 

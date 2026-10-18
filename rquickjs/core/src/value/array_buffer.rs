@@ -16,11 +16,6 @@ use core::{
 
 use super::typed_array::TypedArrayItem;
 
-/// JS_NewArrayBuffer uses max_len=0 for fixed-length buffers, and calls the
-/// realloc callback with size=0 to free. Same sentinel, different meanings.
-const FIXED_SIZE: qjs::size_t = 0;
-const FREE: qjs::size_t = 0;
-
 /// A contiguous byte region owned by `self` and usable as the backing store
 /// of an [`ArrayBuffer`].
 ///
@@ -94,47 +89,19 @@ impl<'js> ArrayBuffer<'js> {
         let capacity = src.capacity();
         let size = src.len() * size_of::<T>();
 
-        // `opaque` stays fixed across `transfer()`, so mutable capacity lives behind it instead of in it.
-        let capacity_cell = Box::into_raw(Box::new(capacity));
-
-        extern "C" fn realloc_raw<T: Copy>(
+        // QuickJS never resizes a buffer it does not own: the capacity is
+        // constant and travels in `opaque` (kept by `transfer()`). A detached
+        // buffer is finalized with a NULL pointer.
+        extern "C" fn free_raw<T: Copy>(
             _rt: *mut qjs::JSRuntime,
             opaque: *mut c_void,
             ptr: *mut c_void,
-            size: qjs::size_t,
-        ) -> *mut c_void {
-            let capacity_cell = opaque as *mut usize;
-            let capacity = unsafe { *capacity_cell };
-            // `ManuallyDrop` so a failed or unsupported resize leaves the allocation untouched.
-            let mut vec = ManuallyDrop::new(unsafe {
-                Vec::from_raw_parts(ptr as *mut T, capacity, capacity)
-            });
-
-            if size == FREE {
-                unsafe {
-                    ManuallyDrop::drop(&mut vec);
-                    drop(Box::from_raw(capacity_cell));
-                }
-                return core::ptr::null_mut();
+        ) {
+            if ptr.is_null() {
+                return;
             }
-
-            let elem_size = size_of::<T>();
-            if elem_size == 0 {
-                return core::ptr::null_mut();
-            }
-            let new_len = (size as usize).div_ceil(elem_size);
-
-            if new_len > capacity {
-                if vec.try_reserve_exact(new_len - capacity).is_err() {
-                    return core::ptr::null_mut();
-                }
-            } else if new_len < capacity {
-                vec.truncate(new_len);
-                vec.shrink_to(new_len);
-            }
-
-            unsafe { *capacity_cell = vec.capacity() };
-            vec.as_mut_ptr() as *mut c_void
+            let capacity = opaque as usize;
+            unsafe { drop(Vec::from_raw_parts(ptr as *mut T, capacity, capacity)) };
         }
 
         Ok(Self(Object(unsafe {
@@ -142,15 +109,13 @@ impl<'js> ArrayBuffer<'js> {
                 ctx.as_ptr(),
                 ptr as _,
                 size as _,
-                FIXED_SIZE,
-                Some(realloc_raw::<T>),
-                capacity_cell as _,
-                false,
+                Some(free_raw::<T>),
+                capacity as _,
+                0,
             );
             ctx.handle_exception(val).inspect_err(|_| {
                 // don't forget to free data when error occurred
                 Vec::from_raw_parts(ptr, capacity, capacity);
-                drop(Box::from_raw(capacity_cell));
             })?;
             Value::from_js_value(ctx, val)
         })))
@@ -174,14 +139,14 @@ impl<'js> ArrayBuffer<'js> {
     /// The source is moved into the buffer; JS has exclusive mutable access
     /// until the buffer is collected, at which point the source is dropped.
     /// Using this with a shared-immutable source (`Arc<[u8]>`, `bytes::Bytes`,
-    /// …) is unsound; use [`from_source_immutable`](Self::from_source_immutable) for those.
+    /// …) is unsound: JS can write to the buffer.
     pub fn from_source<S>(ctx: Ctx<'js>, src: S) -> Result<Self>
     where
         S: ArrayBufferSource + ParallelSend + 'static,
     {
         let ptr = src.as_ptr();
         let len = src.len();
-        unsafe { Self::from_external(ctx, ptr, len, false, false, move || drop(src)) }
+        unsafe { Self::from_external(ctx, ptr, len, false, move || drop(src)) }
     }
 
     /// Create a `SharedArrayBuffer` from a source that owns its backing bytes.
@@ -193,22 +158,7 @@ impl<'js> ArrayBuffer<'js> {
     {
         let ptr = src.as_ptr();
         let len = src.len();
-        unsafe { Self::from_external(ctx, ptr, len, true, false, move || drop(src)) }
-    }
-
-    /// Create an `ArrayBuffer` that JS sees as immutable, backed by a
-    /// possibly shared-immutable source.
-    ///
-    /// JS writes throw, so it is sound for the caller to keep holding
-    /// shared-immutable references to the backing store (`Arc<[u8]>`,
-    /// `bytes::Bytes`, …).
-    pub fn from_source_immutable<S>(ctx: Ctx<'js>, src: S) -> Result<Self>
-    where
-        S: ArrayBufferSource + ParallelSend + 'static,
-    {
-        let ptr = src.as_ptr();
-        let len = src.len();
-        unsafe { Self::from_external(ctx, ptr, len, false, true, move || drop(src)) }
+        unsafe { Self::from_external(ctx, ptr, len, true, move || drop(src)) }
     }
 
     /// Internal helper backing the safe `from_source*` constructors.
@@ -224,26 +174,26 @@ impl<'js> ArrayBuffer<'js> {
         ptr: *mut u8,
         len: usize,
         is_shared: bool,
-        immutable: bool,
         drop_fn: F,
     ) -> Result<Self>
     where
         F: FnOnce() + ParallelSend + 'static,
     {
+        // A detached buffer (whose bytes moved to another buffer by
+        // `transfer()`, with the same `opaque`) is finalized with a NULL
+        // pointer.
         extern "C" fn shim<F: FnOnce()>(
             _rt: *mut qjs::JSRuntime,
             opaque: *mut c_void,
-            _ptr: *mut c_void,
-            size: qjs::size_t,
-        ) -> *mut c_void {
-            if size != FREE {
-                return core::ptr::null_mut();
+            ptr: *mut c_void,
+        ) {
+            if ptr.is_null() {
+                return;
             }
             unsafe {
                 let boxed: Box<F> = Box::from_raw(opaque as *mut F);
                 (*boxed)();
             }
-            core::ptr::null_mut()
         }
 
         let opaque = Box::into_raw(Box::new(drop_fn)) as *mut c_void;
@@ -253,22 +203,13 @@ impl<'js> ArrayBuffer<'js> {
                 ctx.as_ptr(),
                 ptr,
                 len as _,
-                FIXED_SIZE,
                 Some(shim::<F>),
                 opaque,
-                is_shared,
+                is_shared as _,
             );
             if let Err(e) = ctx.handle_exception(val) {
-                shim::<F>(
-                    qjs::JS_GetRuntime(ctx.as_ptr()),
-                    opaque,
-                    ptr as *mut c_void,
-                    FREE,
-                );
+                shim::<F>(qjs::JS_GetRuntime(ctx.as_ptr()), opaque, ptr as *mut c_void);
                 return Err(e);
-            }
-            if immutable {
-                qjs::JS_SetImmutableArrayBuffer(val, true);
             }
             Value::from_js_value(ctx, val)
         })))
@@ -616,88 +557,6 @@ mod test {
     }
 
     #[test]
-    fn from_source_immutable_arc_slices() {
-        struct ArcSlice {
-            arc: Arc<Vec<u8>>,
-            offset: usize,
-            len: usize,
-        }
-        unsafe impl ArrayBufferSource for ArcSlice {
-            fn as_ptr(&self) -> *mut u8 {
-                unsafe { self.arc.as_ptr().add(self.offset) }
-            }
-            fn len(&self) -> usize {
-                self.len
-            }
-        }
-
-        let buf: Arc<Vec<u8>> = Arc::new((0u8..16).collect());
-        let weak = Arc::downgrade(&buf);
-
-        let rt = crate::Runtime::new().unwrap();
-        let c = crate::Context::full(&rt).unwrap();
-        c.with(|ctx| {
-            let mk = |offset: usize, len: usize| -> ArrayBuffer<'_> {
-                ArrayBuffer::from_source_immutable(
-                    ctx.clone(),
-                    ArcSlice {
-                        arc: buf.clone(),
-                        offset,
-                        len,
-                    },
-                )
-                .unwrap()
-            };
-            let full = mk(0, 16);
-            let head = mk(0, 4);
-            let tail = mk(12, 4);
-            let middle = mk(4, 8);
-
-            assert_eq!(
-                unsafe { full.as_bytes() }.unwrap(),
-                (0u8..16).collect::<Vec<_>>()
-            );
-            assert_eq!(unsafe { head.as_bytes() }.unwrap(), &[0, 1, 2, 3]);
-            assert_eq!(unsafe { tail.as_bytes() }.unwrap(), &[12, 13, 14, 15]);
-            assert_eq!(
-                unsafe { middle.as_bytes() }.unwrap(),
-                (4u8..12).collect::<Vec<_>>()
-            );
-            assert_eq!(Arc::strong_count(&buf), 5);
-
-            ctx.globals().set("buf", full).unwrap();
-
-            let after: u8 = ctx
-                .eval::<u8, _>(
-                    r#"
-                        const arr = new Uint8Array(buf);
-                        arr[0] = 99;
-                        arr[0];
-                    "#,
-                )
-                .unwrap();
-            assert_eq!(after, 0, "immutable ArrayBuffer must not accept writes");
-
-            let writer = ctx.eval::<(), _>(
-                r#"
-                    "use strict";
-                    new DataView(buf).setUint8(0, 99);
-                "#,
-            );
-            assert!(
-                writer.is_err(),
-                "DataView write on immutable buffer must throw"
-            );
-        });
-
-        drop(buf);
-        rt.run_gc();
-        drop(c);
-        drop(rt);
-        assert!(weak.upgrade().is_none());
-    }
-
-    #[test]
     fn from_source_vec() {
         let rt = crate::Runtime::new().unwrap();
         let c = crate::Context::full(&rt).unwrap();
@@ -770,7 +629,7 @@ mod test {
     }
 
     #[test]
-    fn transfer_to_different_length_preserves_external_buffer() {
+    fn transfer_to_different_length_releases_external_buffer() {
         use core::sync::atomic::{AtomicUsize, Ordering};
 
         struct Tracker {
@@ -805,82 +664,18 @@ mod test {
             let ab = ArrayBuffer::from_source(ctx.clone(), src).unwrap();
             ctx.globals().set("buf", ab).unwrap();
 
-            assert!(ctx.eval::<(), _>("buf.transfer(8)").is_err());
-            drop(ctx.catch());
-            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            // the bytes are copied to an engine buffer and the source is
+            // released right away
+            ctx.eval::<(), _>("globalThis.grown = buf.transfer(8)")
+                .unwrap();
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
 
-            let ab: ArrayBuffer = ctx.globals().get("buf").unwrap();
-            assert_eq!(unsafe { ab.as_bytes() }.unwrap(), &[1, 2, 3, 4]);
+            let ab: ArrayBuffer = ctx.globals().get("grown").unwrap();
+            assert_eq!(unsafe { ab.as_bytes() }.unwrap(), &[1, 2, 3, 4, 0, 0, 0, 0]);
         });
 
         drop(c);
         drop(rt);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn from_source_immutable_arc() {
-        let arc: Arc<[u8]> = Arc::from((0u8..8).collect::<Vec<_>>().into_boxed_slice());
-        let weak = Arc::downgrade(&arc);
-        assert_eq!(Arc::strong_count(&arc), 1);
-
-        let rt = crate::Runtime::new().unwrap();
-        let c = crate::Context::full(&rt).unwrap();
-
-        // Case 1: JS drops first while Rust keeps its Arc clone.
-        c.with(|ctx| {
-            let _ab = ArrayBuffer::from_source_immutable(ctx.clone(), arc.clone()).unwrap();
-            assert_eq!(Arc::strong_count(&arc), 2, "Arc cloned into drop closure");
-            // _ab drops at end of block; shim runs; closure drops its Arc clone.
-        });
-        assert_eq!(
-            Arc::strong_count(&arc),
-            1,
-            "drop closure must release its Arc clone when ArrayBuffer is freed"
-        );
-        assert!(
-            weak.upgrade().is_some(),
-            "allocation must stay alive while Rust still holds the Arc"
-        );
-
-        // Case 2: Rust drops first, JS keeps the buffer (stored in globals).
-        c.with(|ctx| {
-            let ab = ArrayBuffer::from_source_immutable(ctx.clone(), arc.clone()).unwrap();
-            ctx.globals().set("buf", ab).unwrap();
-            assert_eq!(Arc::strong_count(&arc), 2);
-        });
-        drop(arc);
-        assert!(
-            weak.upgrade().is_some(),
-            "allocation must stay alive: JS still holds the buffer via the Arc clone in the closure"
-        );
-        assert_eq!(
-            weak.strong_count(),
-            1,
-            "only the closure's Arc clone should remain"
-        );
-
-        // Drop the context: JS buffer is freed, shim runs, Arc clone released.
-        drop(c);
-        drop(rt);
-        assert!(
-            weak.upgrade().is_none(),
-            "allocation must be freed after both Rust and JS release their handles"
-        );
-    }
-
-    #[cfg(feature = "bytes")]
-    #[test]
-    fn from_source_immutable_bytes() {
-        let data: bytes::Bytes = (0u8..8).collect::<Vec<_>>().into();
-        let rt = crate::Runtime::new().unwrap();
-        let c = crate::Context::full(&rt).unwrap();
-        c.with(|ctx| {
-            let ab = ArrayBuffer::from_source_immutable(ctx.clone(), data.clone()).unwrap();
-            assert_eq!(
-                unsafe { ab.as_bytes() }.unwrap(),
-                (0u8..8).collect::<Vec<_>>()
-            );
-        });
     }
 }

@@ -57,6 +57,8 @@ pub mod intrinsic {
         Date JS_AddIntrinsicDate,
         /// Add evaluation support
         Eval JS_AddIntrinsicEval,
+        /// Add String.prototype.normalize
+        StringNormalize JS_AddIntrinsicStringNormalize,
         /// Add RegExp compiler
         RegExpCompiler JS_AddIntrinsicRegExpCompiler,
         /// Add RegExp object support
@@ -71,12 +73,12 @@ pub mod intrinsic {
         TypedArrays JS_AddIntrinsicTypedArrays,
         /// Add Promise object support
         Promise JS_AddIntrinsicPromise,
-        /// Add Performance support
-        Performance JS_AddPerformance,
         /// Add WeakRef support
         WeakRef JS_AddIntrinsicWeakRef,
         /// Add DOMException
         DOMException JS_AddIntrinsicDOMException,
+        /// Add atob() and btoa() (they throw DOMExceptions)
+        AToB JS_AddIntrinsicAToB,
     }
 
     /// Add none intrinsics
@@ -86,6 +88,7 @@ pub mod intrinsic {
     pub type All = (
         Date,
         Eval,
+        StringNormalize,
         RegExpCompiler,
         RegExp,
         Json,
@@ -93,9 +96,9 @@ pub mod intrinsic {
         MapSet,
         TypedArrays,
         Promise,
-        Performance,
         WeakRef,
         DOMException,
+        AToB,
     );
 }
 

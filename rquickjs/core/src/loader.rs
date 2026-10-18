@@ -134,37 +134,26 @@ impl LoaderHolder {
         unsafe {
             qjs::JS_SetModuleLoaderFunc2(
                 rt,
-                None,
+                Some(Self::normalize_raw),
                 Some(Self::load_raw),
                 None, // No attribute validation
                 self.0 as _,
             );
-            qjs::JS_SetModuleNormalizeFunc2(rt, Some(Self::normalize_raw));
         }
     }
 
+    /// QuickJS does not give the import attributes to the resolver.
     #[inline]
     fn normalize<'js>(
         opaque: &mut LoaderOpaque,
         ctx: &Ctx<'js>,
         base: &CStr,
         name: &CStr,
-        attributes: qjs::JSValue,
     ) -> Result<*mut qjs::c_char> {
         let base = base.to_str()?;
         let name = name.to_str()?;
 
-        // Convert JSValue to Option<ImportAttributes<'js>>
-        let attrs = {
-            let val = unsafe { Value::from_js_value_const(ctx.clone(), attributes) };
-            if val.is_undefined() || val.is_null() {
-                None
-            } else {
-                Some(ImportAttributes(Object(val)))
-            }
-        };
-
-        let name = opaque.resolver.resolve(ctx, base, name, attrs)?;
+        let name = opaque.resolver.resolve(ctx, base, name, None)?;
 
         // We should transfer ownership of this string to QuickJS
         Ok(unsafe { qjs::js_strndup(ctx.as_ptr(), name.as_ptr() as _, name.len() as _) })
@@ -174,7 +163,6 @@ impl LoaderHolder {
         ctx: *mut qjs::JSContext,
         base: *const qjs::c_char,
         name: *const qjs::c_char,
-        attributes: qjs::JSValue,
         opaque: *mut qjs::c_void,
     ) -> *mut qjs::c_char {
         let ctx = Ctx::from_ptr(ctx);
@@ -182,7 +170,7 @@ impl LoaderHolder {
         let name = CStr::from_ptr(name);
         let loader = &mut *(opaque as *mut LoaderOpaque);
 
-        Self::normalize(loader, &ctx, base, name, attributes).unwrap_or_else(|error| {
+        Self::normalize(loader, &ctx, base, name).unwrap_or_else(|error| {
             error.throw(&ctx);
             ptr::null_mut()
         })

@@ -195,11 +195,10 @@ where
         // Only bail on uncatchable exceptions (e.g. interrupt handler).
         // Regular pending exceptions are transient and don't prevent settlement.
         if this.promise.ctx.has_exception() {
-            let exc = this.promise.ctx.catch();
-            if exc.is_uncatchable_error() {
-                this.promise.ctx.throw(exc);
+            if this.promise.ctx.has_uncatchable_exception() {
                 return Poll::Ready(Err(Error::Exception));
             }
+            drop(this.promise.ctx.catch());
         }
 
         if this.state.is_none() {

@@ -36,10 +36,6 @@ pub struct WriteOptions {
     pub allow_shared_array_buffer: bool,
     /// Allow object references to encode arbitrary object graph.
     pub object_reference: bool,
-    /// Do not write source code information.
-    pub strip_source: bool,
-    /// Do not write debug information.
-    pub strip_debug: bool,
 }
 
 impl WriteOptions {
@@ -62,14 +58,6 @@ impl WriteOptions {
 
         if self.object_reference {
             flag |= qjs::JS_WRITE_OBJ_REFERENCE;
-        }
-
-        if self.strip_source {
-            flag |= qjs::JS_WRITE_OBJ_STRIP_SOURCE;
-        }
-
-        if self.strip_debug {
-            flag |= qjs::JS_WRITE_OBJ_STRIP_DEBUG;
         }
 
         flag as i32
@@ -268,13 +256,16 @@ impl<'js> Module<'js, Declared> {
 
         let module_val = unsafe { ctx.eval_raw(source, name.as_c_str(), flag as i32)? };
         let module_val = unsafe { ctx.handle_exception(module_val)? };
-        debug_assert_eq!(qjs::JS_TAG_MODULE, unsafe {
-            qjs::JS_VALUE_GET_TAG(module_val)
-        });
-        let module_ptr = unsafe {
-            NonNull::new(qjs::JS_VALUE_GET_PTR(module_val).cast()).ok_or(Error::Unknown)?
-        };
-        unsafe { Ok(Module::from_ptr(ctx, module_ptr)) }
+        unsafe { Self::from_module_value(ctx, module_val) }
+    }
+
+    /// Takes the reference returned by the engine: the module stays alive in the list of
+    /// loaded modules of its context.
+    unsafe fn from_module_value(ctx: Ctx<'js>, module_val: qjs::JSValue) -> Result<Self> {
+        debug_assert_eq!(qjs::JS_TAG_MODULE, qjs::JS_VALUE_GET_TAG(module_val));
+        let module_ptr = NonNull::new(qjs::JS_VALUE_GET_PTR(module_val).cast());
+        qjs::JS_FreeValue(ctx.as_ptr(), module_val);
+        Ok(Module::from_ptr(ctx, module_ptr.ok_or(Error::Unknown)?))
     }
 
     /// Declare a rust native module but don't evaluate it.
@@ -346,10 +337,7 @@ impl<'js> Module<'js, Declared> {
             )
         };
         let module = ctx.handle_exception(module)?;
-        debug_assert_eq!(qjs::JS_TAG_MODULE, unsafe { qjs::JS_VALUE_GET_TAG(module) });
-        let module_ptr =
-            unsafe { NonNull::new(qjs::JS_VALUE_GET_PTR(module).cast()).ok_or(Error::Unknown)? };
-        unsafe { Ok(Module::from_ptr(ctx, module_ptr)) }
+        unsafe { Self::from_module_value(ctx, module) }
     }
 
     /// Load a module from a raw module loading function.

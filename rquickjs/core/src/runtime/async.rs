@@ -205,9 +205,6 @@ impl AsyncRuntime {
     /// Set a limit on the max amount of memory the runtime will use.
     ///
     /// Setting the limit to 0 is equivalent to unlimited memory.
-    ///
-    /// Note that is a Noop when a custom allocator is being used,
-    /// as is the case for the "rust-alloc" or "allocator" features.
     pub async fn set_memory_limit(&self, limit: usize) {
         unsafe {
             self.inner.lock().await.runtime.set_memory_limit(limit);

@@ -16,7 +16,7 @@ impl<'js> Symbol<'js> {
         let c_str = description.map(CString::new).transpose()?;
         let ptr = c_str.as_ref().map_or(core::ptr::null(), |s| s.as_ptr());
         unsafe {
-            let val = qjs::JS_NewSymbol(ctx.as_ptr(), ptr, is_global);
+            let val = qjs::JS_NewSymbol(ctx.as_ptr(), ptr, is_global as _);
             let val = ctx.handle_exception(val)?;
             Ok(Symbol(Value::from_js_value(ctx, val)))
         }

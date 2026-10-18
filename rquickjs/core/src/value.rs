@@ -362,28 +362,30 @@ impl<'js> Value<'js> {
         qjs::JS_TAG_MODULE == unsafe { qjs::JS_VALUE_GET_TAG(self.value) }
     }
 
-    /// Check if the value is an array
+    /// Check if the value is an array (a proxy of an array is a proxy, not an array)
     #[inline]
     pub fn is_array(&self) -> bool {
-        unsafe { qjs::JS_IsArray(self.value) }
+        // JS_IsArray() only fails (throws) on revoked proxies
+        unsafe { !self.is_proxy() && qjs::JS_IsArray(self.ctx.as_ptr(), self.value) > 0 }
     }
 
     /// Check if the value is a function
     #[inline]
     pub fn is_function(&self) -> bool {
-        unsafe { qjs::JS_IsFunction(self.ctx.as_ptr(), self.value) }
+        unsafe { qjs::JS_IsFunction(self.ctx.as_ptr(), self.value) != 0 }
     }
 
     /// Check if the value is a constructor function
     #[inline]
     pub fn is_constructor(&self) -> bool {
-        unsafe { qjs::JS_IsConstructor(self.ctx.as_ptr(), self.value) }
+        unsafe { qjs::JS_IsConstructor(self.ctx.as_ptr(), self.value) != 0 }
     }
 
     /// Check if the value is a promise.
     #[inline]
     pub fn is_promise(&self) -> bool {
-        unsafe { qjs::JS_PromiseState(self.ctx.as_ptr(), self.value) >= 0 }
+        // -1 (not a promise) comes back through an unsigned enum
+        unsafe { qjs::JS_PromiseState(self.ctx.as_ptr(), self.value) as i32 >= 0 }
     }
 
     /// Check if the value is an exception
@@ -395,13 +397,7 @@ impl<'js> Value<'js> {
     /// Check if the value is an error
     #[inline]
     pub fn is_error(&self) -> bool {
-        unsafe { qjs::JS_IsError(self.value) }
-    }
-
-    /// Check if the value is an uncatchable error (e.g. from an interrupt handler)
-    #[inline]
-    pub fn is_uncatchable_error(&self) -> bool {
-        unsafe { qjs::JS_IsUncatchableError(self.value) }
+        unsafe { qjs::JS_IsError(self.ctx.as_ptr(), self.value) != 0 }
     }
 
     /// Check if the value is a BigInt
@@ -413,7 +409,7 @@ impl<'js> Value<'js> {
     /// Check if the value is a proxy
     #[inline]
     pub fn is_proxy(&self) -> bool {
-        unsafe { qjs::JS_IsProxy(self.value) }
+        unsafe { qjs::JS_IsProxy(self.value) != 0 }
     }
 
     /// Reference as value
@@ -448,7 +444,7 @@ impl<'js> Value<'js> {
 
     /// Strict equality, like the `===` operator
     pub fn strict_eq(&self, other: &Value<'js>) -> bool {
-        unsafe { qjs::JS_IsStrictEqual(self.ctx.as_ptr(), self.value, other.value) }
+        unsafe { qjs::JS_StrictEq(self.ctx.as_ptr(), self.value, other.value) != 0 }
     }
 
     /// Like [`Value::strict_eq`], but NaNs are equal while positive/negative zero are distinguished.
@@ -456,7 +452,7 @@ impl<'js> Value<'js> {
     /// - Two NaNs are considered `same_value`, but not `strict_eq`.
     /// - `+0` and `-0` are not considered `same_value`, but _are_ considered `strict_eq`.
     pub fn same_value(&self, other: &Value<'js>) -> bool {
-        unsafe { qjs::JS_IsSameValue(self.ctx.as_ptr(), self.value, other.value) }
+        unsafe { qjs::JS_SameValue(self.ctx.as_ptr(), self.value, other.value) != 0 }
     }
 
     /// Like [`Value::strict_eq`], but NaNs are equal.
@@ -464,7 +460,7 @@ impl<'js> Value<'js> {
     /// - Two NaNs are considered `same_value_zero`, but not `strict_eq`.
     /// - `+0` and `-0` are considered both `same_value_zero` and `strict_eq`.
     pub fn same_value_zero(&self, other: &Value<'js>) -> bool {
-        unsafe { qjs::JS_IsSameValueZero(self.ctx.as_ptr(), self.value, other.value) }
+        unsafe { qjs::JS_SameValueZero(self.ctx.as_ptr(), self.value, other.value) != 0 }
     }
 
     /// Returns the raw C library JavaScript value.
@@ -952,6 +948,8 @@ mod test {
     // `Value::new_big_int` must surface QuickJS allocation failures as
     // `Err(Error::Exception)` rather than returning a `Value` that wraps a
     // `JS_EXCEPTION` sentinel.
+    // On 64-bit targets every i64 is a short (unallocated) BigInt.
+    #[cfg(target_pointer_width = "32")]
     #[test]
     fn big_int_oom_is_reported() {
         let rt = crate::Runtime::new().unwrap();

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- Built on the bellard QuickJS tree this copy is vendored in instead of QuickJS-NG: `Runtime::set_dump_flags`, the `Performance` intrinsic, `ArrayBuffer::from_source_immutable`, `WriteOptions::strip_source`/`strip_debug`, `Value::is_uncatchable_error` (see `Ctx::has_uncatchable_exception`) and `Allocator::calloc` are removed; resolvers receive no import attributes; the `dump-*` features enable the engine `DUMP_*` options.
+- `Allocator` implementations are given the memory limit through QuickJS's allocation state: `Runtime::set_memory_limit` also applies with a custom allocator.
+
 ### Added
 
 - `#[rquickjs::methods]` accepts `enumerable`, `configurable`, and `writable` on functions, and `= false` to disable default attributes

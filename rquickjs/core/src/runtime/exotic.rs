@@ -15,6 +15,10 @@ impl ExoticMethodsHolder {
             has_property: Some(crate::class::ffi::exotic_has_property),
             set_property: Some(crate::class::ffi::exotic_set_property),
             get_property: Some(crate::class::ffi::exotic_get_property),
+            get_prototype: None,
+            set_prototype: None,
+            is_extensible: None,
+            prevent_extensions: None,
         })))
     }
 

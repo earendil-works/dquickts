@@ -260,7 +260,16 @@ impl<'js> Ctx<'js> {
 
     /// Returns true if there is a pending JavaScript exception.
     pub fn has_exception(&self) -> bool {
-        unsafe { qjs::JS_HasException(self.ctx.as_ptr()) }
+        unsafe { qjs::JS_HasException(self.ctx.as_ptr()) != 0 }
+    }
+
+    /// Returns true if the pending exception cannot be caught by JavaScript code (raised by
+    /// the interrupt handler, or the marker of a suspended execution).
+    pub fn has_uncatchable_exception(&self) -> bool {
+        unsafe {
+            qjs::JS_HasException(self.ctx.as_ptr()) != 0
+                && qjs::JS_IsUncatchableException(self.ctx.as_ptr()) != 0
+        }
     }
 
     /// Throws a JavaScript value as a new exception.
@@ -550,7 +559,9 @@ mod test {
         let ctx = Context::full(&runtime).unwrap();
         ctx.with(|ctx| {
             // Schedule a job that throws when it runs.
-            ctx.eval::<(), _>("queueMicrotask(() => { throw new Error('boom'); });")
+            ctx.eval::<crate::Function, _>("() => { throw new Error('boom'); }")
+                .unwrap()
+                .defer(())
                 .unwrap();
 
             // Run it: the job throws, but that must not leave a pending
@@ -602,7 +613,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "foo is not defined")]
+    #[should_panic(expected = "'foo' is not defined")]
     fn eval_with_sloppy_code() {
         use crate::{CatchResultExt, Context, Runtime};
 
@@ -654,7 +665,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "foo is not defined")]
+    #[should_panic(expected = "'foo' is not defined")]
     fn eval_with_options_strict_sloppy_code() {
         use crate::{context::EvalOptions, CatchResultExt, Context, Runtime};
 

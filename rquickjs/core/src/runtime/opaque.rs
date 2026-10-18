@@ -100,9 +100,15 @@ impl<'js> Opaque<'js> {
     }
 
     pub unsafe fn initialize(&mut self, rt: *mut qjs::JSRuntime) -> Result<(), Error> {
-        qjs::JS_NewClassID(rt, (&mut self.class_id) as *mut qjs::JSClassID);
-        qjs::JS_NewClassID(rt, (&mut self.callable_class_id) as *mut qjs::JSClassID);
-        qjs::JS_NewClassID(rt, (&mut self.exotic_class_id) as *mut qjs::JSClassID);
+        // Class ids are process wide in QuickJS: allocate them once so that
+        // every runtime uses the same ids (JS_NewClassID() is serialized and
+        // keeps an already allocated id).
+        static mut CLASS_ID: qjs::JSClassID = 0;
+        static mut CALLABLE_CLASS_ID: qjs::JSClassID = 0;
+        static mut EXOTIC_CLASS_ID: qjs::JSClassID = 0;
+        self.class_id = qjs::JS_NewClassID(&raw mut CLASS_ID);
+        self.callable_class_id = qjs::JS_NewClassID(&raw mut CALLABLE_CLASS_ID);
+        self.exotic_class_id = qjs::JS_NewClassID(&raw mut EXOTIC_CLASS_ID);
 
         let class_def = qjs::JSClassDef {
             class_name: c"RustClass".as_ptr().cast(),

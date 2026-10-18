@@ -152,9 +152,6 @@ impl Runtime {
     /// Set a limit on the max amount of memory the runtime will use.
     ///
     /// Setting the limit to 0 is equivalent to unlimited memory.
-    ///
-    /// Note that is a Noop when a custom allocator is being used,
-    /// as is the case for the "rust-alloc" or "allocator" features.
     pub fn set_memory_limit(&self, limit: usize) {
         unsafe {
             self.inner.lock().set_memory_limit(limit);
@@ -174,13 +171,6 @@ impl Runtime {
     pub fn set_gc_threshold(&self, threshold: usize) {
         unsafe {
             self.inner.lock().set_gc_threshold(threshold);
-        }
-    }
-
-    /// Set debug flags for dumping memory
-    pub fn set_dump_flags(&self, flags: u64) {
-        unsafe {
-            self.inner.lock().set_dump_flags(flags);
         }
     }
 
