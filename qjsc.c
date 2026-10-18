@@ -264,8 +264,13 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
         size_t buf_len;
         uint8_t *buf;
         char cname[1024];
-        int res;
-        
+        int type;
+
+        type = js_module_get_type(ctx, attributes);
+        if (type < 0)
+            return NULL;
+        if (type == JS_MODULE_TYPE_JS && has_suffix(module_name, ".json"))
+            type = JS_MODULE_TYPE_JSON;
         buf = js_load_file(ctx, &buf_len, module_name);
         if (!buf) {
             JS_ThrowReferenceError(ctx, "could not load module filename '%s'",
@@ -273,18 +278,12 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
             return NULL;
         }
 
-        res = js_module_test_json(ctx, attributes);
-        if (has_suffix(module_name, ".json") || res > 0) {
-            /* compile as JSON or JSON5 depending on "type" */
+        if (type != JS_MODULE_TYPE_JS) {
+            /* JSON, text or bytes: the value of the "default" export is
+               serialized */
             JSValue val;
-            int flags;
 
-            if (res == 2)
-                flags = JS_PARSE_JSON_EXT;
-            else
-                flags = 0;
-            val = JS_ParseJSON2(ctx, (char *)buf, buf_len, module_name, flags);
-            js_free(ctx, buf);
+            val = js_module_new_value(ctx, type, buf, buf_len, module_name);
             if (JS_IsException(val))
                 return NULL;
             /* create a dummy module */

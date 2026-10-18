@@ -345,6 +345,12 @@ run-test262$(EXE): $(OBJDIR)/run-test262.o $(QJS_LIB_OBJS)
 run-test262-debug: $(patsubst %.o, %.debug.o, $(OBJDIR)/run-test262.o $(QJS_LIB_OBJS))
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
+tests/test_std_api$(EXE): $(OBJDIR)/tests/test_std_api.o $(QJS_LIB_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+
+tests/test_api$(EXE): $(OBJDIR)/tests/test_api.o $(QJS_LIB_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+
 # object suffix order: nolto
 
 $(OBJDIR)/%.o: %.c | $(OBJDIR)
@@ -381,7 +387,7 @@ clean:
 	rm -f repl.c out.c
 	rm -f *.a *.o *.d *~ unicode_gen regexp_test fuzz_eval fuzz_compile fuzz_regexp $(PROGS)
 	rm -f hello.c test_fib.c
-	rm -f examples/*.so tests/*.so
+	rm -f examples/*.so tests/*.so tests/test_std_api$(EXE) tests/test_api$(EXE)
 	rm -rf $(OBJDIR)/ *.dSYM/ qjs-debug$(EXE)
 	rm -rf run-test262-debug$(EXE)
 	rm -f run_octane run_sunspider_like
@@ -464,7 +470,8 @@ ifdef CONFIG_SHARED_LIBS
 test: tests/bjson.so examples/point.so
 endif
 
-test: qjs$(EXE)
+test: qjs$(EXE) tests/test_std_api$(EXE) tests/test_api$(EXE)
+	$(WINE) ./tests/test_api$(EXE)
 	$(WINE) ./qjs$(EXE) tests/test_closure.js
 	$(WINE) ./qjs$(EXE) tests/test_language.js
 	$(WINE) ./qjs$(EXE) --std tests/test_builtin.js
@@ -474,6 +481,7 @@ test: qjs$(EXE)
 	$(WINE) ./qjs$(EXE) tests/test_worker.js
 ifndef CONFIG_WIN32
 	$(WINE) ./qjs$(EXE) tests/test_std.js
+	$(WINE) ./tests/test_std_api$(EXE)
 	$(WINE) ./qjs$(EXE) tests/test_rw_handler.js
 endif
 ifdef CONFIG_SHARED_LIBS

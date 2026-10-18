@@ -62,8 +62,15 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
         val = JS_Eval(ctx, buf, buf_len, filename,
                       eval_flags | JS_EVAL_FLAG_COMPILE_ONLY);
         if (!JS_IsException(val)) {
-            js_module_set_import_meta(ctx, val, TRUE, TRUE);
-            val = JS_EvalFunction(ctx, val);
+            /* "<input>", "<cmdline>" and "<stdin>" are not files:
+               realpath() would fail */
+            if (js_module_set_import_meta(ctx, val, filename[0] != '<',
+                                          TRUE) < 0) {
+                JS_FreeValue(ctx, val);
+                val = JS_EXCEPTION;
+            } else {
+                val = JS_EvalFunction(ctx, val);
+            }
         }
         val = js_std_await(ctx, val);
     } else {

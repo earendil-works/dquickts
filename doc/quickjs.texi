@@ -283,6 +283,32 @@ QuickJS C API.
 
 @end itemize
 
+The @code{type} import attribute selects how the module file is
+loaded by @code{qjs}:
+
+@itemize
+
+@item @code{"json"} (default for module names ending with
+@code{.json}): the default export is the parsed JSON value.
+
+@item @code{"json5"}: same as @code{"json"} with the extensions of
+@code{std.parseExtJSON()}.
+
+@item @code{"text"}: the default export is the file contents as a
+string (UTF-8 encoding).
+
+@item @code{"bytes"}: the default export is the file contents as an
+@code{Uint8Array}.
+
+@end itemize
+
+Example:
+@example
+import text from "./README.md" with @{ type: "text" @};
+@end example
+
+Other types are rejected with a @code{TypeError}.
+
 @section Standard library
 
 The standard library is included by default in the command line
@@ -337,14 +363,16 @@ Load the file @code{filename} and return it as a string assuming UTF-8
 encoding. Return @code{null} in case of I/O error.
 
 @item open(filename, flags, errorObj = undefined)
-Open a file (wrapper to the libc @code{fopen()}). Return the FILE
+Open a file (wrapper to the libc @code{fopen()}). @code{flags} is
+made of the characters @code{rwa+bx} (@code{x}: fail if the file
+exists). Return the FILE
 object or @code{null} in case of I/O error. If @code{errorObj} is not
 undefined, set its @code{errno} property to the error code or to 0 if
 no error occured.
 
 @item popen(command, flags, errorObj = undefined)
 Open a process by creating a pipe (wrapper to the libc
-@code{popen()}). Return the FILE
+@code{popen()}). @code{flags} is @code{"r"} or @code{"w"}. Return the FILE
 object or @code{null} in case of I/O error. If @code{errorObj} is not
 undefined, set its @code{errno} property to the error code or to 0 if
 no error occured.
@@ -592,6 +620,10 @@ Rename a file. Return 0 if OK or @code{-errno}.
 Return @code{[str, err]} where @code{str} is the canonicalized absolute
 pathname of @code{path} and @code{err} the error code.
 
+@item exePath()
+Return the absolute path of the running executable or
+@code{undefined} if it is not available.
+
 @item getcwd()
 Return @code{[str, err]} where @code{str} is the current working directory
 and @code{err} the error code.
@@ -601,6 +633,20 @@ Change the current directory. Return 0 if OK or @code{-errno}.
 
 @item mkdir(path, mode = 0o777)
 Create a directory at @code{path}. Return 0 if OK or @code{-errno}.
+
+@item mkdtemp(pattern = "tmpXXXXXX")
+Create a directory with a unique name and the mode @code{0o700}. The
+trailing @code{XXXXXX} of @code{pattern} (appended if missing) is
+replaced to make the name unique. Return @code{[path, err]} where
+@code{path} is the directory name and @code{err} the error code. Not
+available on Windows.
+
+@item mkstemp(pattern = "tmpXXXXXX")
+Create and open for reading and writing a file with a unique name and
+the mode @code{0o600}, as @code{mkdtemp()}. Return @code{[path, fd]}
+where @code{fd} is the file handle or @code{-errno} in case of
+error. The file is not removed when it is closed. Not available on
+Windows.
 
 @item stat(path)
 @item lstat(path)
@@ -751,6 +797,14 @@ to the timer.
 
 @item clearTimeout(handle)
 Cancel a timer.
+
+@item setInterval(func, delay)
+Call the function @code{func} every @code{delay} ms (at least 1 ms)
+until the timer is cancelled. Return a handle to the timer.
+
+@item clearInterval(handle)
+Cancel a timer. @code{clearTimeout()} and @code{clearInterval()} accept
+the handles of both kinds of timers.
 
 @item platform
 Return a string representing the platform: @code{"linux"}, @code{"darwin"},

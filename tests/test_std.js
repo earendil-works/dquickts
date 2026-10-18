@@ -126,6 +126,60 @@ function test_popen()
     os.remove(fname);
 }
 
+function test_open_modes()
+{
+    var fname = "tmp_file_x.txt", f, err = {};
+
+    os.remove(fname);
+    f = std.open(fname, "wx", err);
+    assert(f !== null && err.errno === 0);
+    f.close();
+    /* 'x' fails if the file exists */
+    f = std.open(fname, "wx", err);
+    assert(f, null);
+    assert(err.errno, std.Error.EEXIST);
+    os.remove(fname);
+
+    /* popen() only accepts "r" or "w" */
+    for (var mode of ["rw", "", "r+"]) {
+        try {
+            std.popen("true", mode);
+            assert(false, true, "popen mode '" + mode + "'");
+        } catch(e) {
+            assert(e instanceof TypeError);
+        }
+    }
+}
+
+function test_load_file()
+{
+    var fname = "tmp_load_file.txt", f, str, fds;
+
+    /* larger than the initial buffer used for non seekable files */
+    str = "0123456789abcdef".repeat(375);
+    f = std.open(fname, "w");
+    f.puts(str);
+    f.close();
+    assert(std.loadFile(fname), str);
+    f = std.open(fname, "w");
+    f.close();
+    assert(std.loadFile(fname), "");
+    os.remove(fname);
+
+    /* pipes are not seekable */
+    fds = os.pipe();
+    f = std.fdopen(fds[1], "w");
+    f.puts(str);
+    f.close();
+    assert(std.loadFile("/dev/fd/" + fds[0]), str);
+    os.close(fds[0]);
+
+    if (os.platform === "linux") {
+        /* the files of /proc report a size of 0 */
+        assert(std.loadFile("/proc/self/status").startsWith("Name:"));
+    }
+}
+
 function test_ext_json()
 {
     var expected, input, obj;
@@ -238,6 +292,60 @@ function test_os()
     assert(os.remove(fdir) === 0);
 }
 
+function test_os_tmp()
+{
+    var dir, err, path, path2, fd, f, st;
+
+    [dir, err] = os.mkdtemp();
+    assert(err, 0);
+    assert(/^tmp[^\/]{6}$/.test(dir), true, dir);
+    [st, err] = os.stat(dir);
+    assert(err, 0);
+    assert(st.mode & os.S_IFMT, os.S_IFDIR);
+    assert(st.mode & 0o777, 0o700);
+
+    /* "XXXXXX" is appended if missing */
+    [path, fd] = os.mkstemp(dir + "/f");
+    assert(fd >= 0);
+    assert(path.startsWith(dir + "/f") && path.length === dir.length + 8,
+           true, path);
+    [st, err] = os.stat(path);
+    assert(err, 0);
+    assert(st.mode & 0o777, 0o600);
+    f = std.fdopen(fd, "w+");
+    f.puts("xyzzy");
+    f.seek(0, std.SEEK_SET);
+    assert(f.readAsString(), "xyzzy");
+    f.close();
+
+    [path2, fd] = os.mkstemp(dir + "/gXXXXXX");
+    assert(fd >= 0);
+    assert(path2.startsWith(dir + "/g") && path2.length === dir.length + 8,
+           true, path2);
+    os.close(fd);
+
+    [, fd] = os.mkstemp(dir + "/none/XXXXXX");
+    assert(fd, -std.Error.ENOENT);
+    [, err] = os.mkdtemp(dir + "/none/XXXXXX");
+    assert(err, std.Error.ENOENT);
+
+    assert(os.remove(path), 0);
+    assert(os.remove(path2), 0);
+    assert(os.remove(dir), 0);
+}
+
+function test_exe_path()
+{
+    var path = os.exePath(), real, err;
+
+    assert(typeof path, "string");
+    assert(/\/qjs[^\/]*$/.test(path), true, path);
+    /* absolute and canonical */
+    [real, err] = os.realpath(path);
+    assert(err, 0);
+    assert(real, path);
+}
+
 function test_os_exec()
 {
     var ret, fds, pid, f, status;
@@ -286,6 +394,61 @@ function test_timer()
         os.clearTimeout(th[i]);
 }
 
+async function test_interval()
+{
+    var count = 0, n = 0, id;
+
+    await new Promise((resolve, reject) => {
+        id = os.setInterval(() => {
+            count++;
+            if (count == 3) {
+                os.clearInterval(id);
+                /* wait for more calls of a cleared interval */
+                os.setTimeout(resolve, 20);
+            } else if (count > 3) {
+                reject(new Error("interval called after clearInterval()"));
+            }
+        }, 1);
+    });
+    assert(count, 3);
+
+    /* timeouts and intervals share their ids */
+    id = os.setInterval(() => n++, 1);
+    os.clearTimeout(id);
+    id = os.setTimeout(() => n++, 1);
+    os.clearInterval(id);
+    await new Promise(resolve => os.setTimeout(resolve, 10));
+    assert(n, 0);
+
+    /* an interval does not starve the other timers */
+    id = os.setInterval(() => n++, 0);
+    await new Promise(resolve => os.setTimeout(resolve, 10));
+    os.clearInterval(id);
+    assert(n > 0);
+}
+
+async function test_module_types()
+{
+    var ns, ns2;
+
+    /* the 'type' attribute wins over the .json suffix */
+    ns = await import("./fixture_text_module.json", { with: { type: "text" } });
+    assert(ns.default, '{ "text": "héllo 🌍" }\n');
+
+    ns = await import("./fixture_bytes_module.txt", { with: { type: "bytes" } });
+    assert(ns.default instanceof Uint8Array);
+    assert(ns.default.join(), "104,195,169,10");
+    ns2 = await import("./fixture_bytes_module.txt", { with: { type: "bytes" } });
+    assert(ns2.default === ns.default);
+
+    try {
+        await import("./fixture_none.txt", { with: { type: "css" } });
+        assert(false, true, "unsupported module type");
+    } catch(e) {
+        assert(e instanceof TypeError, true, e);
+    }
+}
+
 /* test closure variable handling when freeing asynchronous
    function */
 function test_async_gc()
@@ -327,10 +490,17 @@ test_file1();
 test_file2();
 test_getline();
 test_popen();
+test_open_modes();
+test_load_file();
 test_os();
+test_os_tmp();
+test_exe_path();
 test_os_exec();
 test_timer();
 test_ext_json();
 test_async_gc();
 test_async_promise_rejection();
+test_array_loop_interrupt();
+await test_interval();
+await test_module_types();
 

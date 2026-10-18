@@ -2,6 +2,8 @@
 .obj/
 tests/snapshot/build*/
 tests/bjson.so
+tests/test_std_api
+tests/test_std_api.exe
 examples/test_fib
 test_fib.c
 examples/*.so

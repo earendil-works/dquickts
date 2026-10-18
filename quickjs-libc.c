@@ -57,6 +57,9 @@ typedef sig_t sighandler_t;
 #endif
 
 #if defined(__APPLE__)
+/* from <mach-o/dyld.h>, which cannot be included because its TRUE and
+   FALSE conflict with cutils.h */
+extern int _NSGetExecutablePath(char *buf, uint32_t *bufsize);
 #if !defined(environ)
 #include <crt_externs.h>
 #define environ (*_NSGetEnviron())
@@ -102,6 +105,7 @@ typedef struct {
     struct list_head link;
     int timer_id;
     int64_t timeout;
+    int64_t interval; /* period in ms of os.setInterval(), 0 otherwise */
     JSValue func;
 } JSOSTimer;
 
@@ -152,7 +156,14 @@ typedef struct JSThreadState {
     struct list_head port_list; /* list of JSWorkerMessageHandler.link */
     struct list_head rejected_promise_list; /* list of JSRejectedPromiseEntry.link */
     int eval_script_recurse; /* only used in the main thread */
-    int next_timer_id; /* for setTimeout() */
+    /* interrupt handler of the host, chained while std.evalScript()
+       runs */
+    JSInterruptHandler *prev_interrupt_handler;
+    void *prev_interrupt_opaque;
+    int next_timer_id; /* for setTimeout() and setInterval() */
+    /* JS_EVAL_FLAG_TS_x flags of the TypeScript sources, see
+       js_std_set_typescript_flags() */
+    int ts_eval_flags;
     /* not used in the main thread */
     JSWorkerMessagePipe *recv_pipe, *send_pipe;
 #if !defined(_WIN32)
@@ -395,40 +406,58 @@ fail:
 uint8_t *js_load_file(JSContext *ctx, size_t *pbuf_len, const char *filename)
 {
     FILE *f;
-    uint8_t *buf;
-    size_t buf_len;
+    uint8_t *buf, *new_buf;
+    size_t buf_len, buf_size;
     long lret;
+    int err;
 
     f = fopen(filename, "rb");
     if (!f)
         return NULL;
-    if (fseek(f, 0, SEEK_END) < 0)
-        goto fail;
-    lret = ftell(f);
-    if (lret < 0)
-        goto fail;
-    /* XXX: on Linux, ftell() return LONG_MAX for directories */
-    if (lret == LONG_MAX) {
-        errno = EISDIR;
-        goto fail;
+    /* the file size is only a hint: pipes and character devices are
+       not seekable and the files of /proc report a size of 0, so read
+       until the end of file. One more byte is requested so that the
+       end of a regular file is seen without reallocating. */
+    buf = NULL;
+    buf_len = 0;
+    buf_size = 4096;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        lret = ftell(f);
+        /* on Linux, ftell() returns LONG_MAX for directories */
+        if (lret > 0 && lret < LONG_MAX)
+            buf_size = (size_t)lret + 1;
+        if (fseek(f, 0, SEEK_SET) < 0)
+            goto fail;
     }
-    buf_len = lret;
-    if (fseek(f, 0, SEEK_SET) < 0)
-        goto fail;
-    if (ctx)
-        buf = js_malloc(ctx, buf_len + 1);
-    else
-        buf = malloc(buf_len + 1);
-    if (!buf)
-        goto fail;
-    if (fread(buf, 1, buf_len, f) != buf_len) {
-        errno = EIO;
+    for(;;) {
+        /* +1 for the null terminator */
+        if (ctx)
+            new_buf = js_realloc(ctx, buf, buf_size + 1);
+        else
+            new_buf = realloc(buf, buf_size + 1);
+        if (!new_buf) {
+            errno = ENOMEM;
+            goto fail;
+        }
+        buf = new_buf;
+        buf_len += fread(buf + buf_len, 1, buf_size - buf_len, f);
+        if (buf_len < buf_size)
+            break;
+        if (buf_size > SIZE_MAX / 2) {
+            errno = EFBIG;
+            goto fail;
+        }
+        buf_size += buf_size / 2;
+    }
+    if (ferror(f)) {
+    fail:
+        err = errno;
         if (ctx)
             js_free(ctx, buf);
         else
             free(buf);
-    fail:
         fclose(f);
+        errno = err;
         return NULL;
     }
     buf[buf_len] = '\0';
@@ -598,7 +627,7 @@ int js_module_set_import_meta(JSContext *ctx, JSValueConst func_val,
     return 0;
 }
 
-static int json_module_init(JSContext *ctx, JSModuleDef *m)
+static int value_module_init(JSContext *ctx, JSModuleDef *m)
 {
     JSValue val;
     val = JS_GetModulePrivateValue(ctx, m);
@@ -606,15 +635,16 @@ static int json_module_init(JSContext *ctx, JSModuleDef *m)
     return 0;
 }
 
-static JSModuleDef *create_json_module(JSContext *ctx, const char *module_name, JSValue val)
+/* create a JSON, text or bytes module: its only export is "default"
+   whose value is 'val' */
+static JSModuleDef *create_value_module(JSContext *ctx, const char *module_name, JSValue val)
 {
     JSModuleDef *m;
-    m = JS_NewCModule(ctx, module_name, json_module_init);
+    m = JS_NewCModule(ctx, module_name, value_module_init);
     if (!m) {
         JS_FreeValue(ctx, val);
         return NULL;
     }
-    /* only export the "default" symbol which will contain the JSON object */
     JS_AddModuleExport(ctx, m, "default");
     JS_SetModulePrivateValue(ctx, m, val);
     return m;
@@ -652,33 +682,213 @@ int js_module_check_attributes(JSContext *ctx, void *opaque,
     return ret;
 }
 
-/* return > 0 if the attributes indicate a JSON module */
-int js_module_test_json(JSContext *ctx, JSValueConst attributes)
+int js_module_get_type(JSContext *ctx, JSValueConst attributes)
 {
     JSValue str;
     const char *cstr;
     size_t len;
-    BOOL res;
+    int res;
 
     if (JS_IsUndefined(attributes))
-        return FALSE;
+        return JS_MODULE_TYPE_JS;
     str = JS_GetPropertyStr(ctx, attributes, "type");
-    if (!JS_IsString(str))
-        return FALSE;
+    if (JS_IsException(str))
+        return -1;
+    if (!JS_IsString(str)) {
+        JS_FreeValue(ctx, str);
+        return JS_MODULE_TYPE_JS;
+    }
     cstr = JS_ToCStringLen(ctx, &len, str);
     JS_FreeValue(ctx, str);
     if (!cstr)
-        return FALSE;
-    /* XXX: raise an error if unknown type ? */
+        return -1;
     if (len == 4 && !memcmp(cstr, "json", len)) {
-        res = 1;
+        res = JS_MODULE_TYPE_JSON;
     } else if (len == 5 && !memcmp(cstr, "json5", len)) {
-        res = 2;
+        res = JS_MODULE_TYPE_JSON5;
+    } else if (len == 4 && !memcmp(cstr, "text", len)) {
+        res = JS_MODULE_TYPE_TEXT;
+    } else if (len == 5 && !memcmp(cstr, "bytes", len)) {
+        res = JS_MODULE_TYPE_BYTES;
     } else {
-        res = 0;
+        /* loading it as another type would hide the error */
+        JS_ThrowTypeError(ctx, "unsupported module type '%s'", cstr);
+        res = -1;
     }
     JS_FreeCString(ctx, cstr);
     return res;
+}
+
+static void js_free_module_bytes(JSRuntime *rt, void *opaque, void *ptr)
+{
+    js_free_rt(rt, ptr);
+}
+
+JSValue js_module_new_value(JSContext *ctx, int type, uint8_t *buf,
+                            size_t buf_len, const char *module_name)
+{
+    JSValue val, args[3];
+
+    switch(type) {
+    case JS_MODULE_TYPE_JSON:
+    case JS_MODULE_TYPE_JSON5:
+        val = JS_ParseJSON2(ctx, (char *)buf, buf_len, module_name,
+                            type == JS_MODULE_TYPE_JSON5 ? JS_PARSE_JSON_EXT : 0);
+        break;
+    case JS_MODULE_TYPE_TEXT:
+        val = JS_NewStringLen(ctx, (char *)buf, buf_len);
+        break;
+    case JS_MODULE_TYPE_BYTES:
+        /* the array buffer takes the ownership of the file contents */
+        args[0] = JS_NewArrayBuffer(ctx, buf, buf_len, js_free_module_bytes,
+                                    NULL, FALSE);
+        if (JS_IsException(args[0])) {
+            val = JS_EXCEPTION;
+            break;
+        }
+        /* byteOffset and length */
+        args[1] = JS_UNDEFINED;
+        args[2] = JS_UNDEFINED;
+        val = JS_NewTypedArray(ctx, countof(args), (JSValueConst *)args,
+                               JS_TYPED_ARRAY_UINT8);
+        JS_FreeValue(ctx, args[0]);
+        return val;
+    default:
+        val = JS_ThrowInternalError(ctx, "invalid module type");
+        break;
+    }
+    js_free(ctx, buf);
+    return val;
+}
+
+void js_std_set_typescript_flags(JSRuntime *rt, int flags)
+{
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
+    if (ts)
+        ts->ts_eval_flags = flags & (JS_EVAL_FLAG_TS_LEGACY_DECORATORS |
+                                     JS_EVAL_FLAG_TS_DECORATOR_METADATA);
+}
+
+/* JS_EVAL_FLAG_TYPESCRIPT and the flags set with
+   js_std_set_typescript_flags() */
+static int js_std_typescript_flags(JSContext *ctx)
+{
+    JSThreadState *ts = JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
+    return JS_EVAL_FLAG_TYPESCRIPT | (ts ? ts->ts_eval_flags : 0);
+}
+
+int js_std_get_typescript_flag(JSContext *ctx, const char *filename)
+{
+    if (has_suffix(filename, ".tsx")) {
+        JS_ThrowSyntaxError(ctx, "%s: TSX (JSX) is not supported", filename);
+        return -1;
+    }
+    if (has_suffix(filename, ".ts") || has_suffix(filename, ".mts") ||
+        has_suffix(filename, ".cts"))
+        return js_std_typescript_flags(ctx);
+    return 0;
+}
+
+static BOOL js_file_exists(const char *filename)
+{
+    struct stat st;
+    return stat(filename, &st) == 0 && !S_ISDIR(st.st_mode);
+}
+
+/* same as the default module name normalization, then, if the file
+   does not exist, a TypeScript source is used instead: TypeScript
+   projects import './x.js' (or './x') for './x.ts' and './x.mjs' for
+   './x.mts'. */
+char *js_module_normalize(JSContext *ctx, const char *base_name,
+                          const char *name, void *opaque)
+{
+    static const char * const ts_ext[][2] = {
+        { ".js", ".ts" },
+        { ".mjs", ".mts" },
+        { ".cjs", ".cts" },
+    };
+    char *filename, *p, *ts_filename;
+    const char *r, *last;
+    size_t len, cap, ext_len;
+    int i;
+
+    if (name[0] != '.' && name[0] != '/') {
+        /* bare module names are not modified */
+        return js_strdup(ctx, name);
+    }
+
+    p = strrchr(base_name, '/');
+    if (p && name[0] == '.')
+        len = p - base_name;
+    else
+        len = 0;
+
+    /* room for the longest TypeScript extension */
+    cap = len + strlen(name) + 1 + 4 + 1;
+    filename = js_malloc(ctx, cap);
+    if (!filename)
+        return NULL;
+    memcpy(filename, base_name, len);
+    filename[len] = '\0';
+
+    /* we only normalize the leading '..' or '.' */
+    r = name;
+    for(;;) {
+        if (r[0] == '.' && r[1] == '/') {
+            r += 2;
+        } else if (r[0] == '.' && r[1] == '.' && r[2] == '/') {
+            /* remove the last path element of filename, except if "."
+               or ".." */
+            if (filename[0] == '\0')
+                break;
+            p = strrchr(filename, '/');
+            if (!p)
+                p = filename;
+            else
+                p++;
+            if (!strcmp(p, ".") || !strcmp(p, ".."))
+                break;
+            if (p > filename)
+                p--;
+            *p = '\0';
+            r += 3;
+        } else {
+            break;
+        }
+    }
+    if (filename[0] != '\0')
+        pstrcat(filename, cap, "/");
+    pstrcat(filename, cap, r);
+
+    if (js_file_exists(filename))
+        return filename;
+    len = strlen(filename);
+    ts_filename = js_malloc(ctx, cap);
+    if (!ts_filename)
+        return filename;
+    for(i = 0; i < countof(ts_ext); i++) {
+        if (has_suffix(filename, ts_ext[i][0])) {
+            ext_len = strlen(ts_ext[i][0]);
+            memcpy(ts_filename, filename, len - ext_len);
+            ts_filename[len - ext_len] = '\0';
+            pstrcat(ts_filename, cap, ts_ext[i][1]);
+            goto found;
+        }
+    }
+    /* no extension */
+    last = strrchr(filename, '/');
+    last = last ? last + 1 : filename;
+    if (strchr(last, '.'))
+        goto not_found;
+    snprintf(ts_filename, cap, "%s.ts", filename);
+ found:
+    if (js_file_exists(ts_filename)) {
+        js_free(ctx, filename);
+        return ts_filename;
+    }
+ not_found:
+    js_free(ctx, ts_filename);
+    return filename;
 }
 
 JSModuleDef *js_module_loader(JSContext *ctx,
@@ -686,51 +896,50 @@ JSModuleDef *js_module_loader(JSContext *ctx,
                               JSValueConst attributes)
 {
     JSModuleDef *m;
-    int res;
-    
-    if (has_suffix(module_name, ".so")) {
-        m = js_module_loader_so(ctx, module_name);
-    } else {
-        size_t buf_len;
-        uint8_t *buf;
+    JSValue val;
+    size_t buf_len;
+    uint8_t *buf;
+    int type, ts_flag;
 
-        buf = js_load_file(ctx, &buf_len, module_name);
-        if (!buf) {
-            JS_ThrowReferenceError(ctx, "could not load module filename '%s'",
-                                   module_name);
-            return NULL;
-        }
-        res = js_module_test_json(ctx, attributes);
-        if (has_suffix(module_name, ".json") || res > 0) {
-            /* compile as JSON or JSON5 depending on "type" */
-            JSValue val;
-            int flags;
-            if (res == 2)
-                flags = JS_PARSE_JSON_EXT;
-            else
-                flags = 0;
-            val = JS_ParseJSON2(ctx, (char *)buf, buf_len, module_name, flags);
-            js_free(ctx, buf);
-            if (JS_IsException(val))
-                return NULL;
-            m = create_json_module(ctx, module_name, val);
-            if (!m)
-                return NULL;
-        } else {
-            JSValue func_val;
-            /* compile the module */
-            func_val = JS_Eval(ctx, (char *)buf, buf_len, module_name,
-                               JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-            js_free(ctx, buf);
-            if (JS_IsException(func_val))
-                return NULL;
-            /* XXX: could propagate the exception */
-            js_module_set_import_meta(ctx, func_val, TRUE, FALSE);
-            /* the module is already referenced, so we must free it */
-            m = JS_VALUE_GET_PTR(func_val);
-            JS_FreeValue(ctx, func_val);
-        }
+    if (has_suffix(module_name, ".so"))
+        return js_module_loader_so(ctx, module_name);
+    type = js_module_get_type(ctx, attributes);
+    if (type < 0)
+        return NULL;
+    /* the suffix is only used when there is no 'type' attribute so
+       that a JSON file can be imported as text or bytes */
+    if (type == JS_MODULE_TYPE_JS && has_suffix(module_name, ".json"))
+        type = JS_MODULE_TYPE_JSON;
+    buf = js_load_file(ctx, &buf_len, module_name);
+    if (!buf) {
+        JS_ThrowReferenceError(ctx, "could not load module filename '%s'",
+                               module_name);
+        return NULL;
     }
+    if (type != JS_MODULE_TYPE_JS) {
+        val = js_module_new_value(ctx, type, buf, buf_len, module_name);
+        if (JS_IsException(val))
+            return NULL;
+        return create_value_module(ctx, module_name, val);
+    }
+    ts_flag = js_std_get_typescript_flag(ctx, module_name);
+    if (ts_flag < 0) {
+        js_free(ctx, buf);
+        return NULL;
+    }
+    /* compile the module */
+    val = JS_Eval(ctx, (char *)buf, buf_len, module_name,
+                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY | ts_flag);
+    js_free(ctx, buf);
+    if (JS_IsException(val))
+        return NULL;
+    if (js_module_set_import_meta(ctx, val, TRUE, FALSE) < 0) {
+        JS_FreeValue(ctx, val);
+        return NULL;
+    }
+    /* the module is already referenced, so we must free it */
+    m = JS_VALUE_GET_PTR(val);
+    JS_FreeValue(ctx, val);
     return m;
 }
 
@@ -859,7 +1068,14 @@ static JSValue js_std_gc(JSContext *ctx, JSValueConst this_val,
 
 static int interrupt_handler(JSRuntime *rt, void *opaque)
 {
-    return (os_pending_signals >> SIGINT) & 1;
+    JSThreadState *ts = opaque;
+    if ((os_pending_signals >> SIGINT) & 1)
+        return 1;
+    /* the host handler may enforce a time limit or request a
+       suspension: keep calling it */
+    if (ts->prev_interrupt_handler)
+        return ts->prev_interrupt_handler(rt, ts->prev_interrupt_opaque);
+    return 0;
 }
 
 static int get_bool_option(JSContext *ctx, BOOL *pbool,
@@ -905,7 +1121,9 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (!ts->recv_pipe && ++ts->eval_script_recurse == 1) {
         /* install the interrupt handler */
-        JS_SetInterruptHandler(JS_GetRuntime(ctx), interrupt_handler, NULL);
+        ts->prev_interrupt_handler =
+            JS_GetInterruptHandler(rt, &ts->prev_interrupt_opaque);
+        JS_SetInterruptHandler(rt, interrupt_handler, ts);
     }
     flags = JS_EVAL_TYPE_GLOBAL;
     if (backtrace_barrier)
@@ -915,12 +1133,17 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
     ret = JS_Eval(ctx, str, len, "<evalScript>", flags);
     JS_FreeCString(ctx, str);
     if (!ts->recv_pipe && --ts->eval_script_recurse == 0) {
-        /* remove the interrupt handler */
-        JS_SetInterruptHandler(JS_GetRuntime(ctx), NULL, NULL);
+        BOOL is_sigint = (os_pending_signals >> SIGINT) & 1;
+        /* restore the interrupt handler of the host */
+        JS_SetInterruptHandler(rt, ts->prev_interrupt_handler,
+                               ts->prev_interrupt_opaque);
+        ts->prev_interrupt_handler = NULL;
+        ts->prev_interrupt_opaque = NULL;
         os_pending_signals &= ~((uint64_t)1 << SIGINT);
         /* convert the uncatchable "interrupted" error into a normal error
-           so that it can be caught by the REPL */
-        if (JS_IsException(ret))
+           so that it can be caught by the REPL. An interruption
+           requested by the host handler stays uncatchable. */
+        if (JS_IsException(ret) && is_sigint)
             JS_SetUncatchableException(ctx, FALSE);
     }
     return ret;
@@ -934,16 +1157,20 @@ typedef struct {
     BOOL is_popen;
 } JSSTDFile;
 
+static void js_std_file_close_stream(FILE *f, BOOL is_popen)
+{
+    if (is_popen)
+        pclose(f);
+    else
+        fclose(f);
+}
+
 static void js_std_file_finalizer(JSRuntime *rt, JSValue val)
 {
     JSSTDFile *s = JS_GetOpaque(val, js_std_file_class_id);
     if (s) {
-        if (s->f && s->close_in_finalizer) {
-            if (s->is_popen)
-                pclose(s->f);
-            else
-                fclose(s->f);
-        }
+        if (s->f && s->close_in_finalizer)
+            js_std_file_close_stream(s->f, s->is_popen);
         js_free_rt(rt, s);
     }
 }
@@ -987,17 +1214,22 @@ static JSValue js_new_std_file(JSContext *ctx, FILE *f,
     JSValue obj;
     obj = JS_NewObjectClass(ctx, js_std_file_class_id);
     if (JS_IsException(obj))
-        return obj;
+        goto fail;
     s = js_mallocz(ctx, sizeof(*s));
     if (!s) {
         JS_FreeValue(ctx, obj);
-        return JS_EXCEPTION;
+        goto fail;
     }
     s->close_in_finalizer = close_in_finalizer;
     s->is_popen = is_popen;
     s->f = f;
     JS_SetOpaque(obj, s);
     return obj;
+ fail:
+    /* the file object owns the stream: do not leak it */
+    if (close_in_finalizer)
+        js_std_file_close_stream(f, is_popen);
+    return JS_EXCEPTION;
 }
 
 static void js_set_error_object(JSContext *ctx, JSValue obj, int err)
@@ -1020,7 +1252,8 @@ static JSValue js_std_open(JSContext *ctx, JSValueConst this_val,
     mode = JS_ToCString(ctx, argv[1]);
     if (!mode)
         goto fail;
-    if (mode[strspn(mode, "rwa+b")] != '\0') {
+    /* 'x' (C11): fail if the file exists */
+    if (mode[strspn(mode, "rwa+bx")] != '\0') {
         JS_ThrowTypeError(ctx, "invalid file mode");
         goto fail;
     }
@@ -1056,7 +1289,7 @@ static JSValue js_std_popen(JSContext *ctx, JSValueConst this_val,
     mode = JS_ToCString(ctx, argv[1]);
     if (!mode)
         goto fail;
-    if (mode[strspn(mode, "rw")] != '\0') {
+    if (strcmp(mode, "r") && strcmp(mode, "w")) {
         JS_ThrowTypeError(ctx, "invalid file mode");
         goto fail;
     }
@@ -2172,8 +2405,9 @@ static void free_timer(JSRuntime *rt, JSOSTimer *th)
     js_free_rt(rt, th);
 }
 
+/* setTimeout(func, delay) and setInterval(func, delay) if is_interval */
 static JSValue js_os_setTimeout(JSContext *ctx, JSValueConst this_val,
-                                int argc, JSValueConst *argv)
+                                int argc, JSValueConst *argv, int is_interval)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
     JSThreadState *ts = JS_GetRuntimeOpaque(rt);
@@ -2186,6 +2420,10 @@ static JSValue js_os_setTimeout(JSContext *ctx, JSValueConst this_val,
         return JS_ThrowTypeError(ctx, "not a function");
     if (JS_ToInt64(ctx, &delay, argv[1]))
         return JS_EXCEPTION;
+    /* an interval of 0 would always be expired and starve the other
+       events */
+    if (is_interval && delay < 1)
+        delay = 1;
     th = js_mallocz(ctx, sizeof(*th));
     if (!th)
         return JS_EXCEPTION;
@@ -2195,6 +2433,8 @@ static JSValue js_os_setTimeout(JSContext *ctx, JSValueConst this_val,
     else
         ts->next_timer_id++;
     th->timeout = get_time_ms() + delay;
+    if (is_interval)
+        th->interval = delay;
     th->func = JS_DupValue(ctx, func);
     list_add_tail(&th->link, &ts->os_timers);
     return JS_NewInt32(ctx, th->timer_id);
@@ -2273,6 +2513,54 @@ static void call_handler(JSContext *ctx, JSValueConst func)
     if (JS_IsException(ret))
         js_std_dump_error(ctx);
     JS_FreeValue(ctx, ret);
+}
+
+/* call the handler of the first expired timer. Return TRUE if a
+   handler was called. Otherwise '*pmin_delay' is set to the delay
+   in ms until the next timer expires or to -1 if there is no timer. */
+static BOOL js_os_run_timers(JSContext *ctx, JSThreadState *ts,
+                             int *pmin_delay)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    int64_t cur_time, delay;
+    int min_delay;
+    struct list_head *el;
+    JSOSTimer *th;
+    JSValue func;
+
+    if (list_empty(&ts->os_timers)) {
+        *pmin_delay = -1;
+        return FALSE;
+    }
+    cur_time = get_time_ms();
+    min_delay = 10000;
+    list_for_each(el, &ts->os_timers) {
+        th = list_entry(el, JSOSTimer, link);
+        delay = th->timeout - cur_time;
+        if (delay <= 0) {
+            /* the timer expired */
+            if (th->interval > 0) {
+                /* rearm it before the call so that the handler can
+                   clear it. Moving it to the end of the list lets the
+                   other expired timers run first. */
+                func = JS_DupValue(ctx, th->func);
+                th->timeout = cur_time + th->interval;
+                list_del(&th->link);
+                list_add_tail(&th->link, &ts->os_timers);
+            } else {
+                func = th->func;
+                th->func = JS_UNDEFINED;
+                free_timer(rt, th);
+            }
+            call_handler(ctx, func);
+            JS_FreeValue(ctx, func);
+            return TRUE;
+        } else if (delay < min_delay) {
+            min_delay = delay;
+        }
+    }
+    *pmin_delay = min_delay;
+    return FALSE;
 }
 
 #ifdef USE_WORKER
@@ -2424,7 +2712,6 @@ static int js_os_poll(JSContext *ctx)
     JSRuntime *rt = JS_GetRuntime(ctx);
     JSThreadState *ts = JS_GetRuntimeOpaque(rt);
     int min_delay, count;
-    int64_t cur_time, delay;
     JSOSRWHandler *rh;
     struct list_head *el;
     HANDLE handles[MAXIMUM_WAIT_OBJECTS]; // 64
@@ -2436,28 +2723,8 @@ static int js_os_poll(JSContext *ctx)
         return -1; /* no more events */
     }
     
-    if (!list_empty(&ts->os_timers)) {
-        cur_time = get_time_ms();
-        min_delay = 10000;
-        list_for_each(el, &ts->os_timers) {
-            JSOSTimer *th = list_entry(el, JSOSTimer, link);
-            delay = th->timeout - cur_time;
-            if (delay <= 0) {
-                JSValue func;
-                /* the timer expired */
-                func = th->func;
-                th->func = JS_UNDEFINED;
-                free_timer(rt, th);
-                call_handler(ctx, func);
-                JS_FreeValue(ctx, func);
-                return 0;
-            } else if (delay < min_delay) {
-                min_delay = delay;
-            }
-        }
-    } else {
-        min_delay = -1;
-    }
+    if (js_os_run_timers(ctx, ts, &min_delay))
+        return 0;
 
     count = 0;
     list_for_each(el, &ts->os_rw_handlers) {
@@ -2549,7 +2816,6 @@ static int js_os_poll(JSContext *ctx)
     JSRuntime *rt = JS_GetRuntime(ctx);
     JSThreadState *ts = JS_GetRuntimeOpaque(rt);
     int min_delay, nfds;
-    int64_t cur_time, delay;
     JSOSRWHandler *rh;
     struct list_head *el;
 
@@ -2574,28 +2840,8 @@ static int js_os_poll(JSContext *ctx)
         list_empty(&ts->port_list))
         return -1; /* no more events */
 
-    if (!list_empty(&ts->os_timers)) {
-        cur_time = get_time_ms();
-        min_delay = 10000;
-        list_for_each(el, &ts->os_timers) {
-            JSOSTimer *th = list_entry(el, JSOSTimer, link);
-            delay = th->timeout - cur_time;
-            if (delay <= 0) {
-                JSValue func;
-                /* the timer expired */
-                func = th->func;
-                th->func = JS_UNDEFINED;
-                free_timer(rt, th);
-                call_handler(ctx, func);
-                JS_FreeValue(ctx, func);
-                return 0;
-            } else if (delay < min_delay) {
-                min_delay = delay;
-            }
-        }
-    } else {
-        min_delay = -1; /* infinite */
-    }
+    if (js_os_run_timers(ctx, ts, &min_delay))
+        return 0;
 
     nfds = 0;
     list_for_each(el, &ts->os_rw_handlers) {
@@ -2987,7 +3233,115 @@ static JSValue js_os_realpath(JSContext *ctx, JSValueConst this_val,
     return make_string_error(ctx, buf, err);
 }
 
+/* return the absolute path of the running executable or undefined if
+   not available */
+static JSValue js_os_exePath(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv)
+{
+#if defined(_WIN32)
+    /* 32767 characters is the maximum length of an extended path */
+    DWORD wbuf_size = 32768, wlen;
+    WCHAR *wbuf;
+    char *buf;
+    int len;
+    JSValue ret;
+
+    wbuf = js_malloc(ctx, wbuf_size * sizeof(WCHAR));
+    if (!wbuf)
+        return JS_EXCEPTION;
+    ret = JS_UNDEFINED;
+    wlen = GetModuleFileNameW(NULL, wbuf, wbuf_size);
+    if (wlen > 0 && wlen < wbuf_size) {
+        len = WideCharToMultiByte(CP_UTF8, 0, wbuf, wlen, NULL, 0, NULL, NULL);
+        if (len > 0) {
+            buf = js_malloc(ctx, len);
+            if (!buf) {
+                ret = JS_EXCEPTION;
+            } else {
+                WideCharToMultiByte(CP_UTF8, 0, wbuf, wlen, buf, len,
+                                    NULL, NULL);
+                ret = JS_NewStringLen(ctx, buf, len);
+                js_free(ctx, buf);
+            }
+        }
+    }
+    js_free(ctx, wbuf);
+    return ret;
+#elif defined(__APPLE__)
+    char path[PATH_MAX], buf[PATH_MAX];
+    uint32_t size = sizeof(path);
+
+    /* the returned path may contain symbolic links or '..' */
+    if (_NSGetExecutablePath(path, &size) != 0 || !realpath(path, buf))
+        return JS_UNDEFINED;
+    return JS_NewString(ctx, buf);
+#elif defined(__linux__)
+    char buf[PATH_MAX];
+    ssize_t len;
+
+    len = readlink("/proc/self/exe", buf, sizeof(buf));
+    /* a full buffer may be a truncated path */
+    if (len <= 0 || len >= (ssize_t)sizeof(buf))
+        return JS_UNDEFINED;
+    return JS_NewStringLen(ctx, buf, len);
+#else
+    return JS_UNDEFINED;
+#endif
+}
+
 #if !defined(_WIN32)
+/* mkstemp(pattern) -> [path, fd], fd < 0 is -errno
+   mkdtemp(pattern) -> [path, errorcode] */
+static JSValue js_os_mkstemp(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv, int is_dir)
+{
+    static const char suffix[] = "XXXXXX";
+    const size_t suffix_len = sizeof(suffix) - 1;
+    const char *str;
+    char *pattern;
+    size_t len, pattern_len;
+    JSValue path;
+    int ret;
+
+    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
+        str = JS_ToCStringLen(ctx, &len, argv[0]);
+        if (!str)
+            return JS_EXCEPTION;
+    } else {
+        str = NULL;
+        len = 0;
+    }
+    /* mkstemp() and mkdtemp() replace the trailing "XXXXXX": add it if
+       missing. The default pattern is "tmpXXXXXX". */
+    pattern_len = str ? len : 3;
+    if (!str || len < suffix_len ||
+        memcmp(str + len - suffix_len, suffix, suffix_len) != 0)
+        pattern_len += suffix_len;
+    pattern = js_malloc(ctx, pattern_len + 1);
+    if (!pattern) {
+        JS_FreeCString(ctx, str);
+        return JS_EXCEPTION;
+    }
+    if (str) {
+        memcpy(pattern, str, len);
+        JS_FreeCString(ctx, str);
+    } else {
+        memcpy(pattern, "tmp", 3);
+        len = 3;
+    }
+    memcpy(pattern + len, suffix, pattern_len - len);
+    pattern[pattern_len] = '\0';
+
+    if (is_dir) {
+        ret = mkdtemp(pattern) ? 0 : errno;
+    } else {
+        ret = js_get_errno(mkstemp(pattern));
+    }
+    path = JS_NewString(ctx, pattern);
+    js_free(ctx, pattern);
+    return make_obj_error(ctx, path, ret);
+}
+
 static JSValue js_os_symlink(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -3643,6 +3997,7 @@ static void *worker_func(void *opaque)
     ctx = js_worker_new_context_func(rt);
     if (ctx == NULL) {
         fprintf(stderr, "JS_NewContext failure");
+        exit(1);
     }
 
     JS_SetCanBlock(rt, TRUE);
@@ -3969,8 +4324,11 @@ static const JSCFunctionListEntry js_os_funcs[] = {
     OS_FLAG(SIGTTOU),
 #endif
     JS_CFUNC_DEF("now", 0, js_os_now ),
-    JS_CFUNC_DEF("setTimeout", 2, js_os_setTimeout ),
+    JS_CFUNC_MAGIC_DEF("setTimeout", 2, js_os_setTimeout, 0 ),
     JS_CFUNC_DEF("clearTimeout", 1, js_os_clearTimeout ),
+    JS_CFUNC_MAGIC_DEF("setInterval", 2, js_os_setTimeout, 1 ),
+    /* timeouts and intervals share their ids, as in HTML */
+    JS_CFUNC_DEF("clearInterval", 1, js_os_clearTimeout ),
     JS_CFUNC_DEF("sleepAsync", 1, js_os_sleepAsync ),
     JS_PROP_STRING_DEF("platform", OS_PLATFORM, 0 ),
     JS_CFUNC_DEF("getcwd", 0, js_os_getcwd ),
@@ -3994,7 +4352,10 @@ static const JSCFunctionListEntry js_os_funcs[] = {
     JS_CFUNC_DEF("utimes", 3, js_os_utimes ),
     JS_CFUNC_DEF("sleep", 1, js_os_sleep ),
     JS_CFUNC_DEF("realpath", 1, js_os_realpath ),
+    JS_CFUNC_DEF("exePath", 0, js_os_exePath ),
 #if !defined(_WIN32)
+    JS_CFUNC_MAGIC_DEF("mkstemp", 1, js_os_mkstemp, 0 ),
+    JS_CFUNC_MAGIC_DEF("mkdtemp", 1, js_os_mkstemp, 1 ),
     JS_CFUNC_MAGIC_DEF("lstat", 1, js_os_stat, 1 ),
     JS_CFUNC_DEF("symlink", 2, js_os_symlink ),
     JS_CFUNC_DEF("readlink", 1, js_os_readlink ),
@@ -4358,8 +4719,10 @@ void js_std_eval_binary(JSContext *ctx, const uint8_t *buf, size_t buf_len,
     if (JS_IsException(obj))
         goto exception;
     if (load_only) {
-        if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE) {
-            js_module_set_import_meta(ctx, obj, FALSE, FALSE);
+        if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE &&
+            js_module_set_import_meta(ctx, obj, FALSE, FALSE) < 0) {
+            JS_FreeValue(ctx, obj);
+            goto exception;
         }
         JS_FreeValue(ctx, obj);
     } else {
@@ -4368,7 +4731,10 @@ void js_std_eval_binary(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                 JS_FreeValue(ctx, obj);
                 goto exception;
             }
-            js_module_set_import_meta(ctx, obj, FALSE, TRUE);
+            if (js_module_set_import_meta(ctx, obj, FALSE, TRUE) < 0) {
+                JS_FreeValue(ctx, obj);
+                goto exception;
+            }
             val = JS_EvalFunction(ctx, obj);
             val = js_std_await(ctx, val);
         } else {
@@ -4393,7 +4759,7 @@ void js_std_eval_binary_json_module(JSContext *ctx,
     obj = JS_ReadObject(ctx, buf, buf_len, 0);
     if (JS_IsException(obj))
         goto exception;
-    m = create_json_module(ctx, module_name, obj);
+    m = create_value_module(ctx, module_name, obj);
     if (!m) {
     exception:
         js_std_dump_error(ctx);

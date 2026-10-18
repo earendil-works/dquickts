@@ -962,7 +962,7 @@ static char *load_file(const char *filename, size_t *lenp)
     return buf;
 }
 
-static int json_module_init_test(JSContext *ctx, JSModuleDef *m)
+static int value_module_init_test(JSContext *ctx, JSModuleDef *m)
 {
     JSValue val;
     val = JS_GetModulePrivateValue(ctx, m);
@@ -978,6 +978,7 @@ static JSModuleDef *js_module_loader_test(JSContext *ctx,
     uint8_t *buf;
     JSModuleDef *m;
     char *filename, *slash, path[1024];
+    int type;
 
     // interpret import("bar.js") from path/to/foo.js as
     // import("path/to/bar.js") but leave import("./bar.js") untouched
@@ -991,6 +992,9 @@ static JSModuleDef *js_module_loader_test(JSContext *ctx,
         }
     }
 
+    type = js_module_get_type(ctx, attributes);
+    if (type < 0)
+        return NULL;
     buf = js_load_file(ctx, &buf_len, module_name);
     if (!buf) {
         JS_ThrowReferenceError(ctx, "could not load module filename '%s'",
@@ -998,19 +1002,18 @@ static JSModuleDef *js_module_loader_test(JSContext *ctx,
         return NULL;
     }
 
-    if (js_module_test_json(ctx, attributes) == 1) {
-        /* compile as JSON */
+    if (type != JS_MODULE_TYPE_JS) {
+        /* JSON, text or bytes */
         JSValue val;
-        val = JS_ParseJSON(ctx, (char *)buf, buf_len, module_name);
-        js_free(ctx, buf);
+        val = js_module_new_value(ctx, type, buf, buf_len, module_name);
         if (JS_IsException(val))
             return NULL;
-        m = JS_NewCModule(ctx, module_name, json_module_init_test);
+        m = JS_NewCModule(ctx, module_name, value_module_init_test);
         if (!m) {
             JS_FreeValue(ctx, val);
             return NULL;
         }
-        /* only export the "default" symbol which will contain the JSON object */
+        /* only export the "default" symbol which will contain the value */
         JS_AddModuleExport(ctx, m, "default");
         JS_SetModulePrivateValue(ctx, m, val);
     } else {

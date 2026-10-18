@@ -2361,6 +2361,13 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
     rt->interrupt_opaque = opaque;
 }
 
+JSInterruptHandler *JS_GetInterruptHandler(JSRuntime *rt, void **popaque)
+{
+    if (popaque)
+        *popaque = rt->interrupt_opaque;
+    return rt->interrupt_handler;
+}
+
 void JS_SetLocaleCallbacks(JSContext *ctx, const JSLocaleCallbacks *callbacks)
 {
     ctx->locale_callbacks = callbacks;
@@ -32029,7 +32036,18 @@ static JSValue js_import_meta(JSContext *ctx)
 
     /* XXX: inefficient, need to add a module or script pointer in
        JSFunctionBytecode */
-    m = js_find_loaded_module(ctx, filename);
+    {
+        struct list_head *el;
+        m = NULL;
+        list_for_each(el, &ctx->loaded_modules) {
+            JSModuleDef *m1 = list_entry(el, JSModuleDef, link);
+            /* the same name can also designate e.g. a text module */
+            if (m1->module_name == filename && !m1->init_func) {
+                m = m1;
+                break;
+            }
+        }
+    }
     JS_FreeAtom(ctx, filename);
     if (!m) {
     fail:

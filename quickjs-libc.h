@@ -44,7 +44,23 @@ void js_std_dump_error(JSContext *ctx);
 uint8_t *js_load_file(JSContext *ctx, size_t *pbuf_len, const char *filename);
 int js_module_set_import_meta(JSContext *ctx, JSValueConst func_val,
                               JS_BOOL use_realpath, JS_BOOL is_main);
-int js_module_test_json(JSContext *ctx, JSValueConst attributes);
+/* module types selected by the 'type' import attribute */
+typedef enum {
+    JS_MODULE_TYPE_JS,
+    JS_MODULE_TYPE_JSON,
+    JS_MODULE_TYPE_JSON5, /* JSON with the JS_PARSE_JSON_EXT extensions */
+    JS_MODULE_TYPE_TEXT, /* default export: the file as a string */
+    JS_MODULE_TYPE_BYTES, /* default export: the file as an Uint8Array */
+} JSModuleTypeEnum;
+/* return the JSModuleTypeEnum given by the 'type' import attribute
+   (JS_MODULE_TYPE_JS if absent) or -1 with an exception if the type is
+   not supported */
+int js_module_get_type(JSContext *ctx, JSValueConst attributes);
+/* return the default export of a module of a non JS 'type' whose file
+   contents are 'buf'. 'buf' must be allocated with js_malloc() and is
+   owned by the function, even in case of exception. */
+JSValue js_module_new_value(JSContext *ctx, int type, uint8_t *buf,
+                            size_t buf_len, const char *module_name);
 int js_module_check_attributes(JSContext *ctx, void *opaque, JSValueConst attributes);
 JSModuleDef *js_module_loader(JSContext *ctx,
                               const char *module_name, void *opaque,
