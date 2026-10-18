@@ -419,6 +419,12 @@ void JS_AddIntrinsicRegExpCompiler(JSContext *ctx);
 int JS_AddIntrinsicRegExp(JSContext *ctx);
 int JS_AddIntrinsicJSON(JSContext *ctx);
 int JS_AddIntrinsicProxy(JSContext *ctx);
+/* same as 'new Proxy(target, handler)' */
+JSValue JS_NewProxy(JSContext *ctx, JSValueConst target, JSValueConst handler);
+JS_BOOL JS_IsProxy(JSValueConst val);
+/* throw a TypeError if 'proxy' is not a proxy or is revoked */
+JSValue JS_GetProxyTarget(JSContext *ctx, JSValueConst proxy);
+JSValue JS_GetProxyHandler(JSContext *ctx, JSValueConst proxy);
 int JS_AddIntrinsicMapSet(JSContext *ctx);
 int JS_AddIntrinsicTypedArrays(JSContext *ctx);
 int JS_AddIntrinsicPromise(JSContext *ctx);
@@ -684,6 +690,9 @@ static inline JS_BOOL JS_IsObject(JSValueConst v)
 
 JSValue JS_Throw(JSContext *ctx, JSValue obj);
 void JS_SetUncatchableException(JSContext *ctx, JS_BOOL flag);
+/* TRUE if the pending exception cannot be caught by JS code (interruption,
+   suspension) */
+JS_BOOL JS_IsUncatchableException(JSContext *ctx);
 JSValue JS_GetException(JSContext *ctx);
 JS_BOOL JS_HasException(JSContext *ctx);
 JS_BOOL JS_IsError(JSContext *ctx, JSValueConst val);
@@ -740,6 +749,8 @@ static inline JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
     return (JSValue)v;
 }
 
+/* abstract equality (==): return -1 if exception */
+int JS_IsEqual(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 JS_BOOL JS_StrictEq(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 JS_BOOL JS_SameValue(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 JS_BOOL JS_SameValueZero(JSContext *ctx, JSValueConst op1, JSValueConst op2);
@@ -874,6 +885,8 @@ JSValue JS_EvalThis(JSContext *ctx, JSValueConst this_obj,
                     const char *input, size_t input_len,
                     const char *filename, int eval_flags);
 JSValue JS_GetGlobalObject(JSContext *ctx);
+/* Function.prototype of the context */
+JSValue JS_GetFunctionProto(JSContext *ctx);
 int JS_OrdinaryIsInstanceOf(JSContext *ctx, JSValueConst val,
                             JSValueConst obj);
 int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
@@ -928,6 +941,8 @@ typedef enum JSTypedArrayEnum {
 
 JSValue JS_NewTypedArray(JSContext *ctx, int argc, JSValueConst *argv,
                          JSTypedArrayEnum array_type);
+/* the JSTypedArrayEnum of a typed array, or -1 */
+int JS_GetTypedArrayType(JSValueConst obj);
 JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
                                size_t *pbyte_offset,
                                size_t *pbyte_length,
@@ -949,6 +964,9 @@ typedef enum JSPromiseStateEnum {
 
 JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs);
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValue promise);
+/* consider a rejected promise as handled (the rejection tracker is told
+   so if it was not) */
+void JS_PromiseMarkAsHandled(JSContext *ctx, JSValueConst promise);
 JSValue JS_PromiseResult(JSContext *ctx, JSValue promise);
 
 /* is_handled = TRUE means that the rejection is handled */

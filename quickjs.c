@@ -2261,7 +2261,7 @@ static size_t js_def_malloc_usable_size(const void *ptr)
     return malloc_size(ptr);
 #elif defined(_WIN32)
     return _msize((void *)ptr);
-#elif defined(__EMSCRIPTEN__)
+#elif defined(__EMSCRIPTEN__) || defined(__wasi__)
     return 0;
 #elif defined(__linux__) || defined(__GLIBC__)
     return malloc_usable_size((void *)ptr);
@@ -7572,6 +7572,11 @@ JSValue JS_GetGlobalObject(JSContext *ctx)
     return JS_DupValue(ctx, ctx->global_obj);
 }
 
+JSValue JS_GetFunctionProto(JSContext *ctx)
+{
+    return JS_DupValue(ctx, ctx->function_proto);
+}
+
 /* WARNING: obj is freed */
 JSValue JS_Throw(JSContext *ctx, JSValue obj)
 {
@@ -11291,6 +11296,11 @@ BOOL JS_IsError(JSContext *ctx, JSValueConst val)
 void JS_SetUncatchableException(JSContext *ctx, BOOL flag)
 {
     ctx->rt->current_exception_is_uncatchable = flag;
+}
+
+JS_BOOL JS_IsUncatchableException(JSContext *ctx)
+{
+    return ctx->rt->current_exception_is_uncatchable;
 }
 
 void JS_SetOpaque(JSValue obj, void *opaque)
@@ -16303,6 +16313,14 @@ static BOOL js_strict_eq2(JSContext *ctx, JSValueConst op1, JSValueConst op2,
 static BOOL js_strict_eq(JSContext *ctx, JSValueConst op1, JSValueConst op2)
 {
     return js_strict_eq2(ctx, op1, op2, JS_EQ_STRICT);
+}
+
+int JS_IsEqual(JSContext *ctx, JSValueConst op1, JSValueConst op2)
+{
+    JSValue sp[2] = { JS_DupValue(ctx, op1), JS_DupValue(ctx, op2) };
+    if (js_eq_slow(ctx, sp + 2, FALSE))
+        return -1;
+    return JS_VALUE_GET_BOOL(sp[0]);
 }
 
 BOOL JS_StrictEq(JSContext *ctx, JSValueConst op1, JSValueConst op2)
@@ -54119,6 +54137,39 @@ static JSValue js_proxy_constructor(JSContext *ctx, JSValueConst this_val,
     return obj;
 }
 
+JSValue JS_NewProxy(JSContext *ctx, JSValueConst target, JSValueConst handler)
+{
+    JSValueConst args[2] = { target, handler };
+    return js_proxy_constructor(ctx, JS_UNDEFINED, 2, args);
+}
+
+JS_BOOL JS_IsProxy(JSValueConst val)
+{
+    return JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_PROXY;
+}
+
+static JSValue js_get_proxy_field(JSContext *ctx, JSValueConst proxy,
+                                  BOOL handler)
+{
+    JSProxyData *s = JS_GetOpaque(proxy, JS_CLASS_PROXY);
+    if (!s)
+        return JS_ThrowTypeError(ctx, "not a proxy");
+    if (s->is_revoked)
+        return JS_ThrowTypeErrorRevokedProxy(ctx);
+    return JS_DupValue(ctx, handler ? s->handler : s->target);
+}
+
+JSValue JS_GetProxyTarget(JSContext *ctx, JSValueConst proxy)
+{
+    return js_get_proxy_field(ctx, proxy, FALSE);
+}
+
+JSValue JS_GetProxyHandler(JSContext *ctx, JSValueConst proxy)
+{
+    return js_get_proxy_field(ctx, proxy, TRUE);
+}
+
 static JSValue js_proxy_revoke(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv, int magic,
                                JSValue *func_data)
@@ -56018,6 +56069,22 @@ JSValue JS_PromiseResult(JSContext *ctx, JSValue promise)
     if (!s)
         return JS_UNDEFINED;
     return JS_DupValue(ctx, s->promise_result);
+}
+
+void JS_PromiseMarkAsHandled(JSContext *ctx, JSValueConst promise)
+{
+    JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+    JSRuntime *rt = ctx->rt;
+    if (!s || s->is_handled)
+        return;
+    if (s->promise_state == JS_PROMISE_REJECTED &&
+        rt->host_promise_rejection_tracker) {
+        JSStackFrame *saved_caller = js_host_callback_enter(rt);
+        rt->host_promise_rejection_tracker(ctx, promise, s->promise_result,
+                                           TRUE, rt->host_promise_rejection_tracker_opaque);
+        js_host_callback_leave(rt, saved_caller);
+    }
+    s->is_handled = TRUE;
 }
 
 static int js_create_resolving_functions(JSContext *ctx, JSValue *args,
@@ -60534,6 +60601,14 @@ JSValue JS_NewTypedArray(JSContext *ctx, int argc, JSValueConst *argv,
 
     return js_typed_array_constructor(ctx, JS_UNDEFINED, argc, argv,
                                       JS_CLASS_UINT8C_ARRAY + type);
+}
+
+int JS_GetTypedArrayType(JSValueConst obj)
+{
+    JSClassID class_id = JS_GetClassID(obj);
+    if (class_id >= JS_CLASS_UINT8C_ARRAY && class_id <= JS_CLASS_FLOAT64_ARRAY)
+        return class_id - JS_CLASS_UINT8C_ARRAY;
+    return -1;
 }
 
 /* Return the buffer associated to the typed array or an exception if
