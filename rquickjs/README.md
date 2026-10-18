@@ -8,6 +8,34 @@
 This library is a high level bindings of the [QuickJS](https://bellard.org/quickjs/) Javascript engine.
 Its goal is to be an easy to use, and safe wrapper similar to the rlua library.
 
+## This copy
+
+Vendored from [rquickjs](https://github.com/DelSkayn/rquickjs) master `85517b7` (0.14.0) into the
+QuickJS tree two directories above, which `rquickjs-sys` compiles (bellard's QuickJS with heap
+snapshots and suspension, instead of the QuickJS-NG submodule of upstream rquickjs). The crates
+are not published.
+
+Added:
+
+- Suspension: `Runtime::suspender()` returns a `Suspender` (usable from any thread or from the
+  interrupt handler) whose `request()` suspends the running JavaScript at its next suspendable
+  point; the call which started it returns `Error::Suspended` and `Ctx::resume()` continues it.
+- Heap snapshots (`rquickjs::snapshot`): `Ctx::write_snapshot()` saves the whole runtime
+  (including a suspended execution) as a full, base or delta snapshot; `Runtime::read_snapshot()`
+  rebuilds it in another runtime or process. A `SnapshotHost` registers the Rust natives and
+  classes (`Persist`) a snapshot can reference.
+- Optional script builtins (`SnapshotHost::builtins()`): `snapshot()` / `restore()`, like
+  `setjmp()` / `longjmp()`, with a `Uint8Array` or a file.
+- TypeScript: the engine erases types while parsing (`EvalOptions::typescript`, or files and
+  modules named `*.ts`, `*.mts`, `*.cts`); enums, namespaces and parameter properties compile to
+  bytecode, `const enum` members are folded; standard or legacy decorators
+  (`Runtime::set_decorators`), `using` declarations.
+
+Removed (QuickJS-NG only): runtime dump flags (the `dump-*` features are compile-time `DUMP_*`
+defines of the engine), immutable `ArrayBuffer`s, the `strip_*` module write options and the
+import attributes given to resolvers. The bindings are generated from `quickjs.h` by
+`scripts/gen-bindings.sh`; `wasm32-unknown-unknown` is not supported.
+
 **QuickJS** is a small and embeddable JavaScript engine. It supports the _ES2020_ specification including modules, asynchronous generators, proxies and BigInt.
 It optionally supports mathematical extensions such as big decimal floating point numbers (BigDecimal), big binary floating point numbers (BigFloat) and operator overloading.
 

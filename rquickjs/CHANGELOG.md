@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Runtime::suspender` / `Suspender`, `Error::Suspended`, `Ctx::resume`, `Ctx::resume_with` and `Runtime::is_suspended`: suspend a running execution and continue it later.
+- `rquickjs::snapshot`: `Ctx::write_snapshot` (full, base and delta snapshots), `Runtime::read_snapshot`, `Runtime::drop_snapshot_base`, `SnapshotHost` (natives and `Persist` classes) and the optional `snapshot()`/`restore()` builtins with `Error::Restore`.
+- `Ctx::has_uncatchable_exception`.
+- `StringNormalize` and `AToB` (`atob()`/`btoa()`) intrinsics.
+- TypeScript: `EvalOptions::typescript`; files and modules named `*.ts`, `*.mts`, `*.cts` are TypeScript (`Ctx::eval_file`, `Module::declare`/`evaluate`, `ScriptLoader`); `FileResolver` resolves `./x.js` to an existing `./x.ts` and tries `{}.ts`/`{}.mts`; `Runtime::set_decorators` (`Decorators`: standard, TypeScript legacy, legacy with `design:*` metadata).
 - `#[rquickjs::methods]` accepts `enumerable`, `configurable`, and `writable` on functions, and `= false` to disable default attributes
 - Added `Value::loose_eq`, `Value::strict_eq`, `Value::same_value`, and `Value::same_value_zero` which map to the various concepts of equality exposed by QuickJS.
 
