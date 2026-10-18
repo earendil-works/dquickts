@@ -308,10 +308,17 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
             JS_FreeValue(ctx, val);
         } else {
             JSValue func_val;
+            int ts_flag;
 
+            ts_flag = js_std_get_typescript_flag(ctx, module_name);
+            if (ts_flag < 0) {
+                js_free(ctx, buf);
+                return NULL;
+            }
             /* compile the module */
             func_val = JS_Eval(ctx, (char *)buf, buf_len, module_name,
-                               JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+                               JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY |
+                               ts_flag);
             js_free(ctx, buf);
             if (JS_IsException(func_val))
                 return NULL;
@@ -336,7 +343,7 @@ static void compile_file(JSContext *ctx, FILE *fo,
 {
     uint8_t *buf;
     char c_name[1024];
-    int eval_flags;
+    int eval_flags, ret;
     JSValue obj;
     size_t buf_len;
 
@@ -346,9 +353,16 @@ static void compile_file(JSContext *ctx, FILE *fo,
         exit(1);
     }
     eval_flags = JS_EVAL_FLAG_COMPILE_ONLY;
+    ret = js_std_get_typescript_flag(ctx, filename);
+    if (ret < 0) {
+        js_std_dump_error(ctx);
+        exit(1);
+    }
+    eval_flags |= ret;
     if (module < 0) {
-        module = (has_suffix(filename, ".mjs") ||
-                  JS_DetectModule((const char *)buf, buf_len));
+        module = (has_suffix(filename, ".mjs") || has_suffix(filename, ".mts") ||
+                  (!has_suffix(filename, ".cts") &&
+                   JS_DetectModule((const char *)buf, buf_len)));
     }
     if (module)
         eval_flags |= JS_EVAL_TYPE_MODULE;
@@ -778,7 +792,7 @@ int main(int argc, char **argv)
     JS_SetStripInfo(rt, strip_flags);
 
     /* loader for ES6 modules */
-    JS_SetModuleLoaderFunc2(rt, NULL, jsc_module_loader, NULL, NULL);
+    JS_SetModuleLoaderFunc2(rt, js_module_normalize, jsc_module_loader, NULL, NULL);
 
     fprintf(fo, "/* File generated automatically by the QuickJS compiler. */\n"
             "\n"
@@ -867,7 +881,7 @@ int main(int argc, char **argv)
 
         /* add the module loader if necessary */
         if (feature_bitmap & (1 << FE_MODULE_LOADER)) {
-            fprintf(fo, "  JS_SetModuleLoaderFunc2(rt, NULL, js_module_loader, js_module_check_attributes, NULL);\n");
+            fprintf(fo, "  JS_SetModuleLoaderFunc2(rt, js_module_normalize, js_module_loader, js_module_check_attributes, NULL);\n");
         }
 
         fprintf(fo,

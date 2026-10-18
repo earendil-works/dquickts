@@ -62,6 +62,22 @@ int js_module_get_type(JSContext *ctx, JSValueConst attributes);
 JSValue js_module_new_value(JSContext *ctx, int type, uint8_t *buf,
                             size_t buf_len, const char *module_name);
 int js_module_check_attributes(JSContext *ctx, void *opaque, JSValueConst attributes);
+/* return JS_EVAL_FLAG_TYPESCRIPT if 'filename' has a TypeScript
+   extension ('.ts', '.mts', '.cts'), 0 otherwise, or -1 with a
+   SyntaxError for '.tsx' (JSX is not supported) */
+int js_std_get_typescript_flag(JSContext *ctx, const char *filename);
+/* set the JS_EVAL_FLAG_TS_LEGACY_DECORATORS and
+   JS_EVAL_FLAG_TS_DECORATOR_METADATA flags added for the TypeScript
+   sources by js_std_get_typescript_flag() and std.evalScript() (the
+   other flags are ignored). The workers inherit them. */
+void js_std_set_typescript_flags(JSRuntime *rt, int flags);
+/* module name normalizer: the default normalization, then, if the file
+   does not exist, './x.js', './x.mjs', './x.cjs' and './x' resolve to
+   an existing './x.ts', './x.mts', './x.cts' and './x.ts' */
+char *js_module_normalize(JSContext *ctx, const char *base_name,
+                          const char *name, void *opaque);
+/* module loader: compiles the TypeScript files as TypeScript (see
+   js_std_get_typescript_flag()) */
 JSModuleDef *js_module_loader(JSContext *ctx,
                               const char *module_name, void *opaque,
                               JSValueConst attributes);

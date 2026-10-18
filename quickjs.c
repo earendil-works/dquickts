@@ -23530,6 +23530,35 @@ typedef struct JSVarDef {
     int func_pool_idx;
 } JSVarDef;
 
+/* TypeScript enum or namespace, shared by all its (merged)
+   declarations. The members are the exported values: inside the
+   closure of each declaration, a reference to a member name that is
+   not shadowed resolves to a property of the closure argument, as in
+   tsc's '(function (N) { ... })(N || (N = {}))' emission. */
+typedef enum {
+    TS_NS_NAMESPACE,
+    TS_NS_ENUM,
+    TS_NS_CONST_ENUM,
+} TSNamespaceKindEnum;
+
+typedef struct TSNamespaceMember {
+    JSAtom name;
+    /* enum member constant value or JS_UNINITIALIZED if not constant */
+    JSValue value;
+    struct TSNamespace *child; /* exported namespace or enum, or NULL */
+} TSNamespaceMember;
+
+typedef struct TSNamespace {
+    int ref_count;
+    TSNamespaceKindEnum kind;
+    JSAtom name;
+    int scope_level; /* declaration scope in the owner function */
+    struct TSNamespace *next; /* next declaration of the owner function */
+    int member_count;
+    int member_size;
+    TSNamespaceMember *members;
+} TSNamespace;
+
 typedef struct JSFunctionDef {
     JSContext *ctx;
     struct JSFunctionDef *parent;
@@ -23643,6 +23672,25 @@ typedef struct JSFunctionDef {
 
     JSModuleDef *module; /* != NULL when parsing a module */
     BOOL has_await; /* TRUE if await is used (used in module eval) */
+
+    /* TypeScript (only set when parsing with JS_EVAL_FLAG_TYPESCRIPT) */
+    BOOL is_ts;
+    BOOL ts_has_const_enum; /* top level only: enables const enum folding */
+    TSNamespace *ts_ns; /* namespace/enum closure: its members alias arg 0 */
+    TSNamespace *ts_decls; /* enums and namespaces declared in this function */
+    JSAtom *ts_param_props; /* constructor parameter properties */
+    int ts_param_prop_count;
+    int ts_param_prop_size;
+    /* module top level: names only declared as types, for 'export {}' */
+    JSAtom *ts_type_names;
+    int ts_type_name_count;
+    int ts_type_name_size;
+    /* module top level: import elision */
+    uint8_t *ts_import_used; /* indexed like module->import_entries */
+    int ts_import_used_size;
+    int *ts_elidable_reqs; /* req_module_entries of import declarations */
+    int ts_elidable_req_count;
+    int ts_elidable_req_size;
 } JSFunctionDef;
 
 typedef struct JSToken {
@@ -23668,6 +23716,77 @@ typedef struct JSToken {
     } u;
 } JSToken;
 
+/* TypeScript contextual keywords. They are not predefined atoms so that
+   the atom table (and the bytecode format) is unchanged: the parser
+   creates them when TypeScript parsing is enabled. */
+#define TS_KEYWORDS(DEF)                                \
+    DEF(type) DEF(interface) DEF(declare) DEF(abstract)  \
+    DEF(namespace) DEF(module) DEF(global) DEF(readonly) \
+    DEF(public) DEF(private) DEF(protected) DEF(override) \
+    DEF(accessor) DEF(is) DEF(asserts) DEF(keyof)        \
+    DEF(infer) DEF(unique) DEF(satisfies) DEF(require)   \
+    DEF(out) DEF(implements) DEF(any) DEF(never)         \
+    DEF(unknown) DEF(undefined) DEF(object) DEF(number)  \
+    DEF(string) DEF(boolean) DEF(bigint) DEF(symbol)     \
+    DEF(as) DEF(from) DEF(get) DEF(set) DEF(async)       \
+    DEF(static) DEF(constructor)
+
+typedef enum {
+#define DEF(name) TS_KW_ ## name,
+    TS_KEYWORDS(DEF)
+#undef DEF
+    TS_KW_COUNT,
+} TSKeywordEnum;
+
+/* Legacy (TypeScript experimentalDecorators) decorators are evaluated
+   after the class definition as tsc does: their expressions are
+   compiled into an arrow function returning the decorator array. */
+typedef struct {
+    struct JSFunctionDef *fd; /* NULL if none */
+    int count; /* number of values pushed by 'fd' */
+} DecThunk;
+
+/* emitDecoratorMetadata: serialized type of a type annotation */
+typedef enum {
+    TS_META_VOID,
+    TS_META_OBJECT,
+    TS_META_FUNCTION,
+    TS_META_ARRAY,
+    TS_META_BOOLEAN,
+    TS_META_STRING,
+    TS_META_NUMBER,
+    TS_META_BIGINT,
+    TS_META_SYMBOL,
+    TS_META_REF, /* type reference */
+    /* only used to combine the constituents of unions and intersections */
+    TS_META_NEVER,
+    TS_META_UNKNOWN,
+    TS_META_ANY,
+} TSMetaKindEnum;
+
+#define TS_META_MAX_NAMES 4
+
+typedef struct {
+    uint8_t kind;
+    uint8_t elem_kind; /* TS_META_ARRAY: element kind of 'T[]' */
+    uint8_t name_count;
+    /* TS_META_REF (or element of TS_META_ARRAY): qualified name */
+    JSAtom names[TS_META_MAX_NAMES];
+} TSMeta;
+
+/* decorators and types of the parameters of a method or constructor
+   (legacy decorators) */
+typedef struct DecParams {
+    struct JSFunctionDef *class_fd; /* function containing the class */
+    DecThunk *thunk; /* decorators of the method or of the class */
+    BOOL metadata; /* collect the types */
+    TSMeta *types;
+    int count;
+    int size;
+    BOOL has_return_type;
+    TSMeta return_type;
+} DecParams;
+
 typedef struct JSParseState {
     JSContext *ctx;
     const char *filename;
@@ -23684,6 +23803,27 @@ typedef struct JSParseState {
     BOOL allow_html_comments;
     BOOL ext_json; /* JSON parsing: true if accepting JSON superset */
     GetLineColCache get_line_col_cache;
+
+    /* TypeScript */
+    BOOL ts; /* parsing TypeScript (JS_EVAL_FLAG_TYPESCRIPT) */
+    int ts_spec; /* > 0 during speculative type skipping: no error object */
+    BOOL ts_after_question; /* parsing the 'b' of 'a ? b : c' */
+    BOOL ts_type_only_stmt; /* the last statement emitted no code */
+    /* != NULL while parsing 'export var' in a namespace: the declared
+       names become members instead of local variables */
+    TSNamespace *ts_export_ns;
+    JSAtom ts_kw[TS_KW_COUNT];
+    BOOL ts_legacy_decorators; /* JS_EVAL_FLAG_TS_LEGACY_DECORATORS */
+    BOOL ts_decorator_metadata; /* JS_EVAL_FLAG_TS_DECORATOR_METADATA */
+    /* parameter decorators and types of the function being parsed
+       (legacy decorators) */
+    struct DecParams *dec_params;
+
+    /* decorators of the next class, parsed before 'class' and consumed
+       by js_parse_class(): standard decorators are an array on the
+       stack, legacy decorators are in 'class_dec_thunk' */
+    BOOL has_class_decorators;
+    DecThunk class_dec_thunk;
 } JSParseState;
 
 typedef struct JSOpCode {
@@ -23723,6 +23863,62 @@ static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
 #endif
 
 static __exception int next_token(JSParseState *s);
+
+static TSNamespace *ts_ns_new(JSContext *ctx, TSNamespaceKindEnum kind,
+                              JSAtom name, int scope_level)
+{
+    TSNamespace *ns = js_mallocz(ctx, sizeof(*ns));
+    if (!ns)
+        return NULL;
+    ns->ref_count = 1;
+    ns->kind = kind;
+    ns->name = JS_DupAtom(ctx, name);
+    ns->scope_level = scope_level;
+    return ns;
+}
+
+static void ts_ns_free(JSContext *ctx, TSNamespace *ns)
+{
+    int i;
+    if (!ns || --ns->ref_count > 0)
+        return;
+    for(i = 0; i < ns->member_count; i++) {
+        TSNamespaceMember *me = &ns->members[i];
+        JS_FreeAtom(ctx, me->name);
+        JS_FreeValue(ctx, me->value);
+        ts_ns_free(ctx, me->child);
+    }
+    js_free(ctx, ns->members);
+    JS_FreeAtom(ctx, ns->name);
+    js_free(ctx, ns);
+}
+
+static TSNamespaceMember *ts_ns_find_member(TSNamespace *ns, JSAtom name)
+{
+    int i;
+    for(i = 0; i < ns->member_count; i++) {
+        if (ns->members[i].name == name)
+            return &ns->members[i];
+    }
+    return NULL;
+}
+
+/* return the member 'name', adding it if needed */
+static TSNamespaceMember *ts_ns_add_member(JSContext *ctx, TSNamespace *ns,
+                                           JSAtom name)
+{
+    TSNamespaceMember *me = ts_ns_find_member(ns, name);
+    if (me)
+        return me;
+    if (js_resize_array(ctx, (void **)&ns->members, sizeof(ns->members[0]),
+                        &ns->member_size, ns->member_count + 1))
+        return NULL;
+    me = &ns->members[ns->member_count++];
+    me->name = JS_DupAtom(ctx, name);
+    me->value = JS_UNINITIALIZED;
+    me->child = NULL;
+    return me;
+}
 
 static void free_token(JSParseState *s, JSToken *token)
 {
@@ -26192,7 +26388,10 @@ static int __exception js_parse_property_name(JSParseState *s,
                 s->token.val == '}' || s->token.val == '(' ||
                 s->token.val == '=' ||
                 ((s->token.val == ';' || s->token.val == '*') &&
-                 allow_private)) {
+                 allow_private) ||
+                /* TypeScript: 'get<T>()', 'get?()', 'get!: T', 'get: T' */
+                (s->ts && (s->token.val == '<' || s->token.val == '?' ||
+                           s->token.val == '!'))) {
                 is_non_reserved_ident = TRUE;
                 goto ident_found;
             }
@@ -26209,7 +26408,10 @@ static int __exception js_parse_property_name(JSParseState *s,
                 goto fail1;
             if (s->token.val == ':' || s->token.val == ',' ||
                 s->token.val == '}' || s->token.val == '(' ||
-                s->token.val == '=') {
+                s->token.val == '=' ||
+                (s->token.val == ';' && allow_private) ||
+                (s->ts && (s->token.val == '<' || s->token.val == '?' ||
+                           s->token.val == '!'))) {
                 is_non_reserved_ident = TRUE;
                 goto ident_found;
             }
@@ -26236,7 +26438,8 @@ static int __exception js_parse_property_name(JSParseState *s,
         if (is_non_reserved_ident &&
             prop_type == PROP_TYPE_IDENT && allow_var) {
             if (!(s->token.val == ':' ||
-                  (s->token.val == '(' && allow_method))) {
+                  (s->token.val == '(' && allow_method) ||
+                  (s->ts && s->token.val == '<' && allow_method))) {
                 prop_type = PROP_TYPE_VAR;
             }
         }
@@ -26271,7 +26474,7 @@ static int __exception js_parse_property_name(JSParseState *s,
         goto invalid_prop;
     }
     if (prop_type != PROP_TYPE_IDENT && prop_type != PROP_TYPE_VAR &&
-        s->token.val != '(') {
+        s->token.val != '(' && !(s->ts && s->token.val == '<')) {
         JS_FreeAtom(s->ctx, name);
     invalid_prop:
         js_parse_error(s, "invalid property name");
@@ -26464,6 +26667,1348 @@ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, BOOL no_line_
     return tok;
 }
 
+/* TypeScript support.
+
+   Types are erased while parsing: the parser skips them token by token
+   and never emits bytecode for them. The disambiguation rules
+   (generic calls, arrow functions with return types, ...) follow
+   esbuild's TypeScript parser. Speculation uses the JSParsePos save /
+   seek mechanism and always happens before any bytecode is emitted for
+   the speculated tokens. */
+
+static int ts_parse_init(JSParseState *s)
+{
+    static const char ts_kw_names[] =
+#define DEF(name) #name "\0"
+        TS_KEYWORDS(DEF)
+#undef DEF
+        ;
+    const char *p = ts_kw_names;
+    int i;
+
+    for(i = 0; i < TS_KW_COUNT; i++) {
+        s->ts_kw[i] = JS_NewAtom(s->ctx, p);
+        if (s->ts_kw[i] == JS_ATOM_NULL) {
+            while (i-- > 0)
+                JS_FreeAtom(s->ctx, s->ts_kw[i]);
+            return -1;
+        }
+        p += strlen(p) + 1;
+    }
+    s->ts = TRUE;
+    return 0;
+}
+
+static void ts_parse_end(JSParseState *s)
+{
+    int i;
+    if (!s->ts)
+        return;
+    for(i = 0; i < TS_KW_COUNT; i++)
+        JS_FreeAtom(s->ctx, s->ts_kw[i]);
+    s->ts = FALSE;
+}
+
+/* return the atom of an unescaped identifier or keyword token */
+static JSAtom ts_token_atom(JSParseState *s)
+{
+    if ((s->token.val == TOK_IDENT ||
+         (s->token.val >= TOK_FIRST_KEYWORD &&
+          s->token.val <= TOK_LAST_KEYWORD)) &&
+        !s->token.u.ident.has_escape)
+        return s->token.u.ident.atom;
+    return JS_ATOM_NULL;
+}
+
+static BOOL ts_is_kw(JSParseState *s, TSKeywordEnum kw)
+{
+    return ts_token_atom(s) == s->ts_kw[kw];
+}
+
+/* identifier in a type or binding position: the strict mode reserved
+   words are identifiers for TypeScript types */
+static BOOL ts_is_ident(JSParseState *s)
+{
+    return s->token.val == TOK_IDENT ||
+        (s->token.val >= TOK_IMPLEMENTS && s->token.val <= TOK_AWAIT);
+}
+
+static int ts_error(JSParseState *s)
+{
+    if (s->ts_spec)
+        return -1; /* the caller backtracks, no need for an error object */
+    if (s->token.val == TOK_EOF)
+        return js_parse_error(s, "unexpected end of input in type");
+    return js_parse_error(s, "unexpected token in type: '%.*s'",
+                          (int)(s->buf_ptr - s->token.ptr), s->token.ptr);
+}
+
+static int ts_expect(JSParseState *s, int tok)
+{
+    if (s->token.val != tok)
+        return ts_error(s);
+    return next_token(s);
+}
+
+/* lookahead on the next token. '*patom' (if not NULL) receives a
+   reference to its atom or JS_ATOM_NULL. Return -1 on error. */
+static int ts_peek(JSParseState *s, int *ptok, BOOL *pgot_lf, JSAtom *patom)
+{
+    JSParsePos pos;
+    if (patom)
+        *patom = JS_ATOM_NULL;
+    js_parse_get_pos(s, &pos);
+    if (next_token(s))
+        return -1;
+    *ptok = s->token.val;
+    if (pgot_lf)
+        *pgot_lf = s->got_lf;
+    if (patom)
+        *patom = JS_DupAtom(s->ctx, ts_token_atom(s));
+    return js_parse_seek_token(s, &pos);
+}
+
+static void ts_spec_begin(JSParseState *s, JSParsePos *pos)
+{
+    js_parse_get_pos(s, pos);
+    s->ts_spec++;
+}
+
+/* end a speculation: restore the position unless 'keep' is set. The
+   errors raised by the tokenizer during the speculation are dropped. */
+static int ts_spec_end(JSParseState *s, const JSParsePos *pos, BOOL keep)
+{
+    s->ts_spec--;
+    if (JS_HasException(s->ctx))
+        JS_FreeValue(s->ctx, JS_GetException(s->ctx));
+    if (keep)
+        return 0;
+    return js_parse_seek_token(s, pos);
+}
+
+/* expect a '>', splitting the '>>', '>=', ... tokens */
+static int ts_expect_gt(JSParseState *s)
+{
+    switch(s->token.val) {
+    case '>':
+        return next_token(s);
+    case TOK_SAR:
+    case TOK_SHR:
+    case TOK_GTE:
+    case TOK_SAR_ASSIGN:
+    case TOK_SHR_ASSIGN:
+        s->buf_ptr = s->token.ptr + 1;
+        return next_token(s);
+    default:
+        return ts_error(s);
+    }
+}
+
+static BOOL ts_is_lt(int tok)
+{
+    return tok == '<' || tok == TOK_SHL || tok == TOK_LTE ||
+        tok == TOK_SHL_ASSIGN;
+}
+
+/* expect a '<', splitting the '<<' and '<=' tokens */
+static int ts_expect_lt(JSParseState *s)
+{
+    if (s->token.val == '<')
+        return next_token(s);
+    if (!ts_is_lt(s->token.val))
+        return ts_error(s);
+    s->buf_ptr = s->token.ptr + 1;
+    return next_token(s);
+}
+
+/* the current token is the '}' closing a template substitution */
+static int ts_template_continue(JSParseState *s)
+{
+    if (s->token.val != '}')
+        return ts_error(s);
+    free_token(s, &s->token);
+    s->got_lf = FALSE;
+    return js_parse_template_part(s, s->buf_ptr);
+}
+
+#define TS_SKIP_BALANCED (1 << 0) /* stop after the first closed group */
+#define TS_SKIP_COMMA    (1 << 1) /* stop at ',' */
+#define TS_SKIP_LF       (1 << 2) /* stop at a line break (ASI) */
+
+/* Skip tokens without emitting code. Stop at level 0 before a closing
+   bracket, ';', EOF, a ':' not paired with a '?', or as given by
+   'flags'. Regexps and templates are recognized with the heuristic of
+   js_parse_skip_parens_token(). */
+static int ts_skip_tokens(JSParseState *s, int flags)
+{
+    char state[256];
+    size_t level = 0;
+    int last_tok = 0, tok_len, nq = 0, c;
+    BOOL first = TRUE;
+
+    for(;;) {
+        if (!first && level == 0 && (flags & TS_SKIP_LF) && s->got_lf)
+            return 0;
+        first = FALSE;
+        switch(s->token.val) {
+        case '(':
+        case '[':
+        case '{':
+            if (level >= sizeof(state))
+                return ts_error(s);
+            state[level++] = s->token.val;
+            break;
+        case ')':
+        case ']':
+        case '}':
+            if (level == 0)
+                return 0;
+            c = state[--level];
+            if (c == '`') {
+                if (ts_template_continue(s))
+                    return -1;
+                goto handle_template;
+            }
+            if ((c == '(' && s->token.val != ')') ||
+                (c == '[' && s->token.val != ']') ||
+                (c == '{' && s->token.val != '}'))
+                return ts_error(s);
+            if (level == 0 && (flags & TS_SKIP_BALANCED))
+                return next_token(s);
+            break;
+        case TOK_TEMPLATE:
+        handle_template:
+            if (s->token.u.str.sep != '`') {
+                if (level >= sizeof(state))
+                    return ts_error(s);
+                state[level++] = '`';
+            }
+            break;
+        case TOK_EOF:
+            if (level != 0)
+                return ts_error(s);
+            return 0;
+        case ';':
+            if (level == 0)
+                return 0;
+            break;
+        case ',':
+            if (level == 0 && (flags & TS_SKIP_COMMA))
+                return 0;
+            break;
+        case '?':
+            if (level == 0)
+                nq++;
+            break;
+        case ':':
+            if (level == 0) {
+                if (nq == 0)
+                    return 0;
+                nq--;
+            }
+            break;
+        case TOK_DIV_ASSIGN:
+            tok_len = 2;
+            goto parse_regexp;
+        case '/':
+            tok_len = 1;
+        parse_regexp:
+            if (is_regexp_allowed(last_tok)) {
+                s->buf_ptr -= tok_len;
+                if (js_parse_regexp(s))
+                    return -1;
+            }
+            break;
+        }
+        last_tok = s->token.val;
+        if (next_token(s))
+            return -1;
+    }
+}
+
+static int ts_skip_balanced(JSParseState *s)
+{
+    return ts_skip_tokens(s, TS_SKIP_BALANCED);
+}
+
+/* type skipping levels */
+enum {
+    TS_L_LOWEST,
+    TS_L_OR,
+    TS_L_AND,
+    TS_L_PREFIX,
+};
+
+#define TS_TYPE_RETURN       (1 << 0)
+#define TS_TYPE_INDEX_SIG    (1 << 1)
+#define TS_TYPE_TUPLE_LABELS (1 << 2)
+#define TS_TYPE_NO_COND      (1 << 3)
+
+/* type parameter flags */
+#define TS_TP_IN_OUT (1 << 0)
+#define TS_TP_CONST  (1 << 1)
+#define TS_TP_EMPTY  (1 << 2)
+
+/* ts_skip_type_params() result */
+enum {
+    TS_TP_NONE,
+    TS_TP_MAYBE_CAST,
+    TS_TP_DEFINITE,
+};
+
+static int ts_skip_type2(JSParseState *s, int level, int flags);
+static int ts_skip_type_args(JSParseState *s, BOOL in_expr);
+static int ts_skip_object_type(JSParseState *s);
+
+static int ts_skip_type(JSParseState *s)
+{
+    return ts_skip_type2(s, TS_L_LOWEST, 0);
+}
+
+static int ts_skip_return_type(JSParseState *s)
+{
+    return ts_skip_type2(s, TS_L_LOWEST, TS_TYPE_RETURN);
+}
+
+/* skip a binding name or pattern in a function type */
+static int ts_skip_binding(JSParseState *s)
+{
+    if (ts_is_ident(s) || s->token.val == TOK_THIS)
+        return next_token(s);
+    if (s->token.val == '[' || s->token.val == '{')
+        return ts_skip_balanced(s);
+    return ts_error(s);
+}
+
+/* skip the parameters of a function type or signature */
+static int ts_skip_fn_args(JSParseState *s)
+{
+    if (ts_expect(s, '('))
+        return -1;
+    while (s->token.val != ')') {
+        if (s->token.val == TOK_ELLIPSIS && next_token(s))
+            return -1;
+        if (ts_skip_binding(s))
+            return -1;
+        if (s->token.val == '?' && next_token(s))
+            return -1;
+        if (s->token.val == ':') {
+            if (next_token(s) || ts_skip_type(s))
+                return -1;
+        }
+        if (s->token.val != ',')
+            break;
+        if (next_token(s))
+            return -1;
+    }
+    return ts_expect(s, ')');
+}
+
+/* return the TS_TP_x result or -1 if error */
+static int ts_skip_type_params(JSParseState *s, int tp_flags)
+{
+    int result;
+    BOOL expect_ident;
+
+    if (s->token.val != '<')
+        return TS_TP_NONE;
+    if (next_token(s))
+        return -1;
+    result = TS_TP_MAYBE_CAST;
+    if ((tp_flags & TS_TP_EMPTY) && s->token.val == '>') {
+        if (next_token(s))
+            return -1;
+        return TS_TP_DEFINITE;
+    }
+    for(;;) {
+        /* 'in', 'out' and 'const' modifiers */
+        expect_ident = TRUE;
+        for(;;) {
+            if (s->token.val == TOK_CONST) {
+                result = TS_TP_DEFINITE;
+                expect_ident = TRUE;
+            } else if (s->token.val == TOK_IN) {
+                expect_ident = TRUE;
+            } else if (ts_is_kw(s, TS_KW_out)) {
+                /* 'out' may also be the parameter name */
+                expect_ident = FALSE;
+            } else {
+                break;
+            }
+            if (next_token(s))
+                return -1;
+        }
+        if (expect_ident || ts_is_ident(s)) {
+            if (!ts_is_ident(s))
+                return ts_error(s);
+            if (next_token(s))
+                return -1;
+        }
+        if (s->token.val == TOK_EXTENDS) {
+            result = TS_TP_DEFINITE;
+            if (next_token(s) || ts_skip_type(s))
+                return -1;
+        }
+        if (s->token.val == '=') {
+            result = TS_TP_DEFINITE;
+            if (next_token(s) || ts_skip_type(s))
+                return -1;
+        }
+        if (s->token.val != ',')
+            break;
+        if (next_token(s))
+            return -1;
+        if (s->token.val == '>') {
+            result = TS_TP_DEFINITE;
+            break;
+        }
+    }
+    if (ts_expect_gt(s))
+        return -1;
+    return result;
+}
+
+/* return 1 if type arguments were skipped, 0 if none, -1 if error. In
+   an expression ('in_expr'), the list must end with an actual '>'
+   token (e.g. 'x < y >= z' is not a type argument list) */
+static int ts_skip_type_args(JSParseState *s, BOOL in_expr)
+{
+    if (!ts_is_lt(s->token.val))
+        return 0;
+    if (ts_expect_lt(s))
+        return -1;
+    for(;;) {
+        if (ts_skip_type(s))
+            return -1;
+        if (s->token.val != ',')
+            break;
+        if (next_token(s))
+            return -1;
+    }
+    if (in_expr) {
+        if (ts_expect(s, '>'))
+            return -1;
+    } else {
+        if (ts_expect_gt(s))
+            return -1;
+    }
+    return 1;
+}
+
+/* return 1 if the arguments of a function type followed by '=>' were
+   skipped, 0 if not (position restored), -1 if error */
+static int ts_try_skip_arrow_args(JSParseState *s)
+{
+    JSParsePos pos;
+    BOOL ok;
+    ts_spec_begin(s, &pos);
+    ok = !ts_skip_fn_args(s) && s->token.val == TOK_ARROW;
+    if (ok)
+        ok = !next_token(s);
+    if (ts_spec_end(s, &pos, ok))
+        return -1;
+    return ok;
+}
+
+/* '(T)' or a function type '(a: T) => U' */
+static int ts_skip_paren_or_fn_type(JSParseState *s)
+{
+    int ret = ts_try_skip_arrow_args(s);
+    if (ret < 0)
+        return -1;
+    if (ret)
+        return ts_skip_return_type(s);
+    if (ts_expect(s, '(') || ts_skip_type(s))
+        return -1;
+    return ts_expect(s, ')');
+}
+
+/* 'infer T extends U': only a constraint if not followed by '?' in a
+   conditional type */
+static int ts_try_skip_infer_constraint(JSParseState *s, int flags)
+{
+    JSParsePos pos;
+    BOOL ok;
+    ts_spec_begin(s, &pos);
+    ok = !next_token(s) &&
+        !ts_skip_type2(s, TS_L_PREFIX, TS_TYPE_NO_COND) &&
+        !(!(flags & TS_TYPE_NO_COND) && s->token.val == '?');
+    return ts_spec_end(s, &pos, ok);
+}
+
+static BOOL ts_is_primitive_type(JSParseState *s, JSAtom atom)
+{
+    return atom == s->ts_kw[TS_KW_any] || atom == s->ts_kw[TS_KW_never] ||
+        atom == s->ts_kw[TS_KW_unknown] ||
+        atom == s->ts_kw[TS_KW_undefined] ||
+        atom == s->ts_kw[TS_KW_object] || atom == s->ts_kw[TS_KW_number] ||
+        atom == s->ts_kw[TS_KW_string] || atom == s->ts_kw[TS_KW_boolean] ||
+        atom == s->ts_kw[TS_KW_bigint] || atom == s->ts_kw[TS_KW_symbol];
+}
+
+static int ts_skip_type2(JSParseState *s, int level, int flags)
+{
+    JSAtom atom;
+    BOOL check_type_args;
+
+ redo:
+    switch(s->token.val) {
+    case TOK_NUMBER:
+    case TOK_STRING:
+    case TOK_TRUE:
+    case TOK_FALSE:
+    case TOK_NULL:
+    case TOK_VOID:
+    case TOK_CONST:
+        if (next_token(s))
+            return -1;
+        break;
+    case TOK_TEMPLATE:
+        /* template literal type: `a${T}b` */
+        while (s->token.u.str.sep != '`') {
+            if (next_token(s) || ts_skip_type(s) || ts_template_continue(s))
+                return -1;
+        }
+        if (next_token(s))
+            return -1;
+        break;
+    case TOK_THIS:
+        if (next_token(s))
+            return -1;
+        /* 'this is T' type predicate */
+        if (ts_is_kw(s, TS_KW_is) && !s->got_lf) {
+            if (next_token(s))
+                return -1;
+            return ts_skip_type(s);
+        }
+        break;
+    case '-':
+        if (next_token(s))
+            return -1;
+        if (ts_expect(s, TOK_NUMBER))
+            return -1;
+        break;
+    case '&':
+    case '|':
+        /* leading separator: 'type A = | B | C' */
+        if (next_token(s))
+            return -1;
+        goto redo;
+    case TOK_IMPORT:
+        /* import('mod').T */
+        if (next_token(s))
+            return -1;
+        if ((flags & TS_TYPE_TUPLE_LABELS) &&
+            (s->token.val == ':' || s->token.val == '?'))
+            return 0;
+        if (ts_expect(s, '(') || ts_expect(s, TOK_STRING))
+            return -1;
+        if (s->token.val == ',') {
+            if (next_token(s) || ts_skip_object_type(s))
+                return -1;
+            if (s->token.val == ',' && next_token(s))
+                return -1;
+        }
+        if (ts_expect(s, ')'))
+            return -1;
+        break;
+    case TOK_NEW:
+        /* constructor type: new (...) => T */
+        if (next_token(s))
+            return -1;
+        if ((flags & TS_TYPE_TUPLE_LABELS) &&
+            (s->token.val == ':' || s->token.val == '?'))
+            return 0;
+        if (ts_skip_type_params(s, TS_TP_CONST) < 0 ||
+            ts_skip_paren_or_fn_type(s))
+            return -1;
+        break;
+    case '<':
+        /* generic function type: <T>(x: T) => T */
+        if (ts_skip_type_params(s, TS_TP_CONST) < 0 ||
+            ts_skip_paren_or_fn_type(s))
+            return -1;
+        break;
+    case '(':
+        if (ts_skip_paren_or_fn_type(s))
+            return -1;
+        break;
+    case TOK_TYPEOF:
+        if (next_token(s))
+            return -1;
+        if ((flags & TS_TYPE_TUPLE_LABELS) &&
+            (s->token.val == ':' || s->token.val == '?'))
+            return 0;
+        if (s->token.val == TOK_IMPORT)
+            goto redo;
+        if (!token_is_ident(s->token.val))
+            return ts_error(s);
+        if (next_token(s))
+            return -1;
+        while (s->token.val == '.') {
+            if (next_token(s))
+                return -1;
+            if (!token_is_ident(s->token.val) &&
+                s->token.val != TOK_PRIVATE_NAME)
+                return ts_error(s);
+            if (next_token(s))
+                return -1;
+        }
+        if (!s->got_lf && ts_skip_type_args(s, FALSE) < 0)
+            return -1;
+        break;
+    case '[':
+        /* tuple, possibly with labels, optional and rest elements */
+        if (next_token(s))
+            return -1;
+        while (s->token.val != ']') {
+            if (s->token.val == TOK_ELLIPSIS && next_token(s))
+                return -1;
+            if (ts_skip_type2(s, TS_L_LOWEST, TS_TYPE_TUPLE_LABELS))
+                return -1;
+            if (s->token.val == '?' && next_token(s))
+                return -1;
+            if (s->token.val == ':') {
+                if (next_token(s) || ts_skip_type(s))
+                    return -1;
+            }
+            if (s->token.val != ',')
+                break;
+            if (next_token(s))
+                return -1;
+        }
+        if (ts_expect(s, ']'))
+            return -1;
+        break;
+    case '{':
+        if (ts_skip_object_type(s))
+            return -1;
+        break;
+    default:
+        if (!ts_is_ident(s)) {
+            /* keyword used as tuple label: [function: T] */
+            if ((flags & TS_TYPE_TUPLE_LABELS) && token_is_ident(s->token.val)) {
+                if (next_token(s))
+                    return -1;
+                if (s->token.val != ':' && s->token.val != '?')
+                    return ts_error(s);
+                return 0;
+            }
+            return ts_error(s);
+        }
+        atom = s->token.u.ident.atom;
+        check_type_args = TRUE;
+        if (atom == s->ts_kw[TS_KW_keyof] || atom == s->ts_kw[TS_KW_readonly]) {
+            if (next_token(s))
+                return -1;
+            /* '[keyof: T]' and '{ [keyof in T]: U }' use it as a name */
+            if ((s->token.val != ':' && s->token.val != '?' &&
+                 s->token.val != TOK_IN) ||
+                !(flags & (TS_TYPE_INDEX_SIG | TS_TYPE_TUPLE_LABELS))) {
+                if (ts_skip_type2(s, TS_L_PREFIX, 0))
+                    return -1;
+            }
+            goto suffix;
+        } else if (atom == s->ts_kw[TS_KW_infer]) {
+            if (next_token(s))
+                return -1;
+            if ((s->token.val != ':' && s->token.val != '?' &&
+                 s->token.val != TOK_IN) ||
+                !(flags & (TS_TYPE_INDEX_SIG | TS_TYPE_TUPLE_LABELS))) {
+                if (!ts_is_ident(s))
+                    return ts_error(s);
+                if (next_token(s))
+                    return -1;
+                if (s->token.val == TOK_EXTENDS &&
+                    ts_try_skip_infer_constraint(s, flags))
+                    return -1;
+            }
+            goto suffix;
+        } else if (atom == s->ts_kw[TS_KW_unique]) {
+            if (next_token(s))
+                return -1;
+            if (ts_is_kw(s, TS_KW_symbol)) {
+                if (next_token(s))
+                    return -1;
+                goto suffix;
+            }
+        } else if (atom == s->ts_kw[TS_KW_abstract]) {
+            if (next_token(s))
+                return -1;
+            /* abstract constructor type */
+            if (s->token.val == TOK_NEW)
+                goto redo;
+        } else if (atom == s->ts_kw[TS_KW_asserts]) {
+            if (next_token(s))
+                return -1;
+            /* 'asserts x' and 'asserts x is T' */
+            if ((flags & TS_TYPE_RETURN) && !s->got_lf &&
+                (ts_is_ident(s) || s->token.val == TOK_THIS)) {
+                if (next_token(s))
+                    return -1;
+            }
+        } else {
+            check_type_args = !ts_is_primitive_type(s, atom);
+            if (next_token(s))
+                return -1;
+        }
+        /* 'x is T' type predicate */
+        if (ts_is_kw(s, TS_KW_is) && !s->got_lf) {
+            if (next_token(s))
+                return -1;
+            return ts_skip_type(s);
+        }
+        /* 'let x: T \n <U>y' must not become type arguments */
+        if (check_type_args && !s->got_lf &&
+            ts_skip_type_args(s, FALSE) < 0)
+            return -1;
+        break;
+    }
+
+ suffix:
+    for(;;) {
+        switch(s->token.val) {
+        case '|':
+            if (level >= TS_L_OR)
+                return 0;
+            if (next_token(s) || ts_skip_type2(s, TS_L_OR, flags))
+                return -1;
+            break;
+        case '&':
+            if (level >= TS_L_AND)
+                return 0;
+            if (next_token(s) || ts_skip_type2(s, TS_L_AND, flags))
+                return -1;
+            break;
+        case '!':
+            /* JSDoc non-nullable postfix, accepted like tsc */
+            if (s->got_lf)
+                return 0;
+            if (next_token(s))
+                return -1;
+            break;
+        case '.':
+            if (next_token(s))
+                return -1;
+            if (!token_is_ident(s->token.val))
+                return ts_error(s);
+            if (next_token(s))
+                return -1;
+            if (!s->got_lf && ts_skip_type_args(s, FALSE) < 0)
+                return -1;
+            break;
+        case '[':
+            /* indexed access or array type, not across lines */
+            if (s->got_lf)
+                return 0;
+            if (next_token(s))
+                return -1;
+            if (s->token.val != ']' && ts_skip_type(s))
+                return -1;
+            if (ts_expect(s, ']'))
+                return -1;
+            break;
+        case TOK_EXTENDS:
+            /* conditional type */
+            if (s->got_lf || (flags & TS_TYPE_NO_COND))
+                return 0;
+            if (next_token(s) ||
+                ts_skip_type2(s, TS_L_LOWEST, TS_TYPE_NO_COND) ||
+                ts_expect(s, '?') || ts_skip_type(s) ||
+                ts_expect(s, ':') || ts_skip_type(s))
+                return -1;
+            break;
+        default:
+            return 0;
+        }
+    }
+}
+
+/* object type, interface body or mapped type */
+static int ts_skip_object_type(JSParseState *s)
+{
+    BOOL found_key;
+
+    if (ts_expect(s, '{'))
+        return -1;
+    while (s->token.val != '}') {
+        /* '-readonly [K in T]: U' */
+        if ((s->token.val == '+' || s->token.val == '-') && next_token(s))
+            return -1;
+        /* modifiers and property name */
+        found_key = FALSE;
+        while (token_is_ident(s->token.val) || s->token.val == TOK_STRING ||
+               s->token.val == TOK_NUMBER) {
+            if (next_token(s))
+                return -1;
+            found_key = TRUE;
+        }
+        if (s->token.val == '[') {
+            /* index signature, mapped type or computed property */
+            if (next_token(s) ||
+                ts_skip_type2(s, TS_L_LOWEST, TS_TYPE_INDEX_SIG))
+                return -1;
+            if (s->token.val == ':') {
+                if (next_token(s) || ts_skip_type(s))
+                    return -1;
+            } else if (s->token.val == TOK_IN) {
+                if (next_token(s) || ts_skip_type(s))
+                    return -1;
+                if (ts_is_kw(s, TS_KW_as)) {
+                    /* key remapping */
+                    if (next_token(s) || ts_skip_type(s))
+                        return -1;
+                }
+            }
+            if (ts_expect(s, ']'))
+                return -1;
+            if ((s->token.val == '+' || s->token.val == '-') && next_token(s))
+                return -1;
+            found_key = TRUE;
+        }
+        if (found_key && (s->token.val == '?' || s->token.val == '!') &&
+            next_token(s))
+            return -1;
+        if (ts_skip_type_params(s, TS_TP_CONST) < 0)
+            return -1;
+        switch(s->token.val) {
+        case ':':
+            if (!found_key)
+                return ts_error(s);
+            if (next_token(s) || ts_skip_type(s))
+                return -1;
+            break;
+        case '(':
+            /* method, call or construct signature */
+            if (ts_skip_fn_args(s))
+                return -1;
+            if (s->token.val == ':') {
+                if (next_token(s) || ts_skip_return_type(s))
+                    return -1;
+            }
+            break;
+        default:
+            if (!found_key)
+                return ts_error(s);
+            break;
+        }
+        switch(s->token.val) {
+        case '}':
+            break;
+        case ',':
+        case ';':
+            if (next_token(s))
+                return -1;
+            break;
+        default:
+            if (!s->got_lf)
+                return ts_error(s);
+            break;
+        }
+    }
+    return ts_expect(s, '}');
+}
+
+/* tsc's isBinaryOperator() */
+static BOOL ts_is_binary_operator(JSParseState *s)
+{
+    switch(s->token.val) {
+    case TOK_IN:
+    case TOK_DOUBLE_QUESTION_MARK:
+    case TOK_LOR:
+    case TOK_LAND:
+    case '|':
+    case '^':
+    case '&':
+    case TOK_EQ:
+    case TOK_NEQ:
+    case TOK_STRICT_EQ:
+    case TOK_STRICT_NEQ:
+    case '<':
+    case '>':
+    case TOK_LTE:
+    case TOK_GTE:
+    case TOK_INSTANCEOF:
+    case TOK_SHL:
+    case TOK_SAR:
+    case TOK_SHR:
+    case '+':
+    case '-':
+    case '*':
+    case '/':
+    case '%':
+    case TOK_POW:
+        return TRUE;
+    default:
+        return ts_is_kw(s, TS_KW_as) || ts_is_kw(s, TS_KW_satisfies);
+    }
+}
+
+/* tsc's isStartOfExpression() */
+static BOOL ts_is_start_of_expression(JSParseState *s)
+{
+    switch(s->token.val) {
+    case TOK_THIS:
+    case TOK_SUPER:
+    case TOK_NULL:
+    case TOK_TRUE:
+    case TOK_FALSE:
+    case TOK_NUMBER:
+    case TOK_STRING:
+    case TOK_TEMPLATE:
+    case '(':
+    case '[':
+    case '{':
+    case TOK_FUNCTION:
+    case TOK_CLASS:
+    case TOK_NEW:
+    case '/':
+    case TOK_DIV_ASSIGN:
+    case '+':
+    case '-':
+    case '~':
+    case '!':
+    case TOK_DELETE:
+    case TOK_TYPEOF:
+    case TOK_VOID:
+    case TOK_INC:
+    case TOK_DEC:
+    case '<':
+    case TOK_PRIVATE_NAME:
+    case '@':
+        return TRUE;
+    case TOK_IMPORT:
+        {
+            int tok = peek_token(s, FALSE);
+            return tok == '(' || tok == '<' || tok == '.';
+        }
+    default:
+        return ts_is_ident(s) || ts_is_binary_operator(s);
+    }
+}
+
+/* tsc's canFollowTypeArgumentsInExpression() */
+static BOOL ts_can_follow_type_args(JSParseState *s)
+{
+    switch(s->token.val) {
+    case '(':
+    case TOK_TEMPLATE:
+        return TRUE;
+    case '<':
+    case '>':
+    case '+':
+    case '-':
+    case TOK_GTE:
+    case TOK_SAR:
+    case TOK_SHR:
+    case TOK_SAR_ASSIGN:
+    case TOK_SHR_ASSIGN:
+        return FALSE;
+    default:
+        return s->got_lf || ts_is_binary_operator(s) ||
+            !ts_is_start_of_expression(s);
+    }
+}
+
+/* type arguments of a call, 'new', tagged template or instantiation
+   expression. Return 1 if skipped, 0 if not (position restored), -1 if
+   error. */
+static int ts_try_skip_type_args_in_expr(JSParseState *s)
+{
+    JSParsePos pos;
+    BOOL ok;
+
+    if (!ts_is_lt(s->token.val))
+        return 0;
+    ts_spec_begin(s, &pos);
+    ok = ts_skip_type_args(s, TRUE) > 0 && ts_can_follow_type_args(s);
+    if (ts_spec_end(s, &pos, ok))
+        return -1;
+    return ok;
+}
+
+/* skip the parameter list of an arrow function with type annotations */
+static int ts_skip_arrow_params(JSParseState *s)
+{
+    if (ts_expect(s, '('))
+        return -1;
+    while (s->token.val != ')') {
+        if (s->token.val == TOK_ELLIPSIS && next_token(s))
+            return -1;
+        if (ts_skip_binding(s))
+            return -1;
+        if (s->token.val == '?' && next_token(s))
+            return -1;
+        if (s->token.val == ':') {
+            if (next_token(s) || ts_skip_type(s))
+                return -1;
+        }
+        if (s->token.val == '=') {
+            if (next_token(s) || ts_skip_tokens(s, TS_SKIP_COMMA))
+                return -1;
+        }
+        if (s->token.val != ',')
+            break;
+        if (next_token(s))
+            return -1;
+    }
+    return ts_expect(s, ')');
+}
+
+/* The current token is '(' and the matching ')' is not followed by
+   '=>'. Return TRUE if it starts an arrow function with a return type
+   '(a: T): U => body'. After the '?' of a conditional ('after_q'), the
+   colon is a return type only if another ':' follows the arrow body
+   (tsc semantics: 'a ? (b) : c => d' is a conditional expression,
+   'a ? (b) : c => d : e' contains an arrow function). */
+static int ts_is_arrow_with_return_type(JSParseState *s, BOOL after_q)
+{
+    JSParsePos pos;
+    BOOL ok;
+
+    ts_spec_begin(s, &pos);
+    ok = !ts_skip_arrow_params(s) && s->token.val == ':' &&
+        !next_token(s) && !ts_skip_return_type(s) &&
+        s->token.val == TOK_ARROW && !s->got_lf;
+    if (ok && after_q) {
+        ok = !next_token(s);
+        if (ok) {
+            if (s->token.val == '{')
+                ok = !ts_skip_balanced(s);
+            else
+                ok = !ts_skip_tokens(s, TS_SKIP_COMMA);
+        }
+        ok = ok && s->token.val == ':';
+    }
+    if (ts_spec_end(s, &pos, FALSE))
+        return -1;
+    return ok;
+}
+
+/* The current token is '<' in an expression. Return TRUE if it starts a
+   generic arrow function '<T>(x: T) => x'. */
+static int ts_is_generic_arrow(JSParseState *s)
+{
+    JSParsePos pos;
+    int ret;
+    BOOL ok;
+
+    ts_spec_begin(s, &pos);
+    ret = ts_skip_type_params(s, TS_TP_CONST);
+    ok = ret > 0 && s->token.val == '(';
+    if (ok) {
+        if (js_parse_skip_parens_token(s, NULL, TRUE) == TOK_ARROW) {
+            ok = TRUE;
+        } else {
+            ok = !ts_skip_arrow_params(s) && s->token.val == ':' &&
+                !next_token(s) && !ts_skip_return_type(s) &&
+                s->token.val == TOK_ARROW;
+        }
+    }
+    if (ts_spec_end(s, &pos, FALSE))
+        return -1;
+    return ok;
+}
+
+/* skip an optional ': type' annotation */
+static int ts_skip_type_annotation(JSParseState *s)
+{
+    if (s->token.val != ':')
+        return 0;
+    if (next_token(s))
+        return -1;
+    return ts_skip_type(s);
+}
+
+/* the current token is '(': return 1 if it starts an arrow function, 0
+   if not, -1 if error */
+static int js_parse_is_arrow_paren(JSParseState *s, BOOL after_q)
+{
+    int tok = js_parse_skip_parens_token(s, NULL, TRUE);
+    if (tok == TOK_ARROW)
+        return 1;
+    if (s->ts && tok == ':')
+        return ts_is_arrow_with_return_type(s, after_q);
+    return 0;
+}
+
+/* The current token starts a function declaration. If it is an overload
+   signature or a 'declare function' (no body), skip it and return 1.
+   Otherwise return 0 with the position unchanged. */
+static int ts_skip_function_signature(JSParseState *s)
+{
+    JSParsePos pos;
+    BOOL ok = TRUE;
+
+    ts_spec_begin(s, &pos);
+    if (token_is_pseudo_keyword(s, JS_ATOM_async))
+        ok = !next_token(s);
+    ok = ok && s->token.val == TOK_FUNCTION && !next_token(s);
+    if (ok && s->token.val == '*')
+        ok = !next_token(s);
+    if (ok && token_is_ident(s->token.val))
+        ok = !next_token(s);
+    if (ok && s->token.val == '<')
+        ok = ts_skip_type_params(s, TS_TP_CONST) >= 0;
+    ok = ok && s->token.val == '(' && !ts_skip_balanced(s);
+    if (ok && s->token.val == ':')
+        ok = !next_token(s) && !ts_skip_return_type(s);
+    ok = ok && s->token.val != '{';
+    if (ts_spec_end(s, &pos, ok))
+        return -1;
+    if (!ok)
+        return 0;
+    s->ts_type_only_stmt = TRUE;
+    if (js_parse_expect_semi(s))
+        return -1;
+    return 1;
+}
+
+/* accessibility, 'readonly' or 'override' modifier of a parameter */
+static BOOL ts_is_param_modifier(JSParseState *s)
+{
+    JSAtom atom = ts_token_atom(s);
+    int tok;
+    if (atom != s->ts_kw[TS_KW_public] && atom != s->ts_kw[TS_KW_private] &&
+        atom != s->ts_kw[TS_KW_protected] &&
+        atom != s->ts_kw[TS_KW_readonly] && atom != s->ts_kw[TS_KW_override])
+        return FALSE;
+    /* otherwise it is the parameter name */
+    tok = peek_token(s, FALSE);
+    return tok == TOK_IDENT || tok == TOK_OF || tok == '{' || tok == '[';
+}
+
+/* record the parameter properties of a constructor (parameters with a
+   modifier) before its parameters are parsed */
+static int ts_scan_param_props(JSParseState *s, JSFunctionDef *fd)
+{
+    JSParsePos pos;
+    int ret = 0;
+    BOOL has_mod;
+
+    if (s->token.val != '(')
+        return 0;
+    ts_spec_begin(s, &pos);
+    if (next_token(s))
+        goto done;
+    while (s->token.val != ')') {
+        has_mod = FALSE;
+        while (s->token.val == '@') {
+            /* parameter decorator */
+            if (next_token(s))
+                goto done;
+            if (s->token.val == '(') {
+                if (ts_skip_balanced(s))
+                    goto done;
+            } else {
+                for(;;) {
+                    if (!token_is_ident(s->token.val) || next_token(s))
+                        goto done;
+                    if (s->token.val != '.')
+                        break;
+                    if (next_token(s))
+                        goto done;
+                }
+                if (ts_skip_type_args(s, TRUE) < 0)
+                    goto done;
+                if (s->token.val == '(' && ts_skip_balanced(s))
+                    goto done;
+            }
+        }
+        while (ts_is_param_modifier(s)) {
+            has_mod = TRUE;
+            if (next_token(s))
+                goto done;
+        }
+        if (s->token.val == TOK_ELLIPSIS && next_token(s))
+            goto done;
+        if (has_mod && s->token.val == TOK_IDENT) {
+            if (js_resize_array(s->ctx, (void **)&fd->ts_param_props,
+                                sizeof(fd->ts_param_props[0]),
+                                &fd->ts_param_prop_size,
+                                fd->ts_param_prop_count + 1)) {
+                ret = -1;
+                goto done;
+            }
+            fd->ts_param_props[fd->ts_param_prop_count++] =
+                JS_DupAtom(s->ctx, s->token.u.ident.atom);
+        }
+        if (ts_skip_binding(s))
+            goto done;
+        if (s->token.val == '?' && next_token(s))
+            goto done;
+        if (ts_skip_type_annotation(s))
+            goto done;
+        if (s->token.val == '=') {
+            if (next_token(s) || ts_skip_tokens(s, TS_SKIP_COMMA))
+                goto done;
+        }
+        if (s->token.val != ',')
+            break;
+        if (next_token(s))
+            goto done;
+    }
+ done:
+    if (ts_spec_end(s, &pos, FALSE))
+        return -1;
+    return ret;
+}
+
+/* return TRUE if the next token can start a class member name, i.e. the
+   current identifier is a modifier */
+static BOOL ts_next_is_member_name(JSParseState *s, BOOL same_line)
+{
+    int tok = peek_token(s, same_line);
+    return tok == TOK_IDENT || tok == TOK_IN || tok == TOK_OF ||
+        tok == TOK_IMPORT || tok == TOK_EXPORT || tok == TOK_FUNCTION ||
+        tok == '[' || tok == '\'' || tok == '"' || tok == '#' ||
+        tok == '*' || tok == '.' || (tok >= '0' && tok <= '9');
+}
+
+/* skip the accessibility, 'readonly' and 'override' modifiers of a
+   class member */
+static int ts_skip_member_modifiers(JSParseState *s)
+{
+    for(;;) {
+        JSAtom atom = ts_token_atom(s);
+        if (atom != s->ts_kw[TS_KW_public] &&
+            atom != s->ts_kw[TS_KW_private] &&
+            atom != s->ts_kw[TS_KW_protected] &&
+            atom != s->ts_kw[TS_KW_readonly] &&
+            atom != s->ts_kw[TS_KW_override])
+            return 0;
+        if (!ts_next_is_member_name(s, FALSE))
+            return 0;
+        if (next_token(s))
+            return -1;
+    }
+}
+
+/* If the class member at the current position emits no code (index
+   signature, method overload signature, 'declare' or 'abstract'
+   member), skip it and return 1. Otherwise return 0 with the position
+   unchanged. */
+static int ts_skip_class_member(JSParseState *s)
+{
+    JSParsePos pos;
+    JSAtom atom;
+    BOOL ok = TRUE, no_code = FALSE;
+
+    ts_spec_begin(s, &pos);
+    /* modifiers */
+    for(;;) {
+        atom = ts_token_atom(s);
+        if (atom == JS_ATOM_NULL)
+            break;
+        if (atom == s->ts_kw[TS_KW_declare] ||
+            atom == s->ts_kw[TS_KW_abstract]) {
+            if (!ts_next_is_member_name(s, TRUE))
+                break;
+            no_code = TRUE;
+        } else if (atom == s->ts_kw[TS_KW_public] ||
+                   atom == s->ts_kw[TS_KW_private] ||
+                   atom == s->ts_kw[TS_KW_protected] ||
+                   atom == s->ts_kw[TS_KW_readonly] ||
+                   atom == s->ts_kw[TS_KW_override] ||
+                   atom == s->ts_kw[TS_KW_static] ||
+                   atom == s->ts_kw[TS_KW_async] ||
+                   atom == s->ts_kw[TS_KW_get] ||
+                   atom == s->ts_kw[TS_KW_set] ||
+                   atom == s->ts_kw[TS_KW_accessor]) {
+            if (!ts_next_is_member_name(s, FALSE))
+                break;
+        } else {
+            break;
+        }
+        if (next_token(s)) {
+            ok = FALSE;
+            goto done;
+        }
+    }
+    if (s->token.val == '*' && next_token(s)) {
+        ok = FALSE;
+        goto done;
+    }
+    /* member name */
+    if (s->token.val == '[') {
+        ok = !next_token(s);
+        if (ok && ts_is_ident(s) && peek_token(s, FALSE) == ':') {
+            /* index signature '[key: K]: T' */
+            ok = !next_token(s) && !next_token(s) && !ts_skip_type(s) &&
+                !ts_expect(s, ']') && !ts_skip_type_annotation(s);
+            no_code = TRUE;
+            goto done;
+        }
+        ok = ok && !ts_skip_tokens(s, 0) && s->token.val == ']' &&
+            !next_token(s);
+    } else if (token_is_ident(s->token.val) || s->token.val == TOK_STRING ||
+               s->token.val == TOK_NUMBER || s->token.val == TOK_PRIVATE_NAME) {
+        ok = !next_token(s);
+    } else {
+        ok = FALSE;
+    }
+    if (!ok)
+        goto done;
+    if ((s->token.val == '?' || s->token.val == '!') && next_token(s)) {
+        ok = FALSE;
+        goto done;
+    }
+    if (s->token.val == '<' || s->token.val == '(') {
+        /* method: no code if no body */
+        ok = ts_skip_type_params(s, TS_TP_CONST) >= 0 &&
+            s->token.val == '(' && !ts_skip_balanced(s);
+        if (ok && s->token.val == ':')
+            ok = !next_token(s) && !ts_skip_return_type(s);
+        if (ok && s->token.val != '{')
+            no_code = TRUE;
+    } else if (no_code) {
+        /* 'declare' or 'abstract' field */
+        ok = !ts_skip_type_annotation(s);
+        if (ok && s->token.val == '=')
+            ok = !next_token(s) && !ts_skip_tokens(s, TS_SKIP_COMMA | TS_SKIP_LF);
+    }
+ done:
+    ok = ok && no_code;
+    if (ts_spec_end(s, &pos, ok))
+        return -1;
+    if (!ok)
+        return 0;
+    if (s->token.val == ';' && next_token(s))
+        return -1;
+    return 1;
+}
+
+/* 'this.x = undefined' field definitions for the parameter properties */
+static void ts_emit_param_prop_decls(JSParseState *s, JSFunctionDef *fd)
+{
+    int i;
+    for(i = 0; i < fd->ts_param_prop_count; i++) {
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, JS_ATOM_this);
+        emit_u16(s, 0);
+        emit_op(s, OP_undefined);
+        emit_op(s, OP_define_field);
+        emit_atom(s, fd->ts_param_props[i]);
+        emit_op(s, OP_drop);
+    }
+}
+
+/* 'this.x = x' for the parameter properties */
+static void ts_emit_param_prop_assigns(JSParseState *s, JSFunctionDef *fd)
+{
+    int i;
+    for(i = 0; i < fd->ts_param_prop_count; i++) {
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, JS_ATOM_this);
+        emit_u16(s, 0);
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, fd->ts_param_props[i]);
+        emit_u16(s, s->cur_func->scope_level);
+        emit_op(s, OP_put_field);
+        emit_atom(s, fd->ts_param_props[i]);
+    }
+}
+
 static void set_object_name(JSParseState *s, JSAtom name)
 {
     JSFunctionDef *fd = s->cur_func;
@@ -26553,7 +28098,7 @@ static __exception int js_parse_object_literal(JSParseState *s)
             emit_u16(s, s->cur_func->scope_level);
             emit_op(s, OP_define_field);
             emit_atom(s, name);
-        } else if (s->token.val == '(') {
+        } else if (s->token.val == '(' || (s->ts && s->token.val == '<')) {
             BOOL is_getset = (prop_type == PROP_TYPE_GET ||
                               prop_type == PROP_TYPE_SET);
             JSParseFunctionEnum func_type;
@@ -26755,6 +28300,23 @@ static void emit_class_field_init(JSParseState *s)
     emit_op(s, OP_drop);
 }
 
+/* after super() returns: initialize the class fields, preceded by the
+   TypeScript parameter property fields and followed by their
+   assignments */
+static void emit_super_call_init(JSParseState *s)
+{
+    JSFunctionDef *fd = s->cur_func;
+    while (fd->func_type == JS_PARSE_FUNC_ARROW && fd->parent)
+        fd = fd->parent;
+    if (!fd->is_derived_class_constructor)
+        fd = NULL;
+    if (fd)
+        ts_emit_param_prop_decls(s, fd);
+    emit_class_field_init(s);
+    if (fd)
+        ts_emit_param_prop_assigns(s, fd);
+}
+
 /* build a private setter function name from the private getter name */
 static JSAtom get_private_setter_name(JSContext *ctx, JSAtom name)
 {
@@ -26852,6 +28414,10 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         js_parse_error(s, "class statement requires a name");
         goto fail;
     }
+    if (s->ts && s->token.val == '<') {
+        if (ts_skip_type_params(s, TS_TP_IN_OUT | TS_TP_CONST) < 0)
+            goto fail;
+    }
     if (!is_class_expr) {
         if (class_name == JS_ATOM_NULL)
             class_var_name = JS_ATOM__default_; /* export default */
@@ -26868,8 +28434,17 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             goto fail;
         if (js_parse_left_hand_side_expr(s))
             goto fail;
+        /* 'extends Base<T>' */
+        if (s->ts && ts_skip_type_args(s, FALSE) < 0)
+            goto fail;
     } else {
         emit_op(s, OP_undefined);
+    }
+    if (s->ts && ts_is_kw(s, TS_KW_implements)) {
+        do {
+            if (next_token(s) || ts_skip_type(s))
+                goto fail;
+        } while (s->token.val == ',');
     }
 
     /* add a 'const' definition for the class name */
@@ -26918,10 +28493,50 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 goto fail;
             continue;
         }
+        /* decorators */
+        has_decs = FALSE;
+        thunk.fd = NULL;
+        thunk.count = 0;
+        key_var = JS_ATOM_NULL;
+        de = NULL;
+        if (s->token.val == '@') {
+            has_decs = TRUE;
+            if (legacy) {
+                if (js_new_dec_thunk(s, fd, &thunk) ||
+                    js_parse_decorators(s, &thunk))
+                    goto fail;
+            } else {
+                if (js_parse_decorators(s, NULL))
+                    goto fail;
+                dec_var = class_dec_define_var(s, &cl);
+                if (dec_var == JS_ATOM_NULL)
+                    goto fail;
+                emit_scope_put_var_init(s, dec_var);
+            }
+        }
+        if (s->ts) {
+            /* index signatures, overloads, 'declare' and 'abstract'
+               members: no code */
+            ret = ts_skip_class_member(s);
+            if (ret < 0)
+                goto fail;
+            if (ret) {
+                /* decorators on a member without code are ignored */
+                JS_FreeAtom(ctx, dec_var);
+                dec_var = JS_ATOM_NULL;
+                if (thunk.fd)
+                    emit_dec_thunk_finish(s, &thunk);
+                continue;
+            }
+            if (ts_skip_member_modifiers(s))
+                goto fail;
+        }
         is_static = FALSE;
         if (s->token.val == TOK_STATIC) {
             int next = peek_token(s, FALSE);
-            if (!(next == ';' || next == '}' || next == '(' || next == '='))
+            if (!(next == ';' || next == '}' || next == '(' || next == '=' ||
+                  (s->ts && (next == ':' || next == '?' || next == '!' ||
+                             next == '<'))))
                 is_static = TRUE;
         }
         prop_type = -1;
@@ -26970,12 +28585,33 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 prop_type = PROP_TYPE_IDENT;
             }
         }
-        if (is_static)
+        if (is_static) {
             emit_op(s, OP_swap);
+            if (s->ts && ts_skip_member_modifiers(s))
+                goto fail;
+        }
+        /* auto-accessor: 'accessor' [no LineTerminator here] ClassElementName */
+        is_accessor = FALSE;
+        if (prop_type < 0 && token_is_pseudo_keyword(s, JS_ATOM_accessor)) {
+            int tok = peek_token(s, TRUE);
+            if (tok == TOK_IDENT || tok == TOK_STRING || tok == TOK_NUMBER ||
+                tok == '[' || tok == '#' || tok == '\'' || tok == '"' ||
+                (tok >= '0' && tok <= '9') ||
+                (tok >= TOK_FIRST_KEYWORD && tok <= TOK_LAST_KEYWORD)) {
+                is_accessor = TRUE;
+                if (next_token(s))
+                    goto fail;
+            }
+        }
         start_ptr = s->token.ptr;
         if (prop_type < 0) {
             prop_type = js_parse_property_name(s, &name, TRUE, FALSE, TRUE);
             if (prop_type < 0)
+                goto fail;
+        }
+        if (s->ts && s->token.val == '?') {
+            /* optional field or method */
+            if (next_token(s))
                 goto fail;
         }
         is_private = prop_type & PROP_TYPE_PRIVATE;
@@ -26987,6 +28623,51 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
             name == JS_ATOM_hash_constructor) {
             js_parse_error(s, "invalid method name");
             goto fail;
+        }
+        if (has_decs || (legacy && name == JS_ATOM_NULL)) {
+            BOOL is_field = is_accessor ||
+                (prop_type == PROP_TYPE_IDENT && s->token.val != '(' &&
+                 !(s->ts && s->token.val == '<'));
+            if ((name == JS_ATOM_constructor && !is_static && !is_field) ||
+                (legacy && is_private && has_decs)) {
+                js_parse_error(s, "decorators are not valid here");
+                goto fail;
+            }
+            if (name == JS_ATOM_NULL && !is_field) {
+                /* save the computed property key */
+                key_var = class_dec_define_var(s, &cl);
+                if (key_var == JS_ATOM_NULL)
+                    goto fail;
+                emit_op(s, OP_to_propkey);
+                emit_op(s, OP_dup);
+                emit_scope_put_var_init(s, key_var);
+            }
+            if (has_decs) {
+                de = class_dec_add(s, &cl);
+                if (!de)
+                    goto fail;
+                de->is_static = is_static;
+                de->is_private = is_private;
+                de->name = JS_DupAtom(ctx, name);
+                de->key_var = JS_DupAtom(ctx, key_var);
+                de->dec_var = dec_var;
+                dec_var = JS_ATOM_NULL;
+                if (is_accessor)
+                    de->kind = DEC_KIND_ACCESSOR;
+                else if (prop_type == PROP_TYPE_GET)
+                    de->kind = DEC_KIND_GETTER;
+                else if (prop_type == PROP_TYPE_SET)
+                    de->kind = DEC_KIND_SETTER;
+                else if (is_field)
+                    de->kind = DEC_KIND_FIELD;
+                else
+                    de->kind = DEC_KIND_METHOD;
+                if (!legacy && is_field) {
+                    de->rec_var = class_dec_define_var(s, &cl);
+                    if (de->rec_var == JS_ATOM_NULL)
+                        goto fail;
+                }
+            }
         }
         if (prop_type == PROP_TYPE_GET || prop_type == PROP_TYPE_SET) {
             BOOL is_set = prop_type - PROP_TYPE_GET;
@@ -27051,7 +28732,9 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 }
                 emit_u8(s, OP_DEFINE_METHOD_GETTER + is_set);
             }
-        } else if (prop_type == PROP_TYPE_IDENT && s->token.val != '(') {
+        } else if (is_accessor ||
+                   (prop_type == PROP_TYPE_IDENT && s->token.val != '(' &&
+                    !(s->ts && s->token.val == '<'))) {
             ClassFieldsDef *cf = &class_fields[is_static];
             JSAtom field_var_name = JS_ATOM_NULL;
 
@@ -27113,6 +28796,22 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 emit_u16(s, s->cur_func->scope_level);
             }
 
+            if (s->ts) {
+                /* definite assignment assertion and type annotation */
+                if (s->token.val == '!' && next_token(s))
+                    goto field_fail;
+                if (de && legacy && s->ts_decorator_metadata) {
+                    TSMeta m;
+                    if (ts_meta_get_annotation(s, &m))
+                        goto field_fail;
+                    ret = emit_dec_metadata(s, &thunk, "design:type", &m);
+                    ts_meta_free(ctx, &m);
+                    if (ret)
+                        goto field_fail;
+                }
+                if (ts_skip_type_annotation(s))
+                    goto field_fail;
+            }
             if (s->token.val == '=') {
                 if (next_token(s))
                     goto fail;
@@ -27786,6 +29485,13 @@ static __exception int js_define_var(JSParseState *s, JSAtom name, int tok)
     JSFunctionDef *fd = s->cur_func;
     JSVarDefEnum var_def_type;
 
+    if (s->ts_export_ns && fd->ts_ns == s->ts_export_ns && tok != TOK_CATCH) {
+        /* 'export var x' in a namespace: 'x' is a property of the
+           namespace object, the stores to 'x' are resolved as such */
+        if (!ts_ns_add_member(s->ctx, s->ts_export_ns, name))
+            return -1;
+        return 0;
+    }
     if (name == JS_ATOM_yield && fd->func_kind == JS_FUNC_GENERATOR) {
         return js_parse_error(s, "yield is a reserved identifier");
     }
@@ -28339,6 +30045,13 @@ static int js_parse_destructuring_element(JSParseState *s, int tok, int is_arg,
             return -1;
     } else {
         return js_parse_error(s, "invalid assignment syntax");
+    }
+    if (s->ts && tok != 0 && (s->token.val == '?' || s->token.val == ':')) {
+        /* type annotation of a binding pattern */
+        if (s->token.val == '?' && next_token(s))
+            return -1;
+        if (ts_skip_type_annotation(s))
+            return -1;
     }
     if (s->token.val == '=' && allow_initializer) {
         label_done = emit_goto(s, OP_goto, -1);
@@ -28927,7 +30640,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                         emit_atom(s, JS_ATOM_this);
                         emit_u16(s, 0);
 
-                        emit_class_field_init(s);
+                        emit_super_call_init(s);
                     } else if (call_type == FUNC_CALL_NEW) {
                         /* obj func array -> func obj array */
                         emit_op(s, OP_perm3);
@@ -28972,7 +30685,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                         emit_atom(s, JS_ATOM_this);
                         emit_u16(s, 0);
 
-                        emit_class_field_init(s);
+                        emit_super_call_init(s);
                     } else if (call_type == FUNC_CALL_NEW) {
                         emit_op(s, OP_call_constructor);
                         emit_u16(s, arg_count);
@@ -29048,6 +30761,17 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
             } else {
                 emit_op(s, OP_get_array_el);
             }
+        } else if (s->ts && s->token.val == '!' && !s->got_lf) {
+            /* TypeScript non-null assertion 'x!' */
+            if (next_token(s))
+                return -1;
+        } else if (s->ts && ts_is_lt(s->token.val)) {
+            /* TypeScript type arguments 'f<T>(x)', 'new C<T>()', 'f<T>' */
+            int ret = ts_try_skip_type_args_in_expr(s);
+            if (ret < 0)
+                return -1;
+            if (!ret)
+                break;
         } else {
             break;
         }
@@ -29248,6 +30972,16 @@ static __exception int js_parse_unary(JSParseState *s, int parse_flags)
             return -1;
         parse_flags = 0;
         break;
+    case '<':
+        if (!s->ts)
+            goto postfix_expr;
+        /* TypeScript type assertion '<T>x' */
+        if (next_token(s) || ts_skip_type(s) || ts_expect_gt(s))
+            return -1;
+        if (js_parse_unary(s, PF_POW_FORBIDDEN))
+            return -1;
+        parse_flags = 0;
+        break;
     case TOK_AWAIT:
         if (!(s->cur_func->func_kind & JS_FUNC_ASYNC))
             return js_parse_error(s, "unexpected 'await' keyword");
@@ -29262,6 +30996,7 @@ static __exception int js_parse_unary(JSParseState *s, int parse_flags)
         parse_flags = 0;
         break;
     default:
+    postfix_expr:
         if (js_parse_postfix_expr(s, PF_POSTFIX_CALL))
             return -1;
         if (!s->got_lf &&
@@ -29304,13 +31039,13 @@ static __exception int js_parse_unary(JSParseState *s, int parse_flags)
     return 0;
 }
 
+static __exception int js_parse_expr_binary_rest(JSParseState *s, int level,
+                                                 int parse_flags);
+
 /* allowed parse_flags: PF_IN_ACCEPTED */
 static __exception int js_parse_expr_binary(JSParseState *s, int level,
                                             int parse_flags)
 {
-    int op, opcode;
-    const uint8_t *op_token_ptr;
-    
     if (level == 0) {
         return js_parse_unary(s, PF_POW_ALLOWED);
     } else if (s->token.val == TOK_PRIVATE_NAME &&
@@ -29339,9 +31074,40 @@ static __exception int js_parse_expr_binary(JSParseState *s, int level,
         if (js_parse_expr_binary(s, level - 1, parse_flags))
             return -1;
     }
+    return js_parse_expr_binary_rest(s, level, parse_flags);
+}
+
+/* the operators of 'level' following the left operand */
+static __exception int js_parse_expr_binary_rest(JSParseState *s, int level,
+                                                 int parse_flags)
+{
+    int op, opcode, l;
+    const uint8_t *op_token_ptr;
+
     for(;;) {
         op = s->token.val;
         op_token_ptr = s->token.ptr;
+        if (level == 4 && s->ts && !s->got_lf &&
+            (ts_is_kw(s, TS_KW_as) || ts_is_kw(s, TS_KW_satisfies))) {
+            /* TypeScript 'x as T', 'x as const', 'x satisfies T': same
+               precedence as the relational operators, but the operators
+               of higher precedence apply to the result as with tsc
+               ('x as T * 2' is '(x as T) * 2') */
+            if (next_token(s) || ts_skip_type(s))
+                return -1;
+            if (s->token.val == TOK_POW) {
+                op_token_ptr = s->token.ptr;
+                if (next_token(s) || js_parse_unary(s, PF_POW_ALLOWED))
+                    return -1;
+                emit_source_pos(s, op_token_ptr);
+                emit_op(s, OP_pow);
+            }
+            for(l = 1; l < 4; l++) {
+                if (js_parse_expr_binary_rest(s, l, parse_flags))
+                    return -1;
+            }
+            continue;
+        }
         switch(level) {
         case 1:
             switch(op) {
@@ -29553,6 +31319,7 @@ static __exception int js_parse_cond_expr(JSParseState *s, int parse_flags)
             return -1;
         label1 = emit_goto(s, OP_if_false, -1);
 
+        s->ts_after_question = s->ts;
         if (js_parse_assign_expr(s))
             return -1;
         if (js_parse_expect(s, ':'))
@@ -29573,9 +31340,14 @@ static __exception int js_parse_cond_expr(JSParseState *s, int parse_flags)
 /* allowed parse_flags: PF_IN_ACCEPTED */
 static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
 {
-    int opcode, op, scope, skip_bits;
+    int opcode, op, scope, skip_bits, ret;
     JSAtom name0 = JS_ATOM_NULL;
     JSAtom name;
+    BOOL after_q;
+
+    /* only the first token of the 'b' of 'a ? b : c' is concerned */
+    after_q = s->ts_after_question;
+    s->ts_after_question = FALSE;
 
     if (s->token.val == TOK_YIELD) {
         BOOL is_star = FALSE, is_async;
@@ -29715,7 +31487,16 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
         }
         return 0;
     } else if (s->token.val == '(' &&
-               js_parse_skip_parens_token(s, NULL, TRUE) == TOK_ARROW) {
+               (ret = js_parse_is_arrow_paren(s, after_q)) != 0) {
+        if (ret < 0)
+            return -1;
+        return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
+                                      JS_FUNC_NORMAL, JS_ATOM_NULL,
+                                      s->token.ptr);
+    } else if (s->ts && s->token.val == '<' &&
+               (ret = ts_is_generic_arrow(s)) != 0) {
+        if (ret < 0)
+            return -1;
         return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
                                       s->token.ptr);
@@ -29733,8 +31514,8 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
         js_parse_get_pos(s, &pos);
         if (next_token(s))
             return -1;
-        if ((s->token.val == '(' &&
-             js_parse_skip_parens_token(s, NULL, TRUE) == TOK_ARROW) ||
+        if ((s->token.val == '(' && js_parse_is_arrow_paren(s, FALSE) > 0) ||
+            (s->ts && s->token.val == '<' && ts_is_generic_arrow(s) > 0) ||
             (s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved &&
              peek_token(s, TRUE) == TOK_ARROW)) {
             return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
@@ -30250,7 +32031,18 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
             }
             if (next_token(s))
                 goto var_error;
-            if (js_define_var(s, name, tok))
+            if (s->ts) {
+                /* definite assignment assertion and type annotation */
+                if (s->token.val == '!' && next_token(s))
+                    goto var_error;
+                if (ts_skip_type_annotation(s))
+                    goto var_error;
+            }
+            if (is_using) {
+                method_idx = js_define_using_var(s, name, is_await);
+                if (method_idx < 0)
+                    goto var_error;
+            } else if (js_define_var(s, name, tok)) {
                 goto var_error;
             if (export_flag) {
                 if (!add_export_entry(s, s->cur_func->module, name, name,
@@ -30295,7 +32087,8 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                     js_parse_error(s, "missing initializer for const variable");
                     goto var_error;
                 }
-                if (tok == TOK_LET) {
+                if (tok == TOK_LET &&
+                    !(s->ts_export_ns && fd->ts_ns == s->ts_export_ns)) {
                     /* initialize lexical variable upon entering its scope */
                     emit_op(s, OP_undefined);
                     emit_op(s, OP_scope_put_var_init);
@@ -30306,8 +32099,12 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
             JS_FreeAtom(ctx, name);
         } else {
             int skip_bits;
-            if ((s->token.val == '[' || s->token.val == '{')
-            &&  js_parse_skip_parens_token(s, &skip_bits, FALSE) == '=') {
+            int tok1;
+            if (is_using) {
+                return js_parse_error(s, "binding patterns are not allowed in using declarations");
+            } else if ((s->token.val == '[' || s->token.val == '{')
+            &&  ((tok1 = js_parse_skip_parens_token(s, &skip_bits, FALSE)) == '=' ||
+                 (s->ts && tok1 == ':'))) {
                 emit_op(s, OP_undefined);
                 if (js_parse_destructuring_element(s, tok, 0, TRUE, skip_bits & SKIP_HAS_ELLIPSIS, TRUE, export_flag) < 0)
                     return -1;
@@ -30621,6 +32418,1187 @@ static void set_eval_ret_undefined(JSParseState *s)
     }
 }
 
+/* TypeScript declarations */
+
+static __exception int js_parse_source_element(JSParseState *s);
+static JSExportEntry *find_export_entry(JSContext *ctx, JSModuleDef *m,
+                                        JSAtom export_name);
+static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd);
+
+static BOOL ts_is_ident_tok(int tok)
+{
+    return tok == TOK_IDENT || (tok >= TOK_IMPLEMENTS && tok <= TOK_AWAIT);
+}
+
+/* record a module top level name that only denotes a type, so that
+   'export { T }' can be dropped */
+static int ts_add_type_name(JSParseState *s, JSAtom name)
+{
+    JSFunctionDef *fd = s->cur_func;
+    if (!fd->module || fd->scope_level != fd->body_scope)
+        return 0;
+    if (js_resize_array(s->ctx, (void **)&fd->ts_type_names,
+                        sizeof(fd->ts_type_names[0]),
+                        &fd->ts_type_name_size, fd->ts_type_name_count + 1))
+        return -1;
+    fd->ts_type_names[fd->ts_type_name_count++] = JS_DupAtom(s->ctx, name);
+    return 0;
+}
+
+static TSNamespace *ts_find_decl(JSFunctionDef *fd, JSAtom name,
+                                 int scope_level)
+{
+    TSNamespace *ns;
+    for(ns = fd->ts_decls; ns; ns = ns->next) {
+        if (ns->name == name && ns->scope_level == scope_level)
+            return ns;
+    }
+    return NULL;
+}
+
+/* parse time lookup of an enum or namespace visible from the current
+   scope (used to evaluate enum member constants) */
+static TSNamespace *ts_lookup_decl(JSParseState *s, JSAtom name)
+{
+    JSFunctionDef *fd = s->cur_func;
+    int level = fd->scope_level;
+    TSNamespace *ns;
+    TSNamespaceMember *me;
+
+    while (fd) {
+        if (fd->ts_ns) {
+            me = ts_ns_find_member(fd->ts_ns, name);
+            if (me)
+                return me->child;
+        }
+        for(ns = fd->ts_decls; ns; ns = ns->next) {
+            if (ns->name == name &&
+                is_child_scope(s->ctx, fd, level, ns->scope_level))
+                return ns;
+        }
+        level = fd->parent_scope_level;
+        fd = fd->parent;
+    }
+    return NULL;
+}
+
+static JSValue ts_const_binop(JSContext *ctx, int op, JSValue a, JSValue b)
+{
+    double da, db, r;
+    int32_t ia, ib;
+
+    if (op == '+' && (JS_IsString(a) || JS_IsString(b))) {
+        JSValue sa, sb;
+        sa = JS_ToString(ctx, a);
+        sb = JS_ToString(ctx, b);
+        JS_FreeValue(ctx, a);
+        JS_FreeValue(ctx, b);
+        if (JS_IsException(sa) || JS_IsException(sb)) {
+            JS_FreeValue(ctx, sa);
+            JS_FreeValue(ctx, sb);
+            return JS_EXCEPTION;
+        }
+        return JS_ConcatString(ctx, sa, sb);
+    }
+    if (JS_ToFloat64(ctx, &da, a) || JS_ToFloat64(ctx, &db, b) ||
+        JS_ToInt32(ctx, &ia, a) || JS_ToInt32(ctx, &ib, b)) {
+        JS_FreeValue(ctx, a);
+        JS_FreeValue(ctx, b);
+        return JS_EXCEPTION;
+    }
+    JS_FreeValue(ctx, a);
+    JS_FreeValue(ctx, b);
+    switch(op) {
+    case '+': r = da + db; break;
+    case '-': r = da - db; break;
+    case '*': r = da * db; break;
+    case '/': r = da / db; break;
+    case '%': r = fmod(da, db); break;
+    case TOK_POW: r = js_pow(da, db); break;
+    case '|': r = ia | ib; break;
+    case '^': r = ia ^ ib; break;
+    case '&': r = ia & ib; break;
+    case TOK_SHL: r = (int32_t)((uint32_t)ia << (ib & 31)); break;
+    case TOK_SAR: r = ia >> (ib & 31); break;
+    case TOK_SHR: r = (uint32_t)ia >> (ib & 31); break;
+    default: abort();
+    }
+    return JS_NewFloat64(ctx, r);
+}
+
+static int ts_const_prec(int tok)
+{
+    switch(tok) {
+    case '|': return 1;
+    case '^': return 2;
+    case '&': return 3;
+    case TOK_SHL: case TOK_SAR: case TOK_SHR: return 4;
+    case '+': case '-': return 5;
+    case '*': case '/': case '%': return 6;
+    case TOK_POW: return 7;
+    default: return 0;
+    }
+}
+
+static int ts_const_expr(JSParseState *s, TSNamespace *ns, int min_prec,
+                         JSValue *pv);
+
+/* constant enum expression primary: literal, '(expr)', member of the
+   enum being defined or 'E.A' / 'E["A"]' member of another enum */
+static int ts_const_primary(JSParseState *s, TSNamespace *ns, JSValue *pv)
+{
+    JSContext *ctx = s->ctx;
+    TSNamespace *ns1;
+    TSNamespaceMember *me;
+    JSValue v;
+    JSAtom name;
+
+    switch(s->token.val) {
+    case TOK_NUMBER:
+        v = s->token.u.num.val;
+        if (JS_VALUE_GET_TAG(v) != JS_TAG_INT &&
+            JS_VALUE_GET_TAG(v) != JS_TAG_FLOAT64)
+            return -1; /* bigint */
+        v = JS_DupValue(ctx, v);
+        break;
+    case TOK_TEMPLATE:
+        if (s->token.u.str.sep != '`')
+            return -1;
+        /* fall thru */
+    case TOK_STRING:
+        v = JS_DupValue(ctx, s->token.u.str.str);
+        break;
+    case '(':
+        if (next_token(s) || ts_const_expr(s, ns, 1, &v))
+            return -1;
+        if (s->token.val != ')') {
+            JS_FreeValue(ctx, v);
+            return -1;
+        }
+        break;
+    default:
+        if (!ts_is_ident(s))
+            return -1;
+        name = s->token.u.ident.atom;
+        me = ns ? ts_ns_find_member(ns, name) : NULL;
+        if (me) {
+            if (JS_IsUninitialized(me->value))
+                return -1;
+            v = JS_DupValue(ctx, me->value);
+            break;
+        }
+        ns1 = ts_lookup_decl(s, name);
+        if (!ns1)
+            return -1;
+        for(;;) {
+            if (next_token(s))
+                return -1;
+            if (s->token.val == '.') {
+                if (next_token(s) || !token_is_ident(s->token.val))
+                    return -1;
+                name = JS_DupAtom(ctx, s->token.u.ident.atom);
+            } else if (s->token.val == '[') {
+                if (next_token(s) || s->token.val != TOK_STRING)
+                    return -1;
+                name = JS_ValueToAtom(ctx, s->token.u.str.str);
+                if (name == JS_ATOM_NULL)
+                    return -1;
+                if (next_token(s) || s->token.val != ']') {
+                    JS_FreeAtom(ctx, name);
+                    return -1;
+                }
+            } else {
+                return -1;
+            }
+            me = ts_ns_find_member(ns1, name);
+            JS_FreeAtom(ctx, name);
+            if (!me)
+                return -1;
+            if (ns1->kind != TS_NS_NAMESPACE) {
+                if (JS_IsUninitialized(me->value))
+                    return -1;
+                v = JS_DupValue(ctx, me->value);
+                break;
+            }
+            ns1 = me->child;
+            if (!ns1)
+                return -1;
+        }
+        break;
+    }
+    if (next_token(s)) {
+        JS_FreeValue(ctx, v);
+        return -1;
+    }
+    *pv = v;
+    return 0;
+}
+
+static int ts_const_unary(JSParseState *s, TSNamespace *ns, JSValue *pv)
+{
+    int op = s->token.val;
+    double d;
+    int32_t i;
+
+    if (op == '+' || op == '-' || op == '~') {
+        if (next_token(s) || ts_const_unary(s, ns, pv))
+            return -1;
+        if (JS_ToFloat64(s->ctx, &d, *pv) || JS_ToInt32(s->ctx, &i, *pv)) {
+            JS_FreeValue(s->ctx, *pv);
+            return -1;
+        }
+        JS_FreeValue(s->ctx, *pv);
+        if (op == '-')
+            d = -d;
+        else if (op == '~')
+            d = ~i;
+        *pv = JS_NewFloat64(s->ctx, d);
+        return 0;
+    }
+    return ts_const_primary(s, ns, pv);
+}
+
+/* evaluate a constant enum member expression (tsc's constant enum
+   expressions). Return -1 if it is not constant. */
+static int ts_const_expr(JSParseState *s, TSNamespace *ns, int min_prec,
+                         JSValue *pv)
+{
+    JSValue a, b;
+    int op, prec;
+
+    if (ts_const_unary(s, ns, &a))
+        return -1;
+    for(;;) {
+        op = s->token.val;
+        prec = ts_const_prec(op);
+        if (prec == 0 || prec < min_prec)
+            break;
+        /* '**' is right associative */
+        if (next_token(s) ||
+            ts_const_expr(s, ns, op == TOK_POW ? prec : prec + 1, &b)) {
+            JS_FreeValue(s->ctx, a);
+            return -1;
+        }
+        a = ts_const_binop(s->ctx, op, a, b);
+        if (JS_IsException(a))
+            return -1;
+    }
+    *pv = a;
+    return 0;
+}
+
+/* push an enum constant (number or string) */
+static int ts_emit_const(JSParseState *s, JSValueConst v)
+{
+    double d;
+    if (JS_IsString(v))
+        return emit_push_const(s, v, TRUE);
+    if (JS_ToFloat64(s->ctx, &d, v))
+        return -1;
+    if (d >= INT32_MIN && d <= INT32_MAX && d == (int32_t)d &&
+        !(d == 0 && signbit(d))) {
+        emit_op(s, OP_push_i32);
+        emit_u32(s, (int32_t)d);
+        return 0;
+    }
+    return emit_push_const(s, v, FALSE);
+}
+
+static BOOL ts_has_binding_in_scope(JSParseState *s, JSAtom name)
+{
+    JSFunctionDef *fd = s->cur_func;
+    if (find_var_in_scope(s->ctx, fd, name, fd->scope_level) >= 0)
+        return TRUE;
+    if (fd->scope_level == fd->body_scope) {
+        if (fd->is_global_var && find_global_var(fd, name))
+            return TRUE;
+        if (find_var(s->ctx, fd, name) >= 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* declare the variable of an enum or namespace unless it is merged
+   with an existing declaration (enum, namespace, function, class) of
+   the same scope. As with tsc, it is a 'var' at the top of a function
+   or program and a 'let' in a block. */
+static int ts_declare_binding(JSParseState *s, JSAtom name,
+                              JSParseExportEnum export_flag)
+{
+    JSFunctionDef *fd = s->cur_func;
+
+    if (!ts_has_binding_in_scope(s, name)) {
+        if (fd->scope_level == fd->body_scope) {
+            if (define_var(s, fd, name, JS_VAR_DEF_VAR) < 0)
+                return -1;
+        } else {
+            if (define_var(s, fd, name, JS_VAR_DEF_LET) < 0)
+                return -1;
+            emit_op(s, OP_undefined);
+            emit_op(s, OP_scope_put_var_init);
+            emit_atom(s, name);
+            emit_u16(s, fd->scope_level);
+        }
+    }
+    if (export_flag == JS_PARSE_EXPORT_NAMED &&
+        !find_export_entry(s->ctx, fd->module, name)) {
+        if (!add_export_entry(s, fd->module, name, name,
+                              JS_EXPORT_TYPE_LOCAL))
+            return -1;
+    }
+    return 0;
+}
+
+/* start the closure of an enum or namespace declaration: an arrow-like
+   function whose argument 0 is the enum/namespace object */
+static JSFunctionDef *ts_closure_begin(JSParseState *s, TSNamespace *ns,
+                                       const uint8_t *ptr)
+{
+    JSFunctionDef *parent = s->cur_func, *fd;
+
+    fd = js_new_function_def(s->ctx, parent, FALSE, TRUE, s->filename, ptr,
+                             &s->get_line_col_cache);
+    if (!fd)
+        return NULL;
+    fd->has_arguments_binding = FALSE;
+    fd->has_this_binding = FALSE;
+    fd->new_target_allowed = parent->new_target_allowed;
+    fd->super_call_allowed = parent->super_call_allowed;
+    fd->super_allowed = parent->super_allowed;
+    fd->arguments_allowed = parent->arguments_allowed;
+    fd->func_kind = JS_FUNC_NORMAL;
+    fd->func_type = JS_PARSE_FUNC_ARROW;
+    fd->has_simple_parameter_list = TRUE;
+    fd->ts_ns = ns;
+    ns->ref_count++;
+    /* unnamed: it cannot be shadowed nor referenced by the source */
+    if (add_arg(s->ctx, fd, JS_ATOM_NULL) < 0) {
+        js_free_function_def(s->ctx, fd);
+        return NULL;
+    }
+    fd->defined_arg_count = 1;
+    s->cur_func = fd;
+    fd->in_function_body = TRUE;
+    push_scope(s);
+    fd->body_scope = fd->scope_level;
+    return fd;
+}
+
+static void ts_closure_finish(JSParseState *s, JSFunctionDef *fd)
+{
+    s->cur_func = fd;
+    emit_return(s, FALSE);
+    s->cur_func = fd->parent;
+}
+
+/* emit '(closure)(N || (N = {}))', or '(closure)(P.N || (P.N = {}))'
+   for a member of the enclosing namespace P */
+static int ts_emit_closure_call(JSParseState *s, JSFunctionDef *cfd,
+                                JSAtom name, BOOL is_member)
+{
+    int idx, label;
+
+    idx = cpool_add(s, JS_NULL);
+    if (idx < 0)
+        return -1;
+    cfd->parent_cpool_idx = idx;
+    emit_op(s, OP_fclosure);
+    emit_u32(s, idx);
+    if (is_member) {
+        emit_op(s, OP_get_arg);
+        emit_u16(s, 0);
+        emit_op(s, OP_get_field);
+        emit_atom(s, name);
+    } else {
+        emit_op(s, OP_scope_get_var);
+        emit_atom(s, name);
+        emit_u16(s, s->cur_func->scope_level);
+    }
+    emit_op(s, OP_dup);
+    label = emit_goto(s, OP_if_true, -1);
+    emit_op(s, OP_drop);
+    emit_op(s, OP_object);
+    emit_op(s, OP_dup);
+    if (is_member) {
+        emit_op(s, OP_get_arg);
+        emit_u16(s, 0);
+        emit_op(s, OP_swap);
+        emit_op(s, OP_put_field);
+        emit_atom(s, name);
+    } else {
+        emit_op(s, OP_scope_put_var);
+        emit_atom(s, name);
+        emit_u16(s, s->cur_func->scope_level);
+    }
+    emit_label(s, label);
+    emit_op(s, OP_call);
+    emit_u16(s, 1);
+    emit_op(s, OP_drop);
+    return 0;
+}
+
+/* the namespace (or enum) record of 'name' declared in the current
+   scope or as member of 'parent_ns'. Return a new reference. */
+static TSNamespace *ts_get_decl(JSParseState *s, TSNamespace *parent_ns,
+                                JSAtom name, TSNamespaceKindEnum kind)
+{
+    TSNamespace *ns;
+    if (parent_ns) {
+        TSNamespaceMember *me = ts_ns_find_member(parent_ns, name);
+        ns = me ? me->child : NULL;
+    } else {
+        ns = ts_find_decl(s->cur_func, name, s->cur_func->scope_level);
+    }
+    if (ns) {
+        ns->ref_count++;
+        return ns;
+    }
+    return ts_ns_new(s->ctx, kind, name, s->cur_func->scope_level);
+}
+
+/* register a declaration returned by ts_get_decl() (the reference is
+   transferred) */
+static int ts_register_decl(JSParseState *s, TSNamespace *parent_ns,
+                            TSNamespace *ns)
+{
+    if (parent_ns) {
+        TSNamespaceMember *me = ts_ns_add_member(s->ctx, parent_ns, ns->name);
+        if (!me) {
+            ts_ns_free(s->ctx, ns);
+            return -1;
+        }
+        if (me->child == ns) {
+            ts_ns_free(s->ctx, ns);
+        } else {
+            ts_ns_free(s->ctx, me->child);
+            me->child = ns;
+        }
+    } else {
+        JSFunctionDef *fd = s->cur_func;
+        if (ts_find_decl(fd, ns->name, fd->scope_level) == ns) {
+            ts_ns_free(s->ctx, ns);
+        } else {
+            ns->next = fd->ts_decls;
+            fd->ts_decls = ns;
+        }
+    }
+    return 0;
+}
+
+/* 'enum E { ... }' and 'const enum E { ... }', compiled like tsc:
+     var E; (function (E) { E[E["A"] = 0] = "A"; ... })(E || (E = {}));
+   'parent_ns' is the enclosing namespace of 'export enum'. The current
+   token is 'enum'. */
+static int ts_parse_enum(JSParseState *s, BOOL is_const,
+                         TSNamespace *parent_ns,
+                         JSParseExportEnum export_flag)
+{
+    JSContext *ctx = s->ctx;
+    JSFunctionDef *fd = s->cur_func, *cfd;
+    TSNamespace *ns;
+    TSNamespaceMember *me;
+    JSAtom name, member_name = JS_ATOM_NULL;
+    JSValue val = JS_UNINITIALIZED, auto_val = JS_UNINITIALIZED;
+    const uint8_t *ptr = s->token.ptr;
+    JSParsePos pos;
+    BOOL ok;
+    double d;
+
+    if (next_token(s))
+        return -1;
+    if (!ts_is_ident(s))
+        return js_parse_error(s, "identifier expected");
+    name = JS_DupAtom(ctx, s->token.u.ident.atom);
+    if (next_token(s))
+        goto fail_name;
+    ns = ts_get_decl(s, parent_ns, name,
+                     is_const ? TS_NS_CONST_ENUM : TS_NS_ENUM);
+    if (!ns)
+        goto fail_name;
+    if (ts_register_decl(s, parent_ns, ns))
+        goto fail_name;
+    ns->kind = is_const ? TS_NS_CONST_ENUM : TS_NS_ENUM;
+    if (is_const) {
+        JSFunctionDef *fd1;
+        for(fd1 = fd; fd1->parent; fd1 = fd1->parent)
+            continue;
+        fd1->ts_has_const_enum = TRUE;
+    }
+    if (!parent_ns && ts_declare_binding(s, name, export_flag))
+        goto fail_name;
+
+    cfd = ts_closure_begin(s, ns, ptr);
+    if (!cfd)
+        goto fail_name;
+    if (js_parse_expect(s, '{'))
+        goto fail;
+    auto_val = JS_NewInt32(ctx, 0);
+    while (s->token.val != '}') {
+        if (s->token.val == TOK_STRING) {
+            member_name = JS_ValueToAtom(ctx, s->token.u.str.str);
+            if (member_name == JS_ATOM_NULL)
+                goto fail;
+        } else if (token_is_ident(s->token.val)) {
+            member_name = JS_DupAtom(ctx, s->token.u.ident.atom);
+        } else {
+            js_parse_error(s, "invalid enum member name");
+            goto fail;
+        }
+        if (next_token(s))
+            goto fail;
+        if (s->token.val == '=') {
+            if (next_token(s))
+                goto fail;
+            /* constant expressions are evaluated at compile time */
+            ts_spec_begin(s, &pos);
+            ok = !ts_const_expr(s, ns, 1, &val);
+            if (ok && s->token.val != ',' && s->token.val != '}') {
+                JS_FreeValue(ctx, val);
+                ok = FALSE;
+            }
+            if (ts_spec_end(s, &pos, ok))
+                goto fail;
+            if (!ok) {
+                if (is_const) {
+                    js_parse_error(s, "const enum member initializers must be constant expressions");
+                    goto fail;
+                }
+                val = JS_UNINITIALIZED;
+            }
+        } else {
+            if (JS_IsUninitialized(auto_val)) {
+                js_parse_error(s, "enum member must have initializer");
+                goto fail;
+            }
+            val = JS_DupValue(ctx, auto_val);
+        }
+
+        emit_op(s, OP_get_arg);
+        emit_u16(s, 0);
+        if (JS_IsString(val)) {
+            /* E["A"] = "x": no reverse mapping for string members */
+            if (ts_emit_const(s, val))
+                goto fail;
+            emit_op(s, OP_put_field);
+            emit_atom(s, member_name);
+        } else {
+            /* E[E["A"] = v] = "A" */
+            JSValue str;
+            int ret;
+            emit_op(s, OP_get_arg);
+            emit_u16(s, 0);
+            if (JS_IsUninitialized(val)) {
+                if (js_parse_assign_expr(s))
+                    goto fail;
+            } else {
+                if (ts_emit_const(s, val))
+                    goto fail;
+            }
+            emit_op(s, OP_insert2);
+            emit_op(s, OP_put_field);
+            emit_atom(s, member_name);
+            str = JS_AtomToString(ctx, member_name);
+            if (JS_IsException(str))
+                goto fail;
+            ret = emit_push_const(s, str, TRUE);
+            JS_FreeValue(ctx, str);
+            if (ret)
+                goto fail;
+            emit_op(s, OP_put_array_el);
+        }
+
+        /* auto-increment from the previous numeric constant */
+        JS_FreeValue(ctx, auto_val);
+        auto_val = JS_UNINITIALIZED;
+        if (!JS_IsUninitialized(val) && !JS_IsString(val)) {
+            if (JS_ToFloat64(ctx, &d, val))
+                goto fail;
+            auto_val = JS_NewFloat64(ctx, d + 1);
+        }
+        me = ts_ns_add_member(ctx, ns, member_name);
+        if (!me)
+            goto fail;
+        JS_FreeValue(ctx, me->value);
+        me->value = val;
+        val = JS_UNINITIALIZED;
+        JS_FreeAtom(ctx, member_name);
+        member_name = JS_ATOM_NULL;
+        if (s->token.val != ',')
+            break;
+        if (next_token(s))
+            goto fail;
+    }
+    JS_FreeValue(ctx, auto_val);
+    ts_closure_finish(s, cfd);
+    if (s->token.val != '}') {
+        js_parse_error(s, "expecting '}'");
+        goto fail_name;
+    }
+    if (next_token(s))
+        goto fail_name;
+    if (ts_emit_closure_call(s, cfd, name, parent_ns != NULL))
+        goto fail_name;
+    JS_FreeAtom(ctx, name);
+    s->ts_type_only_stmt = FALSE;
+    return 0;
+ fail:
+    JS_FreeValue(ctx, val);
+    JS_FreeValue(ctx, auto_val);
+    JS_FreeAtom(ctx, member_name);
+    s->cur_func = fd;
+ fail_name:
+    JS_FreeAtom(ctx, name);
+    return -1;
+}
+
+static int ts_parse_type_alias(JSParseState *s);
+static int ts_parse_interface(JSParseState *s);
+static int ts_parse_declare(JSParseState *s, TSNamespace *ns);
+static int ts_parse_import_alias(JSParseState *s, TSNamespace *ns,
+                                 JSParseExportEnum export_flag);
+static int ts_parse_namespace(JSParseState *s, TSNamespace *parent_ns,
+                              JSParseExportEnum export_flag);
+
+/* 'N.x = x' for an exported function or class of a namespace */
+static int ts_emit_ns_export(JSParseState *s, TSNamespace *ns, JSAtom name)
+{
+    if (!ts_ns_add_member(s->ctx, ns, name))
+        return -1;
+    emit_op(s, OP_get_arg);
+    emit_u16(s, 0);
+    emit_op(s, OP_scope_get_var);
+    emit_atom(s, name);
+    emit_u16(s, s->cur_func->scope_level);
+    emit_op(s, OP_put_field);
+    emit_atom(s, name);
+    return 0;
+}
+
+/* statement of a namespace body */
+static int ts_parse_namespace_element(JSParseState *s, TSNamespace *ns)
+{
+    JSContext *ctx = s->ctx;
+    JSFunctionDef *ffd;
+    JSAtom atom, name;
+    int tok, ret;
+
+    if (s->token.val != TOK_EXPORT)
+        return js_parse_source_element(s);
+    if (next_token(s))
+        return -1;
+    atom = ts_token_atom(s);
+    tok = s->token.val;
+    if (atom == JS_ATOM_let)
+        tok = TOK_LET;
+    switch(tok) {
+    case TOK_CONST:
+        if (ts_peek(s, &tok, NULL, NULL))
+            return -1;
+        if (tok == TOK_ENUM) {
+            if (next_token(s))
+                return -1;
+            return ts_parse_enum(s, TRUE, ns, JS_PARSE_EXPORT_NONE);
+        }
+        tok = TOK_CONST;
+        /* fall thru */
+    case TOK_VAR:
+    case TOK_LET:
+        /* the declared names are members of the namespace */
+        if (next_token(s))
+            return -1;
+        s->ts_export_ns = ns;
+        ret = js_parse_var(s, PF_IN_ACCEPTED, tok, FALSE);
+        s->ts_export_ns = NULL;
+        if (ret)
+            return -1;
+        return js_parse_expect_semi(s);
+    case TOK_FUNCTION:
+    parse_func:
+        ffd = NULL;
+        if (js_parse_function_decl2(s, JS_PARSE_FUNC_STATEMENT,
+                                    JS_FUNC_NORMAL, JS_ATOM_NULL,
+                                    s->token.ptr, JS_PARSE_EXPORT_NONE,
+                                    &ffd))
+            return -1;
+        if (!ffd)
+            return 0; /* overload signature */
+        return ts_emit_ns_export(s, ns, ffd->func_name);
+    case TOK_CLASS:
+    parse_class:
+        if (ts_peek(s, &tok, NULL, &name))
+            return -1;
+        if (!ts_is_ident_tok(tok)) {
+            JS_FreeAtom(ctx, name);
+            return js_parse_error(s, "class name expected");
+        }
+        ret = js_parse_class(s, FALSE, JS_PARSE_EXPORT_NONE);
+        if (!ret)
+            ret = ts_emit_ns_export(s, ns, name);
+        JS_FreeAtom(ctx, name);
+        return ret;
+    case TOK_ENUM:
+        return ts_parse_enum(s, FALSE, ns, JS_PARSE_EXPORT_NONE);
+    case TOK_IMPORT:
+        if (next_token(s))
+            return -1;
+        return ts_parse_import_alias(s, ns, JS_PARSE_EXPORT_NONE);
+    default:
+        break;
+    }
+    if (atom == s->ts_kw[TS_KW_async]) {
+        if (peek_token(s, TRUE) == TOK_FUNCTION)
+            goto parse_func;
+    } else if (atom == s->ts_kw[TS_KW_abstract]) {
+        if (next_token(s))
+            return -1;
+        if (s->token.val == TOK_CLASS)
+            goto parse_class;
+    } else if (atom == s->ts_kw[TS_KW_namespace] ||
+               atom == s->ts_kw[TS_KW_module]) {
+        if (next_token(s))
+            return -1;
+        return ts_parse_namespace(s, ns, JS_PARSE_EXPORT_NONE);
+    } else if (atom == s->ts_kw[TS_KW_declare]) {
+        return ts_parse_declare(s, ns);
+    } else if (atom == s->ts_kw[TS_KW_type]) {
+        return ts_parse_type_alias(s);
+    } else if (atom == s->ts_kw[TS_KW_interface]) {
+        return ts_parse_interface(s);
+    }
+    return js_parse_error(s, "unsupported export in a namespace");
+}
+
+/* 'namespace A.B { ... }' / 'module A { ... }', compiled like tsc:
+     var A; (function (A) { ... })(A || (A = {}));
+   An exported 'var' is a property of the namespace object: the
+   references to it in the namespace blocks are resolved as such (see
+   resolve_scope_var()). Namespaces without values emit nothing. The
+   current token is the name. */
+static int ts_parse_namespace(JSParseState *s, TSNamespace *parent_ns,
+                              JSParseExportEnum export_flag)
+{
+    JSContext *ctx = s->ctx;
+    JSFunctionDef *fd = s->cur_func, *cfd;
+    TSNamespace *ns;
+    JSAtom name;
+    const uint8_t *ptr = s->token.ptr;
+    BOOL has_value = FALSE;
+
+    if (!ts_is_ident(s))
+        return js_parse_error(s, "identifier expected");
+    name = JS_DupAtom(ctx, s->token.u.ident.atom);
+    if (next_token(s))
+        goto fail_name;
+    ns = ts_get_decl(s, parent_ns, name, TS_NS_NAMESPACE);
+    if (!ns)
+        goto fail_name;
+    cfd = ts_closure_begin(s, ns, ptr);
+    if (!cfd) {
+        ts_ns_free(ctx, ns);
+        goto fail_name;
+    }
+    if (s->token.val == '.') {
+        /* 'namespace A.B {}' is 'namespace A { export namespace B {} }' */
+        if (next_token(s) || ts_parse_namespace(s, ns, JS_PARSE_EXPORT_NONE))
+            goto fail;
+        has_value = !s->ts_type_only_stmt;
+        ts_closure_finish(s, cfd);
+    } else {
+        if (js_parse_expect(s, '{'))
+            goto fail;
+        while (s->token.val != '}') {
+            if (s->token.val == TOK_EOF) {
+                js_parse_error(s, "expecting '}'");
+                goto fail;
+            }
+            s->ts_type_only_stmt = FALSE;
+            if (ts_parse_namespace_element(s, ns))
+                goto fail;
+            if (!s->ts_type_only_stmt)
+                has_value = TRUE;
+        }
+        ts_closure_finish(s, cfd);
+        if (next_token(s))
+            goto fail_ns;
+    }
+    if (!has_value) {
+        /* type-only namespace: no code and no binding */
+        js_free_function_def(ctx, cfd);
+        ts_ns_free(ctx, ns);
+        if (!parent_ns && ts_add_type_name(s, name))
+            goto fail_name;
+        JS_FreeAtom(ctx, name);
+        s->ts_type_only_stmt = TRUE;
+        return 0;
+    }
+    if (ts_register_decl(s, parent_ns, ns))
+        goto fail_name;
+    if (!parent_ns && ts_declare_binding(s, name, export_flag))
+        goto fail_name;
+    if (ts_emit_closure_call(s, cfd, name, parent_ns != NULL))
+        goto fail_name;
+    JS_FreeAtom(ctx, name);
+    s->ts_type_only_stmt = FALSE;
+    return 0;
+ fail:
+    s->cur_func = fd;
+ fail_ns:
+    ts_ns_free(ctx, ns);
+ fail_name:
+    JS_FreeAtom(ctx, name);
+    return -1;
+}
+
+/* 'type T<P> = ...'. The current token is 'type'. */
+static int ts_parse_type_alias(JSParseState *s)
+{
+    if (next_token(s))
+        return -1;
+    if (!ts_is_ident(s))
+        return js_parse_error(s, "identifier expected");
+    if (ts_add_type_name(s, s->token.u.ident.atom))
+        return -1;
+    if (next_token(s) ||
+        ts_skip_type_params(s, TS_TP_IN_OUT | TS_TP_CONST | TS_TP_EMPTY) < 0 ||
+        ts_expect(s, '=') || ts_skip_type(s))
+        return -1;
+    s->ts_type_only_stmt = TRUE;
+    return js_parse_expect_semi(s);
+}
+
+/* 'interface I<P> extends J { ... }'. The current token is 'interface'. */
+static int ts_parse_interface(JSParseState *s)
+{
+    if (next_token(s))
+        return -1;
+    if (!ts_is_ident(s))
+        return js_parse_error(s, "identifier expected");
+    if (ts_add_type_name(s, s->token.u.ident.atom))
+        return -1;
+    if (next_token(s) ||
+        ts_skip_type_params(s, TS_TP_IN_OUT | TS_TP_EMPTY) < 0)
+        return -1;
+    if (s->token.val == TOK_EXTENDS) {
+        do {
+            if (next_token(s) || ts_skip_type(s))
+                return -1;
+        } while (s->token.val == ',');
+    }
+    if (ts_is_kw(s, TS_KW_implements)) {
+        do {
+            if (next_token(s) || ts_skip_type(s))
+                return -1;
+        } while (s->token.val == ',');
+    }
+    if (ts_skip_object_type(s))
+        return -1;
+    s->ts_type_only_stmt = TRUE;
+    return 0;
+}
+
+/* skip 'Name', 'A.B.C' or a module name string, then a balanced body
+   or ';' */
+static int ts_skip_ambient_body(JSParseState *s)
+{
+    if (s->token.val == TOK_STRING) {
+        if (next_token(s))
+            return -1;
+    } else {
+        for(;;) {
+            if (!ts_is_ident(s))
+                return js_parse_error(s, "identifier expected");
+            if (next_token(s))
+                return -1;
+            if (s->token.val != '.')
+                break;
+            if (next_token(s))
+                return -1;
+        }
+    }
+    if (s->token.val == '{')
+        return ts_skip_balanced(s);
+    return js_parse_expect_semi(s);
+}
+
+/* 'declare ...': ambient declarations emit nothing. In a namespace,
+   'export declare var x' makes 'x' a member of 'ns'. The current token
+   is 'declare'. */
+static int ts_parse_declare(JSParseState *s, TSNamespace *ns)
+{
+    JSAtom atom;
+    int ret;
+
+    if (next_token(s))
+        return -1;
+    s->ts_type_only_stmt = TRUE;
+    atom = ts_token_atom(s);
+    if (s->token.val == TOK_VAR || s->token.val == TOK_LET ||
+        s->token.val == TOK_CONST || atom == JS_ATOM_let) {
+        if (next_token(s))
+            return -1;
+        if (s->token.val == TOK_ENUM)
+            goto enum_decl;
+        for(;;) {
+            if (ns && s->token.val == TOK_IDENT) {
+                if (!ts_ns_add_member(s->ctx, ns, s->token.u.ident.atom))
+                    return -1;
+                s->ts_type_only_stmt = FALSE;
+            }
+            if (ts_skip_binding(s))
+                return -1;
+            if (s->token.val == '!' && next_token(s))
+                return -1;
+            if (ts_skip_type_annotation(s))
+                return -1;
+            if (s->token.val == '=') {
+                if (next_token(s) ||
+                    ts_skip_tokens(s, TS_SKIP_COMMA | TS_SKIP_LF))
+                    return -1;
+            }
+            if (s->token.val != ',')
+                break;
+            if (next_token(s))
+                return -1;
+        }
+        return js_parse_expect_semi(s);
+    }
+    if (s->token.val == TOK_FUNCTION || atom == s->ts_kw[TS_KW_async]) {
+        ret = ts_skip_function_signature(s);
+        if (ret < 0)
+            return -1;
+        if (ret == 0)
+            return js_parse_error(s, "an ambient function cannot have a body");
+        return 0;
+    }
+    if (atom == s->ts_kw[TS_KW_abstract]) {
+        if (next_token(s))
+            return -1;
+    }
+    if (s->token.val == TOK_CLASS) {
+        if (next_token(s))
+            return -1;
+        if (ts_is_ident(s) && next_token(s))
+            return -1;
+        if (ts_skip_type_params(s, TS_TP_IN_OUT | TS_TP_CONST) < 0)
+            return -1;
+        if (s->token.val == TOK_EXTENDS) {
+            if (next_token(s) || ts_skip_type(s))
+                return -1;
+        }
+        if (ts_is_kw(s, TS_KW_implements)) {
+            do {
+                if (next_token(s) || ts_skip_type(s))
+                    return -1;
+            } while (s->token.val == ',');
+        }
+        if (s->token.val != '{')
+            return js_parse_error(s, "expecting '{'");
+        return ts_skip_balanced(s);
+    }
+    if (s->token.val == TOK_ENUM) {
+    enum_decl:
+        if (next_token(s))
+            return -1;
+        if (!ts_is_ident(s))
+            return js_parse_error(s, "identifier expected");
+        if (next_token(s))
+            return -1;
+        if (s->token.val != '{')
+            return js_parse_error(s, "expecting '{'");
+        return ts_skip_balanced(s);
+    }
+    if (atom == s->ts_kw[TS_KW_namespace] || atom == s->ts_kw[TS_KW_module]) {
+        if (next_token(s))
+            return -1;
+        return ts_skip_ambient_body(s);
+    }
+    if (atom == s->ts_kw[TS_KW_global]) {
+        if (next_token(s))
+            return -1;
+        if (s->token.val != '{')
+            return js_parse_error(s, "expecting '{'");
+        return ts_skip_balanced(s);
+    }
+    if (atom == s->ts_kw[TS_KW_type])
+        return ts_parse_type_alias(s);
+    if (atom == s->ts_kw[TS_KW_interface])
+        return ts_parse_interface(s);
+    return js_parse_error(s, "unexpected token after 'declare'");
+}
+
+/* 'import X = A.B.C' (the current token is 'X'): a const binding to the
+   entity. The root is read like 'typeof' and the members with optional
+   chaining so that an alias of a type-only namespace does not throw:
+   tsc drops such aliases. 'ns' is the enclosing namespace of
+   'export import'. */
+static int ts_parse_import_alias(JSParseState *s, TSNamespace *ns,
+                                 JSParseExportEnum export_flag)
+{
+    JSContext *ctx = s->ctx;
+    JSFunctionDef *fd = s->cur_func;
+    JSAtom name;
+    int label = -1, tok;
+
+    if (!ts_is_ident(s))
+        return js_parse_error(s, "identifier expected");
+    name = JS_DupAtom(ctx, s->token.u.ident.atom);
+    if (next_token(s) || js_parse_expect(s, '='))
+        goto fail;
+    if (ts_is_kw(s, TS_KW_require)) {
+        if (ts_peek(s, &tok, NULL, NULL))
+            goto fail;
+        if (tok == '(') {
+            js_parse_error(s, "'import ... = require()' is not supported (no CommonJS modules), use 'import ... from'");
+            goto fail;
+        }
+    }
+    if (!ts_is_ident(s)) {
+        js_parse_error(s, "identifier expected");
+        goto fail;
+    }
+    emit_op(s, OP_scope_get_var_undef);
+    emit_atom(s, s->token.u.ident.atom);
+    emit_u16(s, fd->scope_level);
+    if (next_token(s))
+        goto fail;
+    while (s->token.val == '.') {
+        if (next_token(s))
+            goto fail;
+        if (!token_is_ident(s->token.val)) {
+            js_parse_error(s, "identifier expected");
+            goto fail;
+        }
+        emit_op(s, OP_dup);
+        emit_op(s, OP_is_undefined_or_null);
+        label = emit_goto(s, OP_if_true, label);
+        emit_op(s, OP_get_field);
+        emit_atom(s, s->token.u.ident.atom);
+        if (next_token(s))
+            goto fail;
+    }
+    emit_label(s, label);
+    if (ns) {
+        if (!ts_ns_add_member(ctx, ns, name))
+            goto fail;
+        emit_op(s, OP_get_arg);
+        emit_u16(s, 0);
+        emit_op(s, OP_swap);
+        emit_op(s, OP_put_field);
+        emit_atom(s, name);
+        s->ts_type_only_stmt = FALSE;
+    } else {
+        if (define_var(s, fd, name, JS_VAR_DEF_CONST) < 0)
+            goto fail;
+        emit_op(s, OP_scope_put_var_init);
+        emit_atom(s, name);
+        emit_u16(s, fd->scope_level);
+        if (export_flag == JS_PARSE_EXPORT_NAMED &&
+            !add_export_entry(s, fd->module, name, name, JS_EXPORT_TYPE_LOCAL))
+            goto fail;
+        /* an unexported alias does not make a namespace non-empty */
+        s->ts_type_only_stmt = (export_flag == JS_PARSE_EXPORT_NONE);
+    }
+    JS_FreeAtom(ctx, name);
+    return js_parse_expect_semi(s);
+ fail:
+    JS_FreeAtom(ctx, name);
+    return -1;
+}
+
+/* return TRUE if the current 'import' token starts 'import X = ...' */
+static int ts_is_import_alias(JSParseState *s)
+{
+    JSParsePos pos;
+    BOOL ret;
+    js_parse_get_pos(s, &pos);
+    ret = !next_token(s) && ts_is_ident(s) && !ts_is_kw(s, TS_KW_type) &&
+        !next_token(s) && s->token.val == '=';
+    if (js_parse_seek_token(s, &pos))
+        return -1;
+    return ret;
+}
+
+/* TypeScript declarations at the start of a statement. Return 1 if one
+   was parsed, 0 if the statement is not a TypeScript declaration, -1 on
+   error. The contextual keywords follow tsc's line break rules. */
+static int ts_parse_statement(JSParseState *s)
+{
+    JSContext *ctx = s->ctx;
+    JSAtom atom, next_atom;
+    int tok, ret;
+    BOOL lf;
+
+    switch(s->token.val) {
+    case TOK_ENUM:
+        return ts_parse_enum(s, FALSE, NULL, JS_PARSE_EXPORT_NONE) ? -1 : 1;
+    case TOK_CONST:
+        if (ts_peek(s, &tok, NULL, NULL))
+            return -1;
+        if (tok != TOK_ENUM)
+            return 0;
+        if (next_token(s))
+            return -1;
+        return ts_parse_enum(s, TRUE, NULL, JS_PARSE_EXPORT_NONE) ? -1 : 1;
+    case TOK_IMPORT:
+        ret = ts_is_import_alias(s);
+        if (ret <= 0)
+            return ret;
+        if (next_token(s))
+            return -1;
+        return ts_parse_import_alias(s, NULL, JS_PARSE_EXPORT_NONE) ? -1 : 1;
+    default:
+        break;
+    }
+    atom = ts_token_atom(s);
+    if (atom != s->ts_kw[TS_KW_type] && atom != s->ts_kw[TS_KW_interface] &&
+        atom != s->ts_kw[TS_KW_declare] && atom != s->ts_kw[TS_KW_abstract] &&
+        atom != s->ts_kw[TS_KW_namespace] && atom != s->ts_kw[TS_KW_module])
+        return 0;
+    if (ts_peek(s, &tok, &lf, &next_atom))
+        return -1;
+    JS_FreeAtom(ctx, next_atom);
+    if (lf)
+        return 0; /* ASI: the keyword is an identifier */
+    if (atom == s->ts_kw[TS_KW_type]) {
+        if (!ts_is_ident_tok(tok))
+            return 0;
+        ret = ts_parse_type_alias(s);
+    } else if (atom == s->ts_kw[TS_KW_interface]) {
+        if (!ts_is_ident_tok(tok))
+            return 0;
+        ret = ts_parse_interface(s);
+    } else if (atom == s->ts_kw[TS_KW_declare]) {
+        if (!(tok == TOK_VAR || tok == TOK_LET || tok == TOK_CONST ||
+              tok == TOK_FUNCTION || tok == TOK_CLASS || tok == TOK_ENUM ||
+              next_atom == JS_ATOM_let ||
+              next_atom == s->ts_kw[TS_KW_async] ||
+              next_atom == s->ts_kw[TS_KW_abstract] ||
+              next_atom == s->ts_kw[TS_KW_namespace] ||
+              next_atom == s->ts_kw[TS_KW_module] ||
+              next_atom == s->ts_kw[TS_KW_global] ||
+              next_atom == s->ts_kw[TS_KW_type] ||
+              next_atom == s->ts_kw[TS_KW_interface]))
+            return 0;
+        ret = ts_parse_declare(s, NULL);
+    } else if (atom == s->ts_kw[TS_KW_abstract]) {
+        if (tok != TOK_CLASS)
+            return 0;
+        ret = next_token(s) || js_parse_class(s, FALSE, JS_PARSE_EXPORT_NONE);
+    } else {
+        /* namespace or module */
+        if (tok == TOK_STRING && atom == s->ts_kw[TS_KW_module]) {
+            /* ambient module declaration */
+            s->ts_type_only_stmt = TRUE;
+            ret = next_token(s) || ts_skip_ambient_body(s);
+        } else if (ts_is_ident_tok(tok)) {
+            ret = next_token(s) || ts_parse_namespace(s, NULL, JS_PARSE_EXPORT_NONE);
+        } else {
+            return 0;
+        }
+    }
+    return ret ? -1 : 1;
+}
+
 static __exception int js_parse_statement_or_decl(JSParseState *s,
                                                   int decl_mask)
 {
@@ -30672,6 +33650,14 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         }
     }
 
+    if (s->ts) {
+        int ret = ts_parse_statement(s);
+        if (ret < 0)
+            goto fail;
+        if (ret)
+            goto done;
+    }
+
     switch(tok = s->token.val) {
     case '{':
         if (js_parse_block(s))
@@ -30680,7 +33666,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
     case TOK_RETURN:
         {
             const uint8_t *op_token_ptr;
-            if (s->cur_func->is_eval) {
+            if (s->cur_func->is_eval || s->cur_func->ts_ns) {
                 js_parse_error(s, "return not in a function");
                 goto fail;
             }
@@ -31177,6 +34163,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                         emit_u32(s, name);
                         emit_u16(s, s->cur_func->scope_level);
                     }
+                    if (s->ts && ts_skip_type_annotation(s))
+                        goto fail;
                     if (js_parse_expect(s, ')'))
                         goto fail;
                 }
@@ -33531,6 +36519,301 @@ static __exception int js_parse_from_clause(JSParseState *s, JSModuleDef *m)
     return idx;
 }
 
+/* 'type T' or 'type T as U' specifier in an import or export clause.
+   Return 1 (and the local name in '*plocal') if it is a type-only
+   specifier, 0 if it is not (position unchanged, 'type' is the name). */
+static int ts_parse_type_specifier(JSParseState *s, JSAtom *plocal)
+{
+    JSContext *ctx = s->ctx;
+    JSParsePos pos;
+    JSAtom local, atom2;
+    int tok;
+
+    *plocal = JS_ATOM_NULL;
+    js_parse_get_pos(s, &pos);
+    if (next_token(s))
+        return -1;
+    if (ts_is_kw(s, TS_KW_as)) {
+        if (ts_peek(s, &tok, NULL, &atom2))
+            return -1;
+        JS_FreeAtom(ctx, atom2);
+        if (tok == ',' || tok == '}') {
+            /* 'type as' */
+            local = JS_DupAtom(ctx, s->token.u.ident.atom);
+            goto done;
+        }
+        if (atom2 != s->ts_kw[TS_KW_as])
+            goto restore; /* 'type as x': 'type' renamed */
+        /* 'type as as x' */
+        if (next_token(s) || next_token(s))
+            return -1;
+        if (!token_is_ident(s->token.val))
+            return js_parse_error(s, "identifier expected");
+        local = JS_DupAtom(ctx, s->token.u.ident.atom);
+        goto done;
+    }
+    if (s->token.val == TOK_STRING) {
+        local = JS_ATOM_NULL;
+    } else if (token_is_ident(s->token.val)) {
+        local = JS_DupAtom(ctx, s->token.u.ident.atom);
+    } else {
+        goto restore;
+    }
+    if (next_token(s)) {
+        JS_FreeAtom(ctx, local);
+        return -1;
+    }
+    if (ts_is_kw(s, TS_KW_as)) {
+        JS_FreeAtom(ctx, local);
+        if (next_token(s))
+            return -1;
+        if (!token_is_ident(s->token.val) && s->token.val != TOK_STRING)
+            return js_parse_error(s, "identifier expected");
+        local = s->token.val == TOK_STRING ? JS_ATOM_NULL :
+            JS_DupAtom(ctx, s->token.u.ident.atom);
+    } else {
+        *plocal = local;
+        return 1;
+    }
+ done:
+    *plocal = local;
+    if (next_token(s))
+        return -1;
+    return 1;
+ restore:
+    if (js_parse_seek_token(s, &pos))
+        return -1;
+    return 0;
+}
+
+/* the import declaration 'req_idx' can be dropped if all its bindings
+   are unused as values */
+static int ts_add_elidable_req(JSParseState *s, int req_idx)
+{
+    JSFunctionDef *fd = s->cur_func;
+    if (js_resize_array(s->ctx, (void **)&fd->ts_elidable_reqs,
+                        sizeof(fd->ts_elidable_reqs[0]),
+                        &fd->ts_elidable_req_size,
+                        fd->ts_elidable_req_count + 1))
+        return -1;
+    fd->ts_elidable_reqs[fd->ts_elidable_req_count++] = req_idx;
+    return 0;
+}
+
+/* skip "from 'mod' [with {...}] ;" of a type-only import or export */
+static int ts_skip_from_clause(JSParseState *s)
+{
+    if (!token_is_pseudo_keyword(s, JS_ATOM_from))
+        return js_parse_error(s, "from clause expected");
+    if (next_token(s))
+        return -1;
+    if (s->token.val != TOK_STRING)
+        return js_parse_error(s, "string expected");
+    if (next_token(s))
+        return -1;
+    if (s->token.val == TOK_WITH) {
+        if (next_token(s))
+            return -1;
+        if (s->token.val != '{')
+            return js_parse_error(s, "expecting '{'");
+        if (ts_skip_balanced(s))
+            return -1;
+    }
+    return js_parse_expect_semi(s);
+}
+
+/* TypeScript forms of 'import' (the current token follows 'import'):
+   'import type ...' (no binding) and 'import X = A.B'. Return 1 if
+   parsed, 0 for a regular import. */
+static int ts_parse_import_prefix(JSParseState *s)
+{
+    JSContext *ctx = s->ctx;
+    JSParsePos pos;
+    JSAtom atom2;
+    int tok, ret;
+
+    if (!ts_is_ident(s))
+        return 0;
+    if (ts_peek(s, &tok, NULL, &atom2))
+        return -1;
+    JS_FreeAtom(ctx, atom2);
+    if (tok == '=')
+        return ts_parse_import_alias(s, NULL, JS_PARSE_EXPORT_NONE) ? -1 : 1;
+    if (!ts_is_kw(s, TS_KW_type) || tok == ',' || tok == TOK_STRING)
+        return 0;
+    if (atom2 == JS_ATOM_from) {
+        /* 'import type from "x"' imports the default export as 'type' */
+        js_parse_get_pos(s, &pos);
+        ret = !next_token(s) && !next_token(s) && s->token.val == TOK_STRING;
+        if (js_parse_seek_token(s, &pos))
+            return -1;
+        if (ret)
+            return 0;
+    }
+    /* type-only import */
+    if (next_token(s))
+        return -1;
+    if (s->token.val == '*') {
+        if (next_token(s))
+            return -1;
+        if (!token_is_pseudo_keyword(s, JS_ATOM_as))
+            return js_parse_error(s, "expecting 'as'");
+        if (next_token(s))
+            return -1;
+        if (!ts_is_ident(s))
+            return js_parse_error(s, "identifier expected");
+        if (ts_add_type_name(s, s->token.u.ident.atom) || next_token(s))
+            return -1;
+    } else if (s->token.val == '{') {
+        if (next_token(s))
+            return -1;
+        while (s->token.val != '}') {
+            JSAtom local;
+            if (s->token.val == TOK_STRING) {
+                local = JS_ATOM_NULL;
+            } else if (token_is_ident(s->token.val)) {
+                local = JS_DupAtom(ctx, s->token.u.ident.atom);
+            } else {
+                return js_parse_error(s, "identifier expected");
+            }
+            if (next_token(s)) {
+                JS_FreeAtom(ctx, local);
+                return -1;
+            }
+            if (token_is_pseudo_keyword(s, JS_ATOM_as)) {
+                JS_FreeAtom(ctx, local);
+                if (next_token(s))
+                    return -1;
+                if (!token_is_ident(s->token.val))
+                    return js_parse_error(s, "identifier expected");
+                local = JS_DupAtom(ctx, s->token.u.ident.atom);
+                if (next_token(s)) {
+                    JS_FreeAtom(ctx, local);
+                    return -1;
+                }
+            }
+            ret = local != JS_ATOM_NULL && ts_add_type_name(s, local);
+            JS_FreeAtom(ctx, local);
+            if (ret)
+                return -1;
+            if (s->token.val != ',')
+                break;
+            if (next_token(s))
+                return -1;
+        }
+        if (js_parse_expect(s, '}'))
+            return -1;
+    } else if (ts_is_ident(s)) {
+        if (ts_add_type_name(s, s->token.u.ident.atom) || next_token(s))
+            return -1;
+        if (s->token.val == '=') {
+            /* 'import type X = A.B' */
+            if (next_token(s))
+                return -1;
+            while (token_is_ident(s->token.val) || s->token.val == '.') {
+                if (next_token(s))
+                    return -1;
+            }
+            return js_parse_expect_semi(s) ? -1 : 1;
+        }
+    } else {
+        return js_parse_error(s, "invalid type-only import");
+    }
+    return ts_skip_from_clause(s) ? -1 : 1;
+}
+
+/* TypeScript forms of 'export' (the current token follows 'export').
+   Return 1 if parsed, 0 for a JavaScript export. */
+static int ts_parse_export(JSParseState *s)
+{
+    JSContext *ctx = s->ctx;
+    JSAtom atom = ts_token_atom(s), atom2;
+    int tok, ret;
+
+    switch(s->token.val) {
+    case '=':
+        return js_parse_error(s, "'export =' is not supported (no CommonJS modules), use 'export default'");
+    case TOK_ENUM:
+        ret = ts_parse_enum(s, FALSE, NULL, JS_PARSE_EXPORT_NAMED);
+        goto done;
+    case TOK_CONST:
+        if (ts_peek(s, &tok, NULL, NULL))
+            return -1;
+        if (tok != TOK_ENUM)
+            return 0;
+        ret = next_token(s) ||
+            ts_parse_enum(s, TRUE, NULL, JS_PARSE_EXPORT_NAMED);
+        goto done;
+    case TOK_IMPORT:
+        ret = next_token(s) ||
+            ts_parse_import_alias(s, NULL, JS_PARSE_EXPORT_NAMED);
+        goto done;
+    case TOK_DEFAULT:
+        if (ts_peek(s, &tok, NULL, &atom2))
+            return -1;
+        JS_FreeAtom(ctx, atom2);
+        if (atom2 == s->ts_kw[TS_KW_interface]) {
+            ret = next_token(s) || ts_parse_interface(s);
+            goto done;
+        }
+        if (atom2 == s->ts_kw[TS_KW_abstract]) {
+            ret = next_token(s) || next_token(s) ||
+                js_parse_class(s, FALSE, JS_PARSE_EXPORT_DEFAULT);
+            goto done;
+        }
+        return 0;
+    default:
+        break;
+    }
+    if (atom == s->ts_kw[TS_KW_type]) {
+        if (ts_peek(s, &tok, NULL, NULL))
+            return -1;
+        if (tok == '{') {
+            /* 'export type { T } [from "x"]' */
+            ret = next_token(s) || ts_skip_balanced(s);
+            if (!ret) {
+                if (token_is_pseudo_keyword(s, JS_ATOM_from))
+                    ret = ts_skip_from_clause(s);
+                else
+                    ret = js_parse_expect_semi(s);
+            }
+        } else if (tok == '*') {
+            /* 'export type * [as ns] from "x"' */
+            ret = next_token(s) || next_token(s);
+            if (!ret && token_is_pseudo_keyword(s, JS_ATOM_as))
+                ret = next_token(s) || next_token(s);
+            if (!ret)
+                ret = ts_skip_from_clause(s);
+        } else {
+            ret = ts_parse_type_alias(s);
+        }
+    } else if (atom == s->ts_kw[TS_KW_interface]) {
+        ret = ts_parse_interface(s);
+    } else if (atom == s->ts_kw[TS_KW_declare]) {
+        ret = ts_parse_declare(s, NULL);
+    } else if (atom == s->ts_kw[TS_KW_abstract]) {
+        ret = next_token(s) || js_parse_class(s, FALSE, JS_PARSE_EXPORT_NAMED);
+    } else if (atom == s->ts_kw[TS_KW_namespace] ||
+               atom == s->ts_kw[TS_KW_module]) {
+        if (next_token(s))
+            return -1;
+        if (s->token.val == TOK_STRING)
+            ret = ts_skip_ambient_body(s);
+        else
+            ret = ts_parse_namespace(s, NULL, JS_PARSE_EXPORT_NAMED);
+    } else if (atom == JS_ATOM_as) {
+        /* 'export as namespace N' (UMD global): type only */
+        ret = next_token(s);
+        if (!ret && !ts_is_kw(s, TS_KW_namespace))
+            return js_parse_error(s, "expecting 'namespace'");
+        ret = ret || next_token(s) || next_token(s) || js_parse_expect_semi(s);
+    } else {
+        return 0;
+    }
+ done:
+    return ret ? -1 : 1;
+}
+
 static __exception int js_parse_export(JSParseState *s)
 {
     JSContext *ctx = s->ctx;
@@ -33541,6 +36824,19 @@ static __exception int js_parse_export(JSParseState *s)
 
     if (next_token(s))
         return -1;
+
+    if (s->token.val == '@') {
+        /* 'export @dec class' */
+        if (js_parse_class_decorators(s) ||
+            js_expect_decorated_class(s, FALSE))
+            return -1;
+    }
+
+    if (s->ts) {
+        int ret = ts_parse_export(s);
+        if (ret)
+            return ret < 0 ? -1 : 0;
+    }
 
     tok = s->token.val;
     if (tok == TOK_CLASS) {
@@ -33561,6 +36857,20 @@ static __exception int js_parse_export(JSParseState *s)
     case '{':
         first_export = m->export_entries_count;
         while (s->token.val != '}') {
+            if (s->ts && ts_is_kw(s, TS_KW_type)) {
+                /* 'export { type T }': nothing is exported */
+                int ret = ts_parse_type_specifier(s, &local_name);
+                if (ret < 0)
+                    return -1;
+                if (ret) {
+                    JS_FreeAtom(ctx, local_name);
+                    if (s->token.val != ',')
+                        break;
+                    if (next_token(s))
+                        return -1;
+                    continue;
+                }
+            }
             if (!token_is_ident(s->token.val)) {
                 js_parse_error(s, "identifier expected");
                 return -1;
@@ -33741,6 +37051,12 @@ static __exception int js_parse_import(JSParseState *s)
     if (next_token(s))
         return -1;
 
+    if (s->ts) {
+        int ret = ts_parse_import_prefix(s);
+        if (ret)
+            return ret < 0 ? -1 : 0;
+    }
+
     first_import = m->import_entries_count;
     if (s->token.val == TOK_STRING) {
         module_name = JS_ValueToAtom(ctx, s->token.u.str.str);
@@ -33803,6 +37119,23 @@ static __exception int js_parse_import(JSParseState *s)
 
             while (s->token.val != '}') {
                 BOOL is_string;
+                if (s->ts && ts_is_kw(s, TS_KW_type)) {
+                    /* 'import { type T }': no binding */
+                    int ret = ts_parse_type_specifier(s, &local_name);
+                    if (ret < 0)
+                        return -1;
+                    if (ret) {
+                        ret = ts_add_type_name(s, local_name);
+                        JS_FreeAtom(ctx, local_name);
+                        if (ret)
+                            return -1;
+                        if (s->token.val != ',')
+                            break;
+                        if (next_token(s))
+                            return -1;
+                        continue;
+                    }
+                }
                 if (s->token.val == TOK_STRING) {
                     is_string = TRUE;
                     if (js_string_find_invalid_codepoint(JS_VALUE_GET_STRING(s->token.u.str.str)) >= 0) {
@@ -33858,6 +37191,8 @@ static __exception int js_parse_import(JSParseState *s)
     end_import_clause:
         idx = js_parse_from_clause(s, m);
         if (idx < 0)
+            return -1;
+        if (s->ts && ts_add_elidable_req(s, idx))
             return -1;
     }
     for(i = first_import; i < m->import_entries_count; i++)
@@ -33917,6 +37252,7 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
     if (parent) {
         list_add_tail(&fd->link, &parent->child_list);
         fd->js_mode = parent->js_mode;
+        fd->is_ts = parent->is_ts;
         fd->parent_scope_level = parent->scope_level;
     }
     fd->strip_debug = ((ctx->rt->strip_flags & JS_STRIP_DEBUG) != 0);
@@ -33994,6 +37330,27 @@ static void free_bytecode_atoms(JSRuntime *rt,
     }
 }
 
+/* free the TypeScript compilation state of a function definition */
+static void js_free_function_def_ts(JSContext *ctx, JSFunctionDef *fd)
+{
+    int i;
+
+    ts_ns_free(ctx, fd->ts_ns);
+    while (fd->ts_decls) {
+        TSNamespace *ns = fd->ts_decls;
+        fd->ts_decls = ns->next;
+        ts_ns_free(ctx, ns);
+    }
+    for(i = 0; i < fd->ts_param_prop_count; i++)
+        JS_FreeAtom(ctx, fd->ts_param_props[i]);
+    js_free(ctx, fd->ts_param_props);
+    for(i = 0; i < fd->ts_type_name_count; i++)
+        JS_FreeAtom(ctx, fd->ts_type_names[i]);
+    js_free(ctx, fd->ts_type_names);
+    js_free(ctx, fd->ts_import_used);
+    js_free(ctx, fd->ts_elidable_reqs);
+}
+
 static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
 {
     int i;
@@ -34047,6 +37404,8 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
     dbuf_free(&fd->pc2line);
 
     js_free(ctx, fd->source);
+
+    js_free_function_def_ts(ctx, fd);
 
     if (fd->parent) {
         /* remove in parent list */
@@ -34747,6 +38106,330 @@ static inline void capture_var(JSFunctionDef *s, JSVarDef *vd)
     }
 }
 
+static BOOL ts_is_type_name(JSFunctionDef *fd, JSAtom name)
+{
+    int i;
+    for(i = 0; i < fd->ts_type_name_count; i++) {
+        if (fd->ts_type_names[i] == name)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* TypeScript import elision: the import entry 'idx' of the module of
+   'fd' is used as a value */
+static int ts_mark_import_used(JSContext *ctx, JSFunctionDef *fd, int idx)
+{
+    int n = fd->module->import_entries_count;
+    if (fd->ts_import_used_size < n) {
+        uint8_t *tab = js_realloc(ctx, fd->ts_import_used, n);
+        if (!tab)
+            return -1;
+        memset(tab + fd->ts_import_used_size, 0, n - fd->ts_import_used_size);
+        fd->ts_import_used = tab;
+        fd->ts_import_used_size = n;
+    }
+    fd->ts_import_used[idx] = 1;
+    return 0;
+}
+
+/* the module closure variable 'cv_idx' of 'fd' is referenced */
+static int ts_mark_closure_var_used(JSContext *ctx, JSFunctionDef *fd,
+                                    int cv_idx)
+{
+    JSModuleDef *m = fd->module;
+    int i;
+    if (!fd->is_ts || !m)
+        return 0;
+    for(i = 0; i < m->import_entries_count; i++) {
+        if (m->import_entries[i].var_idx == cv_idx)
+            return ts_mark_import_used(ctx, fd, i);
+    }
+    return 0;
+}
+
+/* Emit, in 's', the access to the member 'var_name' of the TypeScript
+   namespace or enum closure 'fd' (an ancestor of 's' or 's' itself): a
+   property of its argument 0. */
+static void ts_emit_ns_member_access(JSContext *ctx, JSFunctionDef *s,
+                                     JSFunctionDef *fd, JSAtom var_name,
+                                     int op, DynBuf *bc)
+{
+    int idx;
+
+    if (fd == s) {
+        dbuf_putc(bc, OP_get_arg);
+        dbuf_put_u16(bc, 0);
+    } else {
+        capture_var(fd, &fd->args[0]);
+        idx = get_closure_var(ctx, s, fd, JS_CLOSURE_ARG, 0, JS_ATOM_NULL,
+                              FALSE, FALSE, JS_VAR_NORMAL);
+        if (idx < 0) {
+            dbuf_set_error(bc);
+            return;
+        }
+        dbuf_putc(bc, OP_get_var_ref);
+        dbuf_put_u16(bc, idx);
+    }
+    switch(op) {
+    case OP_scope_get_var_checkthis:
+    case OP_scope_get_var_undef:
+    case OP_scope_get_var:
+        dbuf_putc(bc, OP_get_field);
+        dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+        break;
+    case OP_scope_get_ref:
+        /* this = the namespace object */
+        dbuf_putc(bc, OP_get_field2);
+        dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+        break;
+    case OP_scope_put_var:
+    case OP_scope_put_var_init:
+        dbuf_putc(bc, OP_swap);
+        dbuf_putc(bc, OP_put_field);
+        dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+        break;
+    case OP_scope_make_ref:
+        /* (object, property) reference */
+        dbuf_putc(bc, OP_push_atom_value);
+        dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+        break;
+    case OP_scope_delete_var:
+        dbuf_putc(bc, OP_drop);
+        dbuf_putc(bc, OP_push_false);
+        break;
+    default:
+        abort();
+    }
+}
+
+static BOOL ts_is_ns_member(JSFunctionDef *fd, JSAtom var_name)
+{
+    return fd->ts_ns && ts_ns_find_member(fd->ts_ns, var_name) != NULL;
+}
+
+/* Return the TypeScript enum or namespace that 'name' denotes at
+   'scope_level' in 's', or NULL if it is another binding or if the
+   binding cannot be statically resolved ('with', direct eval). */
+static TSNamespace *ts_resolve_ns(JSContext *ctx, JSFunctionDef *s,
+                                  JSAtom name, int scope_level)
+{
+    JSFunctionDef *fd = s;
+    TSNamespaceMember *me;
+    int idx;
+
+    for(;;) {
+        for(idx = fd->scopes[scope_level].first; idx >= 0;
+            idx = fd->vars[idx].scope_next) {
+            JSVarDef *vd = &fd->vars[idx];
+            if (vd->var_name == name) {
+                return ts_find_decl(fd, name, vd->scope_level ?
+                                    vd->scope_level : fd->body_scope);
+            }
+            if (vd->var_name == JS_ATOM__with_)
+                return NULL;
+        }
+        if (idx != ARG_SCOPE_END) {
+            idx = find_var(ctx, fd, name);
+            if (idx >= 0) {
+                if (idx & ARGUMENT_VAR_OFFSET)
+                    return NULL;
+                return ts_find_decl(fd, name, fd->body_scope);
+            }
+        }
+        if (fd->ts_ns) {
+            me = ts_ns_find_member(fd->ts_ns, name);
+            if (me)
+                return me->child;
+        }
+        if (fd->var_object_idx >= 0 || fd->arg_var_object_idx >= 0 ||
+            fd->has_eval_call)
+            return NULL;
+        if ((name == JS_ATOM_arguments && fd->has_arguments_binding) ||
+            (fd->is_func_expr && fd->func_name == name))
+            return NULL;
+        if (fd->is_eval || !fd->parent)
+            break;
+        scope_level = fd->parent_scope_level;
+        fd = fd->parent;
+    }
+    if (fd->eval_type == JS_EVAL_TYPE_DIRECT)
+        return NULL;
+    return ts_find_decl(fd, name, fd->body_scope);
+}
+
+static int ts_skip_line_num(const uint8_t *bc_buf, int bc_len, int pos)
+{
+    while (pos < bc_len && bc_buf[pos] == OP_line_num)
+        pos += opcode_info[OP_line_num].size;
+    return pos;
+}
+
+/* Fold 'E.A', 'E["A"]' or 'N.E.A' where 'E' is a const enum of the
+   compilation unit to the constant value of 'A'. 'pos' is the position
+   of an OP_scope_get_var. Return the position after the folded code, 0
+   if not folded or -1 if error. */
+static int ts_fold_const_enum(JSContext *ctx, JSFunctionDef *s,
+                              const uint8_t *bc_buf, int bc_len, int pos,
+                              DynBuf *bc)
+{
+    JSAtom name = get_u32(bc_buf + pos + 1);
+    int scope = get_u16(bc_buf + pos + 5);
+    int p, nb_atoms, i, cpool_idx;
+    JSAtom atoms[8];
+    TSNamespace *ns;
+    TSNamespaceMember *me;
+    JSValue v;
+    double d;
+
+    ns = ts_resolve_ns(ctx, s, name, scope);
+    if (!ns)
+        return 0;
+    p = pos + opcode_info[OP_scope_get_var].size;
+    nb_atoms = 0;
+    for(;;) {
+        JSAtom prop;
+        p = ts_skip_line_num(bc_buf, bc_len, p);
+        if (p >= bc_len)
+            return 0;
+        if (bc_buf[p] == OP_get_field) {
+            prop = get_u32(bc_buf + p + 1);
+            p += opcode_info[OP_get_field].size;
+        } else if (bc_buf[p] == OP_push_atom_value) {
+            int p1;
+            prop = get_u32(bc_buf + p + 1);
+            p1 = ts_skip_line_num(bc_buf, bc_len,
+                                  p + opcode_info[OP_push_atom_value].size);
+            if (p1 >= bc_len || bc_buf[p1] != OP_get_array_el)
+                return 0;
+            p = p1 + opcode_info[OP_get_array_el].size;
+        } else {
+            return 0;
+        }
+        if (nb_atoms >= countof(atoms))
+            return 0;
+        atoms[nb_atoms++] = prop;
+        me = ts_ns_find_member(ns, prop);
+        if (!me)
+            return 0;
+        if (ns->kind == TS_NS_CONST_ENUM)
+            break;
+        ns = me->child;
+        if (!ns)
+            return 0;
+    }
+    if (JS_IsUninitialized(me->value))
+        return 0;
+    v = me->value;
+    if (!JS_IsString(v) && !JS_ToFloat64(ctx, &d, v) &&
+        d >= INT32_MIN && d <= INT32_MAX && d == (int32_t)d &&
+        !(d == 0 && signbit(d))) {
+        dbuf_putc(bc, OP_push_i32);
+        dbuf_put_u32(bc, (int32_t)d);
+    } else {
+        if (js_resize_array(ctx, (void *)&s->cpool, sizeof(s->cpool[0]),
+                            &s->cpool_size, s->cpool_count + 1))
+            return -1;
+        cpool_idx = s->cpool_count++;
+        s->cpool[cpool_idx] = JS_DupValue(ctx, v);
+        dbuf_putc(bc, OP_push_const);
+        dbuf_put_u32(bc, cpool_idx);
+    }
+    /* the folded opcodes own their atoms */
+    JS_FreeAtom(ctx, name);
+    for(i = 0; i < nb_atoms; i++)
+        JS_FreeAtom(ctx, atoms[i]);
+    return p;
+}
+
+/* TRUE if const enums are declared in the compilation unit of 's' */
+static BOOL ts_unit_has_const_enum(JSFunctionDef *s)
+{
+    while (s->parent)
+        s = s->parent;
+    return s->ts_has_const_enum;
+}
+
+/* TypeScript import elision (isolatedModules semantics): drop the
+   imported bindings that are never used as values and the import
+   declarations whose bindings were all dropped (but not the side
+   effect imports 'import "x"'). Called after the variables of the
+   module function are resolved. */
+static int ts_elide_imports(JSContext *ctx, JSFunctionDef *fd)
+{
+    JSModuleDef *m = fd->module;
+    int i, j, k, *remap;
+    BOOL used;
+
+    j = 0;
+    for(i = 0; i < m->import_entries_count; i++) {
+        JSImportEntry *mi = &m->import_entries[i];
+        used = (i < fd->ts_import_used_size && fd->ts_import_used[i]);
+        for(k = 0; k < fd->ts_elidable_req_count; k++) {
+            if (fd->ts_elidable_reqs[k] == mi->req_module_idx)
+                break;
+        }
+        if (used || k == fd->ts_elidable_req_count) {
+            if (!mi->is_star)
+                fd->closure_var[mi->var_idx].var_idx = j;
+            m->import_entries[j++] = *mi;
+        } else {
+            /* never accessed: a plain module variable */
+            fd->closure_var[mi->var_idx].closure_type = JS_CLOSURE_MODULE_DECL;
+            JS_FreeAtom(ctx, mi->import_name);
+        }
+    }
+    m->import_entries_count = j;
+
+    if (fd->ts_elidable_req_count == 0 || m->req_module_entries_count == 0)
+        return 0;
+    remap = js_malloc(ctx, sizeof(remap[0]) * m->req_module_entries_count);
+    if (!remap)
+        return -1;
+    for(i = 0; i < m->req_module_entries_count; i++)
+        remap[i] = 0;
+    /* remap[i] = 1 if the declaration can be dropped */
+    for(k = 0; k < fd->ts_elidable_req_count; k++)
+        remap[fd->ts_elidable_reqs[k]] = 1;
+    for(i = 0; i < m->import_entries_count; i++)
+        remap[m->import_entries[i].req_module_idx] = 0;
+    for(i = 0; i < m->export_entries_count; i++) {
+        JSExportEntry *me = &m->export_entries[i];
+        if (me->export_type == JS_EXPORT_TYPE_INDIRECT)
+            remap[me->u.req_module_idx] = 0;
+    }
+    for(i = 0; i < m->star_export_entries_count; i++)
+        remap[m->star_export_entries[i].req_module_idx] = 0;
+    j = 0;
+    for(i = 0; i < m->req_module_entries_count; i++) {
+        JSReqModuleEntry *rme = &m->req_module_entries[i];
+        if (remap[i]) {
+            JS_FreeAtom(ctx, rme->module_name);
+            JS_FreeValue(ctx, rme->attributes);
+            remap[i] = -1;
+        } else {
+            m->req_module_entries[j] = *rme;
+            remap[i] = j++;
+        }
+    }
+    m->req_module_entries_count = j;
+    for(i = 0; i < m->import_entries_count; i++) {
+        JSImportEntry *mi = &m->import_entries[i];
+        mi->req_module_idx = remap[mi->req_module_idx];
+    }
+    for(i = 0; i < m->export_entries_count; i++) {
+        JSExportEntry *me = &m->export_entries[i];
+        if (me->export_type == JS_EXPORT_TYPE_INDIRECT)
+            me->u.req_module_idx = remap[me->u.req_module_idx];
+    }
+    for(i = 0; i < m->star_export_entries_count; i++) {
+        JSStarExportEntry *se = &m->star_export_entries[i];
+        se->req_module_idx = remap[se->req_module_idx];
+    }
+    js_free(ctx, remap);
+    return 0;
+}
+
 /* return the position of the next opcode or -1 if error */
 static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                              JSAtom var_name, int scope_level, int op,
@@ -34924,6 +38607,11 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
         }
         goto done;
     }
+    /* TypeScript namespace or enum member */
+    if (!is_arg_scope && !is_pseudo_var && ts_is_ns_member(s, var_name)) {
+        ts_emit_ns_member_access(ctx, s, s, var_name, op, bc);
+        goto done;
+    }
     /* check eval object */
     if (!is_arg_scope && s->var_object_idx >= 0 && !is_pseudo_var) {
         dbuf_putc(bc, OP_get_loc);
@@ -34973,6 +38661,10 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
             var_idx = find_var(ctx, fd, var_name);
             if (var_idx >= 0)
                 break;
+            if (!is_pseudo_var && ts_is_ns_member(fd, var_name)) {
+                ts_emit_ns_member_access(ctx, s, fd, var_name, op, bc);
+                goto done;
+            }
         }
         if (is_pseudo_var) {
             var_idx = resolve_pseudo_var(ctx, fd, var_name);
@@ -35026,6 +38718,8 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
         for (idx1 = 0; idx1 < fd->closure_var_count; idx1++) {
             JSClosureVar *cv = &fd->closure_var[idx1];
             if (var_name == cv->var_name) {
+                if (ts_mark_closure_var_used(ctx, fd, idx1))
+                    dbuf_set_error(bc);
                 if (fd != s) {
                     JSClosureTypeEnum closure_type;
                     if (cv->closure_type == JS_CLOSURE_GLOBAL ||
@@ -36073,6 +39767,16 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
         op = bc_buf[pos];
         len = opcode_info[op].size;
         pos_next = pos + len;
+        if (op == OP_scope_get_var && s->is_ts && ts_unit_has_const_enum(s)) {
+            /* TypeScript const enum member: compile time constant */
+            int pos1 = ts_fold_const_enum(ctx, s, bc_buf, bc_len, pos, &bc_out);
+            if (pos1 < 0)
+                goto fail;
+            if (pos1 > 0) {
+                pos_next = pos1;
+                continue;
+            }
+        }
         switch(op) {
         case OP_line_num:
             line_num = get_u32(bc_buf + pos + 1);
@@ -37824,6 +41528,20 @@ static int add_global_variables(JSContext *ctx, JSFunctionDef *fd)
         }
     }
 
+    if (fd->is_ts && fd->module) {
+        /* TypeScript: an import merged with a local declaration of the
+           same name only imports a type (tsc rejects the merge with a
+           value), so the local declaration is the binding */
+        for(i = 0; i < fd->global_var_count; i++) {
+            idx = find_closure_var(ctx, fd, fd->global_vars[i].var_name);
+            if (idx >= 0) {
+                JSClosureVar *cv = &fd->closure_var[idx];
+                JS_FreeAtom(ctx, cv->var_name);
+                cv->var_name = JS_ATOM_NULL;
+            }
+        }
+    }
+
     if (need_global_closures) {
         JSClosureTypeEnum closure_type;
         if (fd->module)
@@ -37856,6 +41574,8 @@ static int add_global_variables(JSContext *ctx, JSFunctionDef *fd)
                 int import_idx;
                 import_idx = find_import_local(fd, m, me->local_name);
                 if (import_idx >= 0) {
+                    if (fd->is_ts && ts_mark_import_used(ctx, fd, import_idx))
+                        return -1;
                     mi = &m->import_entries[import_idx];
                     me->export_type = JS_EXPORT_TYPE_INDIRECT;
                     me->u.req_module_idx = mi->req_module_idx;
@@ -37877,6 +41597,16 @@ static int add_global_variables(JSContext *ctx, JSFunctionDef *fd)
             if (me->export_type == JS_EXPORT_TYPE_LOCAL) {
                 idx = find_closure_var(ctx, fd, me->local_name);
                 if (idx < 0) {
+                    if (fd->is_ts && ts_is_type_name(fd, me->local_name)) {
+                        /* TypeScript: 'export { T }' of a type */
+                        JS_FreeAtom(ctx, me->local_name);
+                        JS_FreeAtom(ctx, me->export_name);
+                        memmove(me, me + 1, (m->export_entries_count - i - 1) *
+                                sizeof(*me));
+                        m->export_entries_count--;
+                        i--;
+                        continue;
+                    }
                     JS_ThrowSyntaxErrorAtom(ctx, "exported variable '%s' does not exist",
                                             me->local_name);
                     return -1;
@@ -37968,6 +41698,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 #endif
 
     if (resolve_variables(ctx, fd))
+        goto fail;
+
+    if (fd->module && fd->is_ts && ts_elide_imports(ctx, fd))
         goto fail;
 
 #if defined(DUMP_BYTECODE) && (DUMP_BYTECODE & 2)
@@ -38144,6 +41877,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         list_del(&fd->link);
     }
 
+    js_free_function_def_ts(ctx, fd);
     js_free(ctx, fd);
     return JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b);
  fail:
@@ -38386,6 +42120,13 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     is_expr = (func_type != JS_PARSE_FUNC_STATEMENT &&
                func_type != JS_PARSE_FUNC_VAR);
 
+    if (s->ts && !is_expr) {
+        /* overload signature: no code and no binding */
+        int ret = ts_skip_function_signature(s);
+        if (ret)
+            return ret < 0 ? -1 : 0;
+    }
+
     if (func_type == JS_PARSE_FUNC_STATEMENT ||
         func_type == JS_PARSE_FUNC_VAR ||
         func_type == JS_PARSE_FUNC_EXPR) {
@@ -38533,7 +42274,23 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         emit_op(s, OP_check_ctor);
     }
 
+    if (s->ts && func_type != JS_PARSE_FUNC_CLASS_STATIC_INIT &&
+        s->token.val == '<') {
+        /* type parameters */
+        if (ts_skip_type_params(s, TS_TP_CONST) < 0)
+            goto fail;
+    }
+
+    if (s->ts && (func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR ||
+                  func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR)) {
+        if (ts_scan_param_props(s, fd))
+            goto fail;
+    }
+
     if (func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
+        /* with useDefineForClassFields semantics, the parameter
+           properties are fields defined before the other fields */
+        ts_emit_param_prop_decls(s, fd);
         emit_class_field_init(s);
     }
 
@@ -38583,6 +42340,26 @@ static __exception int js_parse_function_decl2(JSParseState *s,
             BOOL rest = FALSE;
             int idx, has_initializer;
 
+            if (s->ts) {
+                if (s->token.val == TOK_THIS && fd->arg_count == 0 &&
+                    func_type != JS_PARSE_FUNC_ARROW) {
+                    /* 'this' parameter: type only */
+                    if (next_token(s) || ts_skip_type_annotation(s))
+                        goto fail;
+                    if (s->token.val == ')')
+                        break;
+                    if (js_parse_expect(s, ','))
+                        goto fail;
+                    continue;
+                }
+                if (s->token.val == '@' &&
+                    js_parse_param_decorators(s, dp, fd->arg_count))
+                    goto fail;
+                while (ts_is_param_modifier(s)) {
+                    if (next_token(s))
+                        goto fail;
+                }
+            }
             if (s->token.val == TOK_ELLIPSIS) {
                 if (func_type == JS_PARSE_FUNC_SETTER)
                     goto fail_accessor;
@@ -38627,6 +42404,15 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                     goto fail;
                 if (next_token(s))
                     goto fail;
+                if (s->ts) {
+                    /* optional parameter and type annotation */
+                    if (s->token.val == '?' && next_token(s))
+                        goto fail;
+                    if (dp && dp->metadata && dec_params_add_type(s, dp, rest))
+                        goto fail;
+                    if (ts_skip_type_annotation(s))
+                        goto fail;
+                }
                 if (rest) {
                     emit_op(s, OP_rest);
                     emit_u16(s, idx);
@@ -38739,6 +42525,17 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     if (next_token(s))
         goto fail;
 
+    if (s->ts && s->token.val == ':') {
+        /* return type */
+        if (dp && dp->metadata) {
+            if (ts_meta_get_annotation(s, &dp->return_type))
+                goto fail;
+            dp->has_return_type = TRUE;
+        }
+        if (next_token(s) || ts_skip_return_type(s))
+            goto fail;
+    }
+
     /* generator function: yield after the parameters are evaluated */
     if (func_kind == JS_FUNC_GENERATOR ||
         func_kind == JS_FUNC_ASYNC_GENERATOR)
@@ -38749,6 +42546,9 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     fd->in_function_body = TRUE;
     push_scope(s);  /* enter body scope */
     fd->body_scope = fd->scope_level;
+
+    if (func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR)
+        ts_emit_param_prop_assigns(s, fd);
 
     if (s->token.val == TOK_ARROW && func_type == JS_PARSE_FUNC_ARROW) {
         if (next_token(s))
@@ -39135,12 +42935,23 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
         fd->func_kind = JS_FUNC_ASYNC;
     }
     s->is_module = (m != NULL);
-    s->allow_html_comments = !s->is_module;
+    /* TypeScript has no Annex B HTML comments */
+    s->allow_html_comments = !s->is_module && !(flags & JS_EVAL_FLAG_TYPESCRIPT);
 
     push_scope(s); /* body scope */
     fd->body_scope = fd->scope_level;
 
+    if ((flags & JS_EVAL_FLAG_TYPESCRIPT) && eval_type != JS_EVAL_TYPE_DIRECT) {
+        if (ts_parse_init(s))
+            goto fail;
+        fd->is_ts = TRUE;
+        s->ts_legacy_decorators =
+            (flags & JS_EVAL_FLAG_TS_LEGACY_DECORATORS) != 0;
+        s->ts_decorator_metadata = s->ts_legacy_decorators &&
+            (flags & JS_EVAL_FLAG_TS_DECORATOR_METADATA) != 0;
+    }
     err = js_parse_program(s);
+    ts_parse_end(s);
     if (err) {
     fail:
         free_token(s, &s->token);

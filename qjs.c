@@ -86,21 +86,66 @@ static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
     return ret;
 }
 
-static int eval_file(JSContext *ctx, const char *filename, int module, int strict)
+/* read the standard input (zero terminated like js_load_file()) */
+static uint8_t *load_stdin(JSContext *ctx, size_t *pbuf_len)
+{
+    uint8_t *buf = NULL, *new_buf;
+    size_t len = 0, size = 0, n;
+
+    for(;;) {
+        if (len + 1 >= size) {
+            size = size ? size * 2 : 4096;
+            new_buf = js_realloc(ctx, buf, size);
+            if (!new_buf) {
+                js_free(ctx, buf);
+                return NULL;
+            }
+            buf = new_buf;
+        }
+        n = fread(buf + len, 1, size - len - 1, stdin);
+        if (n == 0)
+            break;
+        len += n;
+    }
+    buf[len] = '\0';
+    *pbuf_len = len;
+    return buf;
+}
+
+/* 'filename' = "-" reads the standard input. 'typescript' forces
+   TypeScript, otherwise it is selected by the file extension. */
+static int eval_file(JSContext *ctx, const char *filename, int module, int strict,
+                     int typescript)
 {
     uint8_t *buf;
-    int ret, eval_flags;
+    int ret, eval_flags, ts_flag;
     size_t buf_len;
 
-    buf = js_load_file(ctx, &buf_len, filename);
+    if (!strcmp(filename, "-")) {
+        buf = load_stdin(ctx, &buf_len);
+        filename = "<stdin>";
+    } else {
+        buf = js_load_file(ctx, &buf_len, filename);
+    }
     if (!buf) {
         perror(filename);
         exit(1);
     }
 
+    if (typescript) {
+        ts_flag = js_std_get_typescript_flag(ctx, ".ts");
+    } else {
+        ts_flag = js_std_get_typescript_flag(ctx, filename);
+        if (ts_flag < 0) {
+            js_std_dump_error(ctx);
+            js_free(ctx, buf);
+            return -1;
+        }
+    }
     if (module < 0) {
-        module = (has_suffix(filename, ".mjs") ||
-                  JS_DetectModule((const char *)buf, buf_len));
+        module = (has_suffix(filename, ".mjs") || has_suffix(filename, ".mts") ||
+                  (!has_suffix(filename, ".cts") &&
+                   JS_DetectModule((const char *)buf, buf_len)));
     }
     if (module) {
         eval_flags = JS_EVAL_TYPE_MODULE;
@@ -109,7 +154,7 @@ static int eval_file(JSContext *ctx, const char *filename, int module, int stric
         if (strict)
             eval_flags |= JS_EVAL_FLAG_STRICT;
     }
-    ret = eval_buf(ctx, buf, buf_len, filename, eval_flags);
+    ret = eval_buf(ctx, buf, buf_len, filename, eval_flags | ts_flag);
     js_free(ctx, buf);
     return ret;
 }
@@ -308,13 +353,17 @@ static size_t get_suffixed_size(const char *str)
 void help(void)
 {
     printf("QuickJS version " CONFIG_VERSION "\n"
-           "usage: " PROG_NAME " [options] [file [args]]\n"
+           "usage: " PROG_NAME " [options] [file [args]]  (file = - reads stdin)\n"
            "-h  --help         list options\n"
            "-e  --eval EXPR    evaluate EXPR\n"
            "-i  --interactive  go to interactive mode\n"
            "-m  --module       load as ES6 module (default=autodetect)\n"
            "    --script       load as ES6 script (default=autodetect)\n"
            "    --strict       force strict mode\n"
+           "    --typescript   parse the scripts as TypeScript (default: from the\n"
+           "                   .ts, .mts and .cts file extensions)\n"
+           "    --experimental-decorators  TypeScript legacy decorators\n"
+           "    --emit-decorator-metadata  TypeScript legacy decorator metadata\n"
            "-I  --include file include an additional file\n"
            "    --std          make 'std' and 'os' available to the loaded script\n"
            "-T  --trace        trace memory allocation\n"
@@ -344,6 +393,8 @@ int main(int argc, char **argv)
     int empty_run = 0;
     int module = -1;
     int strict = 0;
+    int typescript = 0;
+    int ts_flags = 0;
     int load_std = 0;
     int dump_unhandled_promise_rejection = 1;
     size_t memory_limit = 0;
@@ -415,6 +466,19 @@ int main(int argc, char **argv)
             }
             if (!strcmp(longopt, "strict")) {
                 strict = 1;
+                continue;
+            }
+            if (!strcmp(longopt, "typescript")) {
+                typescript = 1;
+                continue;
+            }
+            if (!strcmp(longopt, "experimental-decorators")) {
+                ts_flags |= JS_EVAL_FLAG_TS_LEGACY_DECORATORS;
+                continue;
+            }
+            if (!strcmp(longopt, "emit-decorator-metadata")) {
+                ts_flags |= JS_EVAL_FLAG_TS_LEGACY_DECORATORS |
+                    JS_EVAL_FLAG_TS_DECORATOR_METADATA;
                 continue;
             }
             if (opt == 'd' || !strcmp(longopt, "dump")) {
@@ -500,7 +564,7 @@ int main(int argc, char **argv)
     }
 
     /* loader for ES6 modules */
-    JS_SetModuleLoaderFunc2(rt, NULL, js_module_loader, js_module_check_attributes, NULL);
+    JS_SetModuleLoaderFunc2(rt, js_module_normalize, js_module_loader, js_module_check_attributes, NULL);
 
     if (dump_unhandled_promise_rejection) {
         JS_SetHostPromiseRejectionTracker(rt, js_std_promise_rejection_tracker,
@@ -520,7 +584,7 @@ int main(int argc, char **argv)
         }
 
         for(i = 0; i < include_count; i++) {
-            if (eval_file(ctx, include_list[i], 0, strict))
+            if (eval_file(ctx, include_list[i], 0, strict, typescript))
                 goto fail;
         }
 
@@ -533,6 +597,8 @@ int main(int argc, char **argv)
                 if (strict)
                     eval_flags |= JS_EVAL_FLAG_STRICT;
             }
+            if (typescript)
+                eval_flags |= js_std_get_typescript_flag(ctx, ".ts");
             if (eval_buf(ctx, expr, strlen(expr), "<cmdline>", eval_flags))
                 goto fail;
         } else
@@ -542,7 +608,7 @@ int main(int argc, char **argv)
         } else {
             const char *filename;
             filename = argv[optind];
-            if (eval_file(ctx, filename, module, strict))
+            if (eval_file(ctx, filename, module, strict, typescript))
                 goto fail;
         }
         if (interactive) {

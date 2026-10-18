@@ -1104,6 +1104,8 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
     JSValueConst options_obj;
     BOOL backtrace_barrier = FALSE;
     BOOL is_async = FALSE;
+    BOOL is_typescript = FALSE;
+    BOOL legacy_decorators, decorator_metadata;
     int flags;
 
     if (argc >= 2) {
@@ -1113,6 +1115,15 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
             return JS_EXCEPTION;
         if (get_bool_option(ctx, &is_async, options_obj,
                             "async"))
+            return JS_EXCEPTION;
+        if (get_bool_option(ctx, &is_typescript, options_obj,
+                            "typescript"))
+            return JS_EXCEPTION;
+        if (get_bool_option(ctx, &legacy_decorators, options_obj,
+                            "experimentalDecorators"))
+            return JS_EXCEPTION;
+        if (get_bool_option(ctx, &decorator_metadata, options_obj,
+                            "emitDecoratorMetadata"))
             return JS_EXCEPTION;
     }
 
@@ -1130,6 +1141,13 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
         flags |= JS_EVAL_FLAG_BACKTRACE_BARRIER;
     if (is_async)
         flags |= JS_EVAL_FLAG_ASYNC;
+    if (is_typescript) {
+        flags |= JS_EVAL_FLAG_TYPESCRIPT;
+        if (legacy_decorators)
+            flags |= JS_EVAL_FLAG_TS_LEGACY_DECORATORS;
+        if (decorator_metadata)
+            flags |= JS_EVAL_FLAG_TS_DECORATOR_METADATA;
+    }
     ret = JS_Eval(ctx, str, len, "<evalScript>", flags);
     JS_FreeCString(ctx, str);
     if (!ts->recv_pipe && --ts->eval_script_recurse == 0) {
@@ -3985,7 +4003,7 @@ static void *worker_func(void *opaque)
     JS_SetStripInfo(rt, args->strip_flags);
     js_std_init_handlers(rt);
 
-    JS_SetModuleLoaderFunc2(rt, NULL, js_module_loader, js_module_check_attributes, NULL);
+    JS_SetModuleLoaderFunc2(rt, js_module_normalize, js_module_loader, js_module_check_attributes, NULL);
 
     /* set the pipe to communicate with the parent */
     ts = JS_GetRuntimeOpaque(rt);

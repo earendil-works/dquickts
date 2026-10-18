@@ -345,6 +345,24 @@ static inline JSValue __JS_NewShortBigInt(JSContext *ctx, int64_t d)
 /* allow top-level await in normal script. JS_Eval() returns a
    promise. Only allowed with JS_EVAL_TYPE_GLOBAL */
 #define JS_EVAL_FLAG_ASYNC (1 << 7)
+/* parse the source as TypeScript: type annotations and other type-only
+   syntax are erased while parsing, enums, namespaces and parameter
+   properties are compiled directly to bytecode, 'const enum' members
+   are folded to constants and module imports only used as types are
+   elided. Only applies to the evaluated source: direct eval() code and
+   Function() bodies are always JavaScript. See the "TypeScript" section
+   of the documentation for the supported subset. */
+#define JS_EVAL_FLAG_TYPESCRIPT (1 << 8)
+/* with JS_EVAL_FLAG_TYPESCRIPT: TypeScript legacy decorators (tsc
+   'experimentalDecorators') instead of the standard ECMAScript
+   decorators. Ignored without JS_EVAL_FLAG_TYPESCRIPT. */
+#define JS_EVAL_FLAG_TS_LEGACY_DECORATORS (1 << 9)
+/* with JS_EVAL_FLAG_TS_LEGACY_DECORATORS: the decorated members and
+   classes also get the 'design:type', 'design:paramtypes' and
+   'design:returntype' metadata computed from their type annotations
+   (tsc 'emitDecoratorMetadata'), defined with Reflect.metadata() when
+   it exists at run time. */
+#define JS_EVAL_FLAG_TS_DECORATOR_METADATA (1 << 10)
 
 typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
