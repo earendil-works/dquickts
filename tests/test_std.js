@@ -485,6 +485,32 @@ function test_async_promise_rejection()
     os.setTimeout(() => { assert(counter, 3) }, 10);
 }
 
+/* ng bug1672: the Array.prototype loops which do not call user code for
+   holes must still poll the interrupt handler. A pending SIGINT makes
+   the handler of std.evalScript() interrupt the evaluation. */
+function test_array_loop_interrupt()
+{
+    var names = [ "every", "some", "forEach", "filter", "reduce",
+                  "reduceRight", "find", "findIndex", "findLast",
+                  "findLastIndex", "includes", "indexOf", "lastIndexOf" ];
+    os.signal(os.SIGINT, function() { });
+    for (var name of names) {
+        var args = name.startsWith("reduce") ? "() => 0, 0" :
+            (name.endsWith("Of") || name == "includes") ? "1" : "() => false";
+        var e = undefined;
+        os.kill(os.getpid(), os.SIGINT);
+        try {
+            std.evalScript("Array.prototype." + name +
+                           ".call({length: 2**53 - 1}, " + args + ")");
+        } catch (ex) {
+            e = ex;
+        }
+        assert(e instanceof InternalError, true, name);
+        assert(e.message, "interrupted", name);
+    }
+    os.signal(os.SIGINT, null);
+}
+
 test_printf();
 test_file1();
 test_file2();

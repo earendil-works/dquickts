@@ -479,6 +479,13 @@ test: qjs$(EXE) tests/test_std_api$(EXE) tests/test_api$(EXE)
 	$(WINE) ./qjs$(EXE) tests/test_loop.js
 	$(WINE) ./qjs$(EXE) tests/test_bigint.js
 	$(WINE) ./qjs$(EXE) tests/test_cyclic_import.js
+	$(WINE) ./qjs$(EXE) tests/test_destructured_export.js
+	$(WINE) ./qjs$(EXE) tests/test_typescript.ts
+	$(WINE) ./qjs$(EXE) --typescript -e 'let x: number = 1; if (x !== 1) throw Error("--typescript")'
+	$(WINE) ./qjs$(EXE) tests/test_decorators.js
+	$(WINE) ./qjs$(EXE) --std --emit-decorator-metadata tests/test_decorators_legacy.ts
+	$(WINE) ./qjs$(EXE) tests/test_ng_fixes.js
+	$(WINE) ./qjs$(EXE) tests/test_using.js
 	$(WINE) ./qjs$(EXE) tests/test_worker.js
 ifndef CONFIG_WIN32
 	$(WINE) ./qjs$(EXE) tests/test_std.js

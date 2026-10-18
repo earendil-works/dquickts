@@ -232,8 +232,9 @@ static int re_string_find2(REStringList *s, int len, const uint32_t *buf,
     if (s->n_strings != 0) {
         h = h0 >> (32 - s->hash_bits);
         for(p = s->hash_table[h]; p != NULL; p = p->next) {
+            /* 'buf' can be NULL if 'len' is zero (e.g. /[\q{}]/v) */
             if (p->hash == h0 && p->len == len &&
-                !memcmp(p->buf, buf, len * sizeof(buf[0]))) {
+                (len == 0 || !memcmp(p->buf, buf, len * sizeof(buf[0])))) {
                 return 1;
             }
         }
@@ -276,7 +277,8 @@ static int re_string_find2(REStringList *s, int len, const uint32_t *buf,
     s->n_strings++;
     p->hash = h0;
     p->len = len;
-    memcpy(p->buf, buf, sizeof(buf[0]) * len);
+    if (len != 0)
+        memcpy(p->buf, buf, sizeof(buf[0]) * len);
     return 1;
 }
 
@@ -1008,7 +1010,7 @@ static int parse_class_string_disjunction(REParseState *s, REStringList *cr,
     for(;;) {
         str.size = 0;
         while (*p != '}' && *p != '|') {
-            c = get_class_atom(s, NULL, &p, FALSE);
+            c = get_class_atom(s, NULL, &p, TRUE);
             if (c < 0)
                 goto fail;
             if (dbuf_put_u32(&str, c)) {
@@ -1100,6 +1102,23 @@ static int get_class_atom(REParseState *s, REStringList *cr,
             break;
         case '-':
             if (!inclass && s->is_unicode)
+                goto invalid_escape;
+            break;
+        case '&':
+        case '!':
+        case '#':
+        case '%':
+        case ',':
+        case ':':
+        case ';':
+        case '<':
+        case '=':
+        case '>':
+        case '@':
+        case '`':
+        case '~':
+            /* ClassSetReservedPunctuator: only escapable in a 'v' class */
+            if (s->is_unicode && (!inclass || !s->unicode_sets))
                 goto invalid_escape;
             break;
         case '^':
@@ -2427,6 +2446,10 @@ static int re_parse_disjunction(REParseState *s, BOOL is_backward_dir)
 
         pos = re_emit_op_u32(s, REOP_goto, 0);
 
+        /* the scope is stored in a byte after each group name: a wrap
+           around would make groups of distinct alternatives collide */
+        if (re_has_named_captures(s) && s->group_name_scope == 255)
+            return re_parse_error(s, "too many named groups");
         s->group_name_scope++;
         
         if (re_parse_alternative(s, is_backward_dir))
@@ -2598,7 +2621,11 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
 
     /* add the named groups if needed */
     if (s->group_names.size > (s->capture_count - 1) * LRE_GROUP_NAME_TRAILER_LEN) {
-        dbuf_put(&s->byte_code, s->group_names.buf, s->group_names.size);
+        /* the flag must not announce group names which are absent */
+        if (dbuf_put(&s->byte_code, s->group_names.buf, s->group_names.size)) {
+            re_parse_out_of_memory(s);
+            goto error;
+        }
         put_u16(s->byte_code.buf + RE_HEADER_FLAGS,
                 lre_get_flags(s->byte_code.buf) | LRE_FLAG_NAMED_GROUPS);
     }
