@@ -35,6 +35,11 @@ pub struct EvalOptions {
     pub backtrace_barrier: bool,
     /// Support top-level-await.
     pub promise: bool,
+    /// Parse the source as TypeScript: types are erased while compiling (see the
+    /// TypeScript section of the QuickJS manual and [`Runtime::set_decorators`]).
+    ///
+    /// [`Runtime::set_decorators`]: crate::Runtime::set_decorators
+    pub typescript: bool,
     /// Filename. Ignored when calling eval_file_*.
     #[cfg(feature = "std")]
     pub filename: Option<StdString>,
@@ -60,6 +65,10 @@ impl EvalOptions {
             flag |= qjs::JS_EVAL_FLAG_ASYNC;
         }
 
+        if self.typescript {
+            flag |= qjs::JS_EVAL_FLAG_TYPESCRIPT;
+        }
+
         flag as i32
     }
 }
@@ -71,6 +80,7 @@ impl Default for EvalOptions {
             strict: true,
             backtrace_barrier: false,
             promise: false,
+            typescript: false,
             #[cfg(feature = "std")]
             filename: None,
         }
@@ -139,6 +149,11 @@ impl<'js> Ctx<'js> {
         file_name: &CStr,
         flag: i32,
     ) -> Result<qjs::JSValue> {
+        let flag = if flag & qjs::JS_EVAL_FLAG_TYPESCRIPT as i32 != 0 {
+            flag | self.get_opaque().decorators().eval_flags()
+        } else {
+            flag
+        };
         let mut src: Vec<u8> = source.into();
         let len = src.len();
         // JS_Eval requires the input to be null-terminated,
@@ -208,11 +223,16 @@ impl<'js> Ctx<'js> {
     }
 
     #[cfg(feature = "std")]
+    /// A `.ts`, `.mts` or `.cts` file is TypeScript.
     pub fn eval_file_with_options<V: FromJs<'js>, P: AsRef<Path>>(
         &self,
         path: P,
-        options: EvalOptions,
+        mut options: EvalOptions,
     ) -> Result<V> {
+        options.typescript |= path
+            .as_ref()
+            .to_str()
+            .is_some_and(|p| crate::module::is_typescript_name(p.as_bytes()));
         let buffer = fs::read(path.as_ref())?;
         let file_name = CString::new(
             path.as_ref()
@@ -686,6 +706,58 @@ mod test {
                 .catch(&ctx)
                 .unwrap();
         })
+    }
+
+    #[test]
+    fn eval_typescript() {
+        use crate::{context::EvalOptions, Context, Runtime};
+
+        let runtime = Runtime::new().unwrap();
+        let ctx = Context::full(&runtime).unwrap();
+        ctx.with(|ctx| {
+            let src = "enum Dir { Up = 1, Down } const d: Dir = Dir.Down; `${d} ${Dir[d]}`";
+            let options = EvalOptions {
+                typescript: true,
+                ..Default::default()
+            };
+            let value: String = ctx.eval_with_options(src, options).unwrap();
+            assert_eq!(value, "2 Down");
+            assert!(ctx.eval::<String, _>(src).is_err());
+        })
+    }
+
+    #[test]
+    fn typescript_decorators() {
+        use crate::{context::EvalOptions, runtime::Decorators, Context, Runtime};
+
+        // a legacy method decorator receives (prototype, key, descriptor), a standard one
+        // (method, context)
+        let src = r#"
+            let seen: string = "";
+            function dec(...args: any[]) { seen = String(args.length); }
+            class C { @dec m(): void {} }
+            seen
+        "#;
+        let options = || EvalOptions {
+            typescript: true,
+            ..Default::default()
+        };
+        let runtime = Runtime::new().unwrap();
+        let ctx = Context::full(&runtime).unwrap();
+        ctx.with(|ctx| {
+            assert_eq!(
+                ctx.eval_with_options::<String, _>(src, options()).unwrap(),
+                "2"
+            )
+        });
+        runtime.set_decorators(Decorators::Legacy);
+        let ctx = Context::full(&runtime).unwrap();
+        ctx.with(|ctx| {
+            assert_eq!(
+                ctx.eval_with_options::<String, _>(src, options()).unwrap(),
+                "3"
+            )
+        });
     }
 
     #[test]

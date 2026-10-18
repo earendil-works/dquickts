@@ -6,7 +6,7 @@ use crate::{
     Ctx, Error, Module, Result,
 };
 
-/// The script module loader
+/// The script module loader: `.js` files, and TypeScript `.ts`, `.mts` and `.cts` files.
 ///
 /// This loader can be used as the nested backing loader in user-defined loaders.
 #[derive(Debug)]
@@ -32,7 +32,7 @@ impl ScriptLoader {
 impl Default for ScriptLoader {
     fn default() -> Self {
         Self {
-            extensions: vec!["js".into()],
+            extensions: vec!["js".into(), "ts".into(), "mts".into(), "cts".into()],
         }
     }
 }

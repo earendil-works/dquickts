@@ -243,18 +243,35 @@ impl<'js, T> Module<'js, T> {
     }
 }
 
+/// Whether a module or file name names TypeScript source (`.ts`, `.mts`, `.cts`), which is
+/// compiled with type erasure.
+pub(crate) fn is_typescript_name(name: &[u8]) -> bool {
+    [&b".ts"[..], b".mts", b".cts"]
+        .iter()
+        .any(|ext| name.ends_with(ext))
+}
+
+/// The eval flags of the module `name`.
+fn module_flags(name: &CStr, flags: u32) -> i32 {
+    let mut flags = qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_STRICT | flags;
+    if is_typescript_name(name.to_bytes()) {
+        flags |= qjs::JS_EVAL_FLAG_TYPESCRIPT;
+    }
+    flags as i32
+}
+
 impl<'js> Module<'js, Declared> {
-    /// Declare a module but don't evaluate it.
+    /// Declare a module but don't evaluate it. A module named `*.ts`, `*.mts` or `*.cts` is
+    /// TypeScript.
     pub fn declare<N, S>(ctx: Ctx<'js>, name: N, source: S) -> Result<Module<'js, Declared>>
     where
         N: Into<Vec<u8>>,
         S: Into<Vec<u8>>,
     {
         let name = CString::new(name)?;
-        let flag =
-            qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_STRICT | qjs::JS_EVAL_FLAG_COMPILE_ONLY;
+        let flag = module_flags(&name, qjs::JS_EVAL_FLAG_COMPILE_ONLY);
 
-        let module_val = unsafe { ctx.eval_raw(source, name.as_c_str(), flag as i32)? };
+        let module_val = unsafe { ctx.eval_raw(source, name.as_c_str(), flag)? };
         let module_val = unsafe { ctx.handle_exception(module_val)? };
         unsafe { Self::from_module_value(ctx, module_val) }
     }
@@ -287,7 +304,7 @@ impl<'js> Module<'js, Declared> {
         //Ok(())
     }
 
-    /// Evaluate the source of a module.
+    /// Evaluate the source of a module (TypeScript if named `*.ts`, `*.mts` or `*.cts`).
     ///
     /// This function returns a promise which resolved when the modules was fully compiled and
     /// returns undefined.
@@ -302,9 +319,9 @@ impl<'js> Module<'js, Declared> {
         S: Into<Vec<u8>>,
     {
         let name = CString::new(name)?;
-        let flag = qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_STRICT;
+        let flag = module_flags(&name, 0);
 
-        let module_val = unsafe { ctx.eval_raw(source, name.as_c_str(), flag as i32)? };
+        let module_val = unsafe { ctx.eval_raw(source, name.as_c_str(), flag)? };
         let module_val = unsafe { ctx.handle_exception(module_val)? };
         let v = unsafe { Value::from_js_value(ctx, module_val) };
         Ok(v.into_promise().expect("evaluate should return a promise"))
@@ -703,6 +720,32 @@ mod test {
 
             assert_eq!(ns.get::<_, std::string::String>("res").unwrap(), "OK");
         });
+    }
+
+    #[test]
+    fn from_typescript() {
+        test_with(|ctx| {
+            let (module, promise) = Module::declare(
+                ctx.clone(),
+                "test.ts",
+                r#"
+            import type { Unused } from "./missing.js";
+            export const enum Base { Offset = 40 }
+            export function add(a: number, b: number = 2): number {
+                return (a as number) + b + Base.Offset;
+            }
+                "#,
+            )
+            .unwrap()
+            .eval()
+            .unwrap();
+            promise.finish::<()>().unwrap();
+            let add: crate::Function = module.namespace().unwrap().get("add").unwrap();
+            assert_eq!(add.call::<_, i32>((0,)).unwrap(), 42);
+
+            // the same source is not JavaScript
+            assert!(Module::declare(ctx.clone(), "test.js", "let x: number = 1;").is_err());
+        })
     }
 
     #[test]

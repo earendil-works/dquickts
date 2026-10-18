@@ -88,7 +88,14 @@ impl FileResolver {
     fn try_patterns(&self, path: &RelativePath) -> Option<RelativePathBuf> {
         if let Some(extension) = &path.extension() {
             if !is_file(path) {
-                return None;
+                // TypeScript sources are imported with the extension of their output:
+                // `./x.js` names `./x.ts` (`./x.mjs` names `./x.mts`)
+                let source = match *extension {
+                    "js" => path.with_extension("ts"),
+                    "mjs" => path.with_extension("mts"),
+                    _ => return None,
+                };
+                return self.try_patterns(&source);
             }
             // check for known extensions
             self.patterns
@@ -121,7 +128,7 @@ impl Default for FileResolver {
     fn default() -> Self {
         Self {
             paths: vec![],
-            patterns: vec!["{}.js".into()],
+            patterns: vec!["{}.js".into(), "{}.ts".into(), "{}.mts".into()],
         }
     }
 }
