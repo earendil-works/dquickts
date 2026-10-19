@@ -54,7 +54,7 @@ fork adds:
 | TypeScript: types erased at parse time; enums, namespaces and parameter properties compiled to bytecode | `JS_EVAL_FLAG_TYPESCRIPT`, `qjs --typescript`, `.ts`/`.mts`/`.cts` |
 | Standard decorators (2023-05), auto-accessors, `Symbol.metadata`; TypeScript legacy decorators and decorator metadata | `JS_EVAL_FLAG_TS_LEGACY_DECORATORS`, `JS_EVAL_FLAG_TS_DECORATOR_METADATA` |
 | Explicit resource management (ES2026) | `using`, `await using`, `DisposableStack`, `AsyncDisposableStack` |
-| Ports from [quickjs-ng](https://github.com/quickjs-ng/quickjs) | `queueMicrotask()`, `atob()`/`btoa()`, `DOMException`, the V8 stack trace API, promise hooks, `os.setInterval()`, and bug fixes |
+| Ports from [quickjs-ng](https://github.com/quickjs-ng/quickjs) | `queueMicrotask()`, `atob()`/`btoa()`, `DOMException`, the V8 stack trace API, promise hooks, immutable `ArrayBuffer`s, `performance`, `os.setInterval()`, `std.writeFile()`, the `bjson` module, a re-entrant event loop, C closures, private symbols, runtime dump flags, and bug fixes |
 | Embedder helpers | `JS_IsEqual()`, `JS_NewProxy()`, `JS_GetProxyTarget()`, `JS_PromiseMarkAsHandled()`, and others |
 | A REPL whose functions and variables survive restarts | `qjs --drepl FILE` |
 | Rust bindings built on this engine | [`rquickjs/`](rquickjs/README.md) |
@@ -475,6 +475,7 @@ the restored runtime.
   - contexts with the Intl or Temporal intrinsics,
   - `SharedArrayBuffer`s whose memory may be shared with another thread,
   - host-class objects with opaque data when there is no `save_opaque()` hook,
+  - C closures (`JS_NewCClosure()`), whose opaque pointer is host state,
   - any call made while JS code is running on the C stack.
 - A runtime can have only one suspended execution at a time.
 - If a suspended frame cannot be resumed (stack overflow, or the interrupt handler interrupts
@@ -485,7 +486,8 @@ the restored runtime.
 - Snapshots are trusted input, like bytecode. Truncated or mismatched snapshots are rejected,
   but malicious ones are not detected.
 - Clocks keep running. `Date.now()` reflects the time spent hibernated, and local-time methods
-  use the timezone of the process that restored the snapshot.
+  use the timezone of the process that restored the snapshot. `performance.now()` does not: it
+  continues from its value when the snapshot was written.
 
 ## TypeScript
 

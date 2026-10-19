@@ -83,7 +83,49 @@ unreleased:
     memory; JS_NewCConstructor() leak; allocation size overflows;
     std: FILE leak, std.evalScript() interrupt handler, loading pipes
     and /proc files, std.open() 'x' mode, std.popen() modes
-- snapshot format version 7
+  - immutable ArrayBuffers (ArrayBuffer.prototype.transferToImmutable(),
+    sliceToImmutable(), immutable; JS_SetImmutableArrayBuffer(),
+    JS_IsImmutableArrayBuffer()); the buffers of 'bytes' modules are
+    immutable
+  - performance is part of the engine (JS_AddPerformance(), added by
+    JS_NewContext()) and has performance.timeOrigin
+  - C API: JS_NewCClosure(), JS_NewCFunction3(), JS_NewCFunctionData2(),
+    JS_NewPrivateSymbol(), JS_Eval2(), JS_EvalThis2(), JS_ReadObject2(),
+    JS_WRITE_OBJ_STRIP_SOURCE, JS_WRITE_OBJ_STRIP_DEBUG,
+    JS_SetDumpFlags() and JS_GetDumpFlags() (DUMP_* options become
+    runtime JS_DUMP_* flags, built with CONFIG_DUMPS=y),
+    JS_AddRuntimeFinalizer(), JS_SetModuleNormalizeFunc2(),
+    JS_GetGCThreshold(), js_calloc(), js_calloc_rt() and the js_calloc
+    member of JSMallocFunctions (now its first member),
+    JS_NewStringUTF16(), JS_ToCStringLenUTF16(), JS_ToCStringUTF16(),
+    JS_FreeCStringUTF16(), JS_FreeCStringRT_UTF16(),
+    JS_New{Internal,Plain,Range,Reference,Syntax,Type}Error(),
+    JS_FreezeObject(), JS_SealObject(), JS_GetClassName(),
+    JS_IsDataView(), JS_IsWeakMap(), JS_IsWeakSet(), JS_IsModule(),
+    JS_GetPropertyValue(), JS_GetPropertyInt64(), JS_SetPropertyValue(),
+    JS_SetLength(), JS_ToNumber(), JS_ToObjectString(),
+    JS_NewUint8Array(), JS_NewUint8ArrayCopy(), JS_GetUint8Array(),
+    JS_FreeValues(), JS_FreeAtoms() and JS_CFUNC_DEF2(),
+    JS_CGETSET_DEF2(), JS_CGETSET_MAGIC_DEF2(), JS_PROP_U2D_DEF()
+  - std.writeFile(), FILE.readAsArrayBuffer(), optional position and
+    length in FILE.read()/write(), FILE.write() of strings; closing
+    std.in/out/err throws; os.cputime()
+  - built-in 'bjson' module (replaces tests/bjson.so); its read() and
+    write() take the READ_OBJ_* / WRITE_OBJ_* flags
+  - JS_WriteObject()/JS_ReadObject(): RegExp, Map, Set and Symbol values
+    and symbol-keyed properties; a checksum after the version byte
+  - std.evalScript() options compile_only, compile_module,
+    eval_function and eval_module
+  - js_std_loop_once(), js_std_poll_io(),
+    js_std_set_worker_new_runtime_func(), js_module_load()
+  - qjs: gc(), navigator.userAgent, argv0, execArgv, -v/--version,
+    -D/--dump-flags, --option=value; a file using top-level await runs
+    as a module without -m
+  - fixes: template literal substitutions are converted to strings in
+    evaluation order; source positions of import() calls; Date.parse()
+    accepts U+202F; Array.isArray() on deep Proxy chains; column of
+    decorator syntax errors
+- snapshot format version 8
 - fixed an atom leak when reading truncated bytecode
 
 2026-06-04:
