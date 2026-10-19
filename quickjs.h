@@ -1137,10 +1137,15 @@ JSValue JS_NewArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len,
                           JSFreeArrayBufferDataFunc *free_func, void *opaque,
                           JS_BOOL is_shared);
 JSValue JS_NewArrayBufferCopy(JSContext *ctx, const uint8_t *buf, size_t len);
+/* does nothing if 'obj' is an immutable ArrayBuffer */
 void JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj);
 uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst obj);
 /* TRUE for an ArrayBuffer (not a SharedArrayBuffer) */
 JS_BOOL JS_IsArrayBuffer(JSValueConst val);
+/* TRUE or FALSE if 'obj' is an ArrayBuffer, -1 otherwise */
+int JS_IsImmutableArrayBuffer(JSValueConst obj);
+/* set whether the ArrayBuffer 'obj' is immutable: 0, or -1 if not an ArrayBuffer */
+int JS_SetImmutableArrayBuffer(JSValueConst obj, JS_BOOL immutable);
 
 typedef enum JSTypedArrayEnum {
     JS_TYPED_ARRAY_UINT8C = 0,

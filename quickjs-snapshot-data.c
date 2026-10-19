@@ -32,7 +32,7 @@
  *   enqueues the cleanup job; a dead token becomes undefined, as
  *   finrec_delete_weakref() does.
  *
- * ArrayBuffer, SharedArrayBuffer: flags (detached, resizable),
+ * ArrayBuffer, SharedArrayBuffer: flags (detached, resizable, immutable),
  *   byte_length, max_byte_length, then the bytes. The data is always
  *   restored in engine allocated memory (free_func = js_array_buffer_free):
  *   buffers created by the host with JS_NewArrayBuffer() are copied and
@@ -59,6 +59,7 @@
 /* ArrayBuffer flags */
 #define SNAP_ABUF_DETACHED  (1 << 0)
 #define SNAP_ABUF_RESIZABLE (1 << 1)
+#define SNAP_ABUF_IMMUTABLE (1 << 2)
 
 /* fixup of a typed array, DataView or map iterator */
 typedef struct {
@@ -469,6 +470,8 @@ static int snap_data_write_array_buffer(SnapWriter *w, JSObject *p)
         flags |= SNAP_ABUF_DETACHED;
     if (array_buffer_is_resizable(abuf))
         flags |= SNAP_ABUF_RESIZABLE;
+    if (abuf->immutable)
+        flags |= SNAP_ABUF_IMMUTABLE;
     bc_put_u8(&w->bc, flags);
     bc_put_leb128(&w->bc, abuf->byte_length);
     if (flags & SNAP_ABUF_RESIZABLE)
@@ -496,9 +499,10 @@ static int snap_data_read_array_buffer(SnapReader *r, JSObject *p)
     max_len = len;
     if ((flags & SNAP_ABUF_RESIZABLE) && snap_get_leb(r, &max_len))
         return -1;
-    if ((flags & ~(SNAP_ABUF_DETACHED | SNAP_ABUF_RESIZABLE)) ||
+    if ((flags & ~(SNAP_ABUF_DETACHED | SNAP_ABUF_RESIZABLE | SNAP_ABUF_IMMUTABLE)) ||
         len > INT32_MAX || max_len > INT32_MAX || max_len < len ||
-        ((flags & SNAP_ABUF_DETACHED) && (shared || len != 0)))
+        ((flags & SNAP_ABUF_DETACHED) && (shared || len != 0)) ||
+        ((flags & SNAP_ABUF_IMMUTABLE) && shared))
         return snap_error(r, "invalid ArrayBuffer");
     if (!(flags & SNAP_ABUF_DETACHED) && len > r->bc.buf_end - r->bc.ptr)
         return snap_error(r, "truncated snapshot");
@@ -512,6 +516,7 @@ static int snap_data_read_array_buffer(SnapReader *r, JSObject *p)
     abuf->max_byte_length = (flags & SNAP_ABUF_RESIZABLE) ? max_len : -1;
     abuf->detached = (flags & SNAP_ABUF_DETACHED) != 0;
     abuf->shared = shared;
+    abuf->immutable = (flags & SNAP_ABUF_IMMUTABLE) != 0;
     abuf->data = NULL;
     init_list_head(&abuf->array_list);
     abuf->opaque = NULL;

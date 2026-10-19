@@ -752,6 +752,9 @@ JSValue js_module_new_value(JSContext *ctx, int type, uint8_t *buf,
             val = JS_EXCEPTION;
             break;
         }
+        /* import-bytes: the default export is backed by an immutable
+           ArrayBuffer */
+        JS_SetImmutableArrayBuffer(args[0], TRUE);
         /* byteOffset and length */
         args[1] = JS_UNDEFINED;
         args[2] = JS_UNDEFINED;
@@ -1576,8 +1579,13 @@ static JSValue js_std_file_read_write(JSContext *ctx, JSValueConst this_val,
     buf = JS_GetArrayBuffer(ctx, &size, argv[0]);
     if (!buf)
         return JS_EXCEPTION;
-    if (pos + len > size)
-        return JS_ThrowRangeError(ctx, "read/write array buffer overflow");
+    if (!magic && JS_IsImmutableArrayBuffer(argv[0]) > 0)
+        return JS_ThrowTypeError(ctx, "ArrayBuffer is immutable");
+    /* the range is clamped to the buffer; 'len' defaults to the end */
+    if (pos > size)
+        pos = size;
+    if (argc < 3 || len > size - pos)
+        len = size - pos;
     if (magic)
         ret = fwrite(buf + pos, 1, len, f);
     else
@@ -2072,6 +2080,8 @@ static JSValue js_os_read_write(JSContext *ctx, JSValueConst this_val,
     buf = JS_GetArrayBuffer(ctx, &size, argv[1]);
     if (!buf)
         return JS_EXCEPTION;
+    if (!magic && JS_IsImmutableArrayBuffer(argv[1]) > 0)
+        return JS_ThrowTypeError(ctx, "ArrayBuffer is immutable");
     if (pos + len > size)
         return JS_ThrowRangeError(ctx, "read/write array buffer overflow");
     if (magic)

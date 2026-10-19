@@ -193,6 +193,41 @@ static void test_typed_arrays(JSContext *ctx)
     CHECK(JS_GetTypedArrayType(JS_UNDEFINED) == -1);
 }
 
+static void test_immutable_array_buffer(JSContext *ctx)
+{
+    JSValue obj, sab;
+    int i;
+
+    obj = JS_NewObject(ctx);
+    sab = eval_str(ctx, "new SharedArrayBuffer(1)");
+    for(i = 0; i < 2; i++) {
+        CHECK(JS_IsImmutableArrayBuffer(JS_NULL) == -1);
+        CHECK(JS_IsImmutableArrayBuffer(JS_UNDEFINED) == -1);
+        CHECK(JS_IsImmutableArrayBuffer(obj) == -1);
+        CHECK(JS_IsImmutableArrayBuffer(sab) == -1);
+        CHECK(JS_SetImmutableArrayBuffer(JS_NULL, i) == -1);
+        CHECK(JS_SetImmutableArrayBuffer(JS_UNDEFINED, i) == -1);
+        CHECK(JS_SetImmutableArrayBuffer(obj, i) == -1);
+        CHECK(JS_SetImmutableArrayBuffer(sab, i) == -1);
+    }
+    JS_FreeValue(ctx, sab);
+    JS_FreeValue(ctx, obj);
+
+    obj = eval_str(ctx, "globalThis.ab = new ArrayBuffer(1); ab");
+    CHECK(JS_IsImmutableArrayBuffer(obj) == 0);
+    CHECK(eval_bool(ctx, "var ta = new Uint8Array(ab); ta[0] = 1; ta[0] === 1"));
+    CHECK(JS_SetImmutableArrayBuffer(obj, 1) == 0);
+    CHECK(JS_IsImmutableArrayBuffer(obj) == 1);
+    CHECK(eval_bool(ctx, "ab.immutable && !Reflect.set(ta, 0, 2) && ta[0] === 1"));
+    /* an immutable ArrayBuffer cannot be detached */
+    JS_DetachArrayBuffer(ctx, obj);
+    CHECK(eval_bool(ctx, "!ab.detached && ab.byteLength === 1"));
+    CHECK(JS_SetImmutableArrayBuffer(obj, 0) == 0);
+    CHECK(JS_IsImmutableArrayBuffer(obj) == 0);
+    CHECK(eval_bool(ctx, "!ab.immutable && Reflect.set(ta, 0, 3) && ta[0] === 3"));
+    JS_FreeValue(ctx, obj);
+}
+
 static void test_errors(JSContext *ctx)
 {
     JSValue e;
@@ -1648,6 +1683,7 @@ int main(void)
     test_numbers(ctx);
     test_predicates(ctx);
     test_typed_arrays(ctx);
+    test_immutable_array_buffer(ctx);
     test_errors(ctx);
     test_cstring(ctx);
     test_utf16_strings(ctx);

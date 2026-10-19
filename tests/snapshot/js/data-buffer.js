@@ -1,6 +1,6 @@
 // ArrayBuffer, SharedArrayBuffer, every typed array type and DataView:
 // contents, views sharing a buffer, resizable buffers with length-tracking
-// views, detached buffers.
+// views, detached buffers, immutable buffers.
 function fmt(v) {
     if (typeof v === "bigint") return v + "n";
     if (Object.is(v, -0)) return "-0";
@@ -75,6 +75,16 @@ sabView[1] = 42;
 var growable = new SharedArrayBuffer(4, { maxByteLength: 16 });
 new Uint8Array(growable).set([4, 3, 2, 1]);
 
+// immutable buffers; 'toFreeze' becomes immutable in a later job
+var imm = new Uint8Array([10, 20, 30, 40]).buffer.transferToImmutable(6);
+var immView = new Int16Array(imm, 2, 2);
+var immDv = new DataView(imm);
+var immSlice = shared.sliceToImmutable(1, 4);
+var toFreeze = new ArrayBuffer(3);
+var toFreezeView = new Uint8Array(toFreeze);
+toFreezeView.set([7, 8, 9]);
+var frozen = null;
+
 function attempt(f) {
     try { return String(f()); } catch (e) { return e.name; }
 }
@@ -107,6 +117,16 @@ function report(label) {
     print("sab", sab instanceof SharedArrayBuffer, sab.byteLength, sabView.join(","),
           growable.growable, growable.byteLength, growable.maxByteLength,
           new Uint8Array(growable).join(","), Object.prototype.toString.call(sab));
+    var d = Object.getOwnPropertyDescriptor(immView, "0");
+    print("imm", imm.immutable, imm.resizable, imm.byteLength, new Uint8Array(imm).join(","),
+          immView.join(","), immDv.getUint16(0, true), d.writable, d.configurable,
+          Reflect.set(immView, 0, 1), Reflect.set(immView, 5, 1),
+          attempt(() => immView.fill(0)), attempt(() => immDv.setUint8(0, 1)),
+          attempt(() => imm.transfer()), attempt(() => imm.resize(0)), imm.detached);
+    print("immSlice", immSlice.immutable, new Uint8Array(immSlice).join(","), shared.immutable);
+    print("frozen", toFreeze.detached, toFreeze.immutable, toFreezeView.length,
+          frozen && frozen.immutable, frozen && new Uint8Array(frozen).join(","),
+          frozen && Reflect.set(new Uint8Array(frozen), 0, 0));
 }
 report("initial");
 
@@ -121,6 +141,7 @@ Promise.resolve().then(() => {
     f64[0] = -0;
     dvAll.setFloat32(12, 1.5);
     sabView[0] = -7;
+    frozen = toFreeze.transferToImmutable(4);
     all.forEach(ta => { ta[0] = ta[ta.length - 1]; });
     rab.resize(16);
     track.fill(9, 8);

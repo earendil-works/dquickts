@@ -314,6 +314,17 @@ the function, so a suspension (see @code{JS_RequestSuspend()}) can
 happen during the disposal, but not during the disposal of a
 @code{DisposableStack}.
 
+The immutable ArrayBuffers (TC39 proposal, stage 2.7) are supported:
+@code{ArrayBuffer.prototype.transferToImmutable()},
+@code{ArrayBuffer.prototype.sliceToImmutable()} and the
+@code{ArrayBuffer.prototype.immutable} getter. The contents of an
+immutable ArrayBuffer cannot be modified through typed arrays,
+@code{DataView} or @code{Atomics}, and the buffer cannot be detached
+nor resized. The host can change the immutability of an ArrayBuffer
+with @code{JS_SetImmutableArrayBuffer()} (@code{JS_DetachArrayBuffer()}
+does nothing on an immutable ArrayBuffer). The binary JSON format does
+not keep the immutability: a read ArrayBuffer is always mutable.
+
 @subsection ECMA402
 
 ECMA402 (Internationalization API) is not supported.
@@ -516,7 +527,7 @@ loaded by @code{qjs}:
 string (UTF-8 encoding).
 
 @item @code{"bytes"}: the default export is the file contents as an
-@code{Uint8Array}.
+@code{Uint8Array} backed by an immutable ArrayBuffer.
 
 @end itemize
 
@@ -771,7 +782,9 @@ Clear the error indication.
 
 @item read(buffer, position, length)
 Read @code{length} bytes from the file to the ArrayBuffer @code{buffer} at byte
-position @code{position} (wrapper to the libc @code{fread}).
+position @code{position} (wrapper to the libc @code{fread}). The
+range is clamped to the buffer. @code{buffer} must not be immutable.
+Return the number of bytes read.
 
 @item write(buffer, position, length)
 Write @code{length} bytes to the file from the ArrayBuffer @code{buffer} at byte
@@ -836,7 +849,8 @@ Seek in the file. Use @code{std.SEEK_*} for
 
 @item read(fd, buffer, offset, length)
 Read @code{length} bytes from the file handle @code{fd} to the
-ArrayBuffer @code{buffer} at byte position @code{offset}.
+ArrayBuffer @code{buffer} at byte position @code{offset}. @code{buffer}
+must not be immutable.
 Return the number of read bytes or < 0 if error.
 
 @item write(fd, buffer, offset, length)

@@ -533,6 +533,73 @@ static void test_incremental(void)
     free(other);
 }
 
+/* the immutable flag of ArrayBuffers round-trips in full snapshots and in
+   deltas, including base buffers made immutable (or mutable again) with
+   JS_SetImmutableArrayBuffer() */
+static void test_immutable_buffer(void)
+{
+    static const char check_src[] =
+        "[ab.immutable, !ab.detached, Reflect.set(view, 0, 9), view.join(),"
+        " frozen.immutable, Reflect.set(frozenView, 0, 9), frozenView.join()].join(' ')";
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = new_context(rt), *ctx2;
+    uint8_t *full, *base, *d1, *d2;
+    size_t full_size, base_size, d1_size, d2_size;
+    JSValue ab;
+
+    JS_FreeValue(ctx, eval(ctx,
+        "var ab = new ArrayBuffer(4); var view = new Uint8Array(ab); view.set([1, 2, 3, 4]);"
+        "var frozen = new Uint8Array([5, 6]).buffer.transferToImmutable();"
+        "var frozenView = new Uint8Array(frozen);"));
+    base = write_snapshot_flags(ctx, &base_size, NULL, 0, JS_SNAPSHOT_BASE);
+    CHECK(base != NULL);
+    ab = eval(ctx, "ab");
+    CHECK(JS_SetImmutableArrayBuffer(ab, 1) == 0);
+    JS_FreeValue(ctx, ab);
+    d1 = write_snapshot_flags(ctx, &d1_size, NULL, 0, JS_SNAPSHOT_DELTA);
+    CHECK(d1 != NULL);
+    full = write_snapshot(ctx, &full_size, NULL, 0);
+    CHECK(full != NULL);
+    free_context_and_runtime(ctx);
+    if (!base || !d1 || !full)
+        goto done;
+
+    ctx2 = read_snapshot(full, full_size, NULL, 0);
+    if (ctx2) {
+        CHECK_STRING(ctx2, eval(ctx2, check_src), "true true false 1,2,3,4 true false 5,6");
+        free_context_and_runtime(ctx2);
+    }
+    ctx2 = read_snapshot(base, base_size, NULL, 0);
+    if (ctx2) {
+        CHECK_STRING(ctx2, eval(ctx2, check_src), "false true true 9,2,3,4 true false 5,6");
+        free_context_and_runtime(ctx2);
+    }
+    ctx2 = read_snapshot(base, base_size, d1, d1_size);
+    if (!ctx2)
+        goto done;
+    CHECK_STRING(ctx2, eval(ctx2, check_src), "true true false 1,2,3,4 true false 5,6");
+    /* mutable again in a delta written by the restored runtime */
+    ab = eval(ctx2, "ab");
+    CHECK(JS_IsImmutableArrayBuffer(ab) == 1);
+    CHECK(JS_SetImmutableArrayBuffer(ab, 0) == 0);
+    JS_FreeValue(ctx2, ab);
+    d2 = write_snapshot_flags(ctx2, &d2_size, NULL, 0, JS_SNAPSHOT_DELTA);
+    CHECK(d2 != NULL);
+    free_context_and_runtime(ctx2);
+    if (d2) {
+        ctx2 = read_snapshot(base, base_size, d2, d2_size);
+        if (ctx2) {
+            CHECK_STRING(ctx2, eval(ctx2, check_src), "false true true 9,2,3,4 true false 5,6");
+            free_context_and_runtime(ctx2);
+        }
+        free(d2);
+    }
+ done:
+    free(base);
+    free(d1);
+    free(full);
+}
+
 /* touch every property reachable from the global object so that every
    lazily instantiated builtin exists, then hibernate: all the code
    pointers of the engine must be in the registry */
@@ -1043,6 +1110,7 @@ int main(void)
     test_gc_during_write();
     test_two_realms();
     test_incremental();
+    test_immutable_buffer();
     test_reproducible_base();
     test_suspend_call();
     test_errors();

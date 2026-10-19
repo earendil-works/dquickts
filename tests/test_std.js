@@ -431,7 +431,7 @@ async function test_interval()
 
 async function test_module_types()
 {
-    var ns, ns2;
+    var ns, ns2, f, read;
 
     /* the 'type' attribute wins over the .json suffix */
     ns = await import("./fixture_text_module.json", { with: { type: "text" } });
@@ -442,6 +442,24 @@ async function test_module_types()
     assert(ns.default.join(), "104,195,169,10");
     ns2 = await import("./fixture_bytes_module.txt", { with: { type: "bytes" } });
     assert(ns2.default === ns.default);
+
+    /* the default export is backed by an immutable ArrayBuffer: reading
+       a file into it fails */
+    assert(ns.default.buffer.immutable, true);
+    f = std.tmpfile();
+    f.puts("xy");
+    f.seek(0, std.SEEK_SET);
+    for (read of [() => f.read(ns.default.buffer, 0, 1),
+                  () => os.read(f.fileno(), ns.default.buffer, 0, 1)]) {
+        try {
+            read();
+            assert(false, true, "read into an immutable buffer");
+        } catch(e) {
+            assert(e instanceof TypeError, true, e);
+        }
+    }
+    f.close();
+    assert(ns.default.join(), "104,195,169,10");
 
     try {
         await import("./fixture_none.txt", { with: { type: "css" } });
