@@ -67,7 +67,7 @@ check: all
 	./$(OBJDIR)/test_hibernate -d $(SCRIPTS) $(UPSTREAM_TESTS)
 	sh cross_process.sh ./$(OBJDIR)/hibernate js/hibernate-sync.js \
 	    js/control-async.js js/control-generators.js js/data-map.js \
-	    js/control-using.js
+	    js/control-using.js js/core-performance.js
 
 stress:
 	$(MAKE) OBJDIR=$(OBJDIR)-stress EXTRA_CFLAGS=-DJS_INTERRUPT_COUNTER_INIT=97 \

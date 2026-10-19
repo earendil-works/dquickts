@@ -1000,12 +1000,647 @@ static void test_version(void)
     }
 }
 
+static void test_dump_flags(void)
+{
+    JSRuntime *rt, *rt2;
+    uint64_t flags = JS_DUMP_LEAKS | JS_DUMP_GC;
+
+    rt = JS_NewRuntime();
+    rt2 = JS_NewRuntime();
+    CHECK(JS_GetDumpFlags(rt) == 0);
+    JS_SetDumpFlags(rt, flags);
+    /* 0 if the dumps are compiled out (no ENABLE_DUMPS) */
+    CHECK(JS_GetDumpFlags(rt) == flags || JS_GetDumpFlags(rt) == 0);
+    /* the flags are per runtime */
+    CHECK(JS_GetDumpFlags(rt2) == 0);
+    JS_SetDumpFlags(rt, 0);
+    CHECK(JS_GetDumpFlags(rt) == 0);
+    JS_FreeRuntime(rt2);
+    JS_FreeRuntime(rt);
+}
+
+/* evaluate 'str' and return TRUE if its string conversion contains 'sub' */
+static int eval_contains(JSContext *ctx, const char *str, const char *sub)
+{
+    JSValue v = eval_str(ctx, str);
+    const char *s;
+    int ret;
+    CHECK(!JS_IsException(v));
+    s = JS_ToCString(ctx, v);
+    CHECK(s != NULL);
+    ret = strstr(s, sub) != NULL;
+    JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, v);
+    return ret;
+}
+
+/* string conversion of the pending exception contains 'sub' */
+static int exception_contains(JSContext *ctx, const char *sub)
+{
+    JSValue exc = JS_GetException(ctx);
+    JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
+    const char *s1 = JS_ToCString(ctx, exc), *s2 = JS_ToCString(ctx, stack);
+    int ret = (s1 && strstr(s1, sub)) || (s2 && strstr(s2, sub));
+    JS_FreeCString(ctx, s1);
+    JS_FreeCString(ctx, s2);
+    JS_FreeValue(ctx, stack);
+    JS_FreeValue(ctx, exc);
+    return ret;
+}
+
+static JSValue cfunc_data_sum(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv, int magic,
+                              JSValue *func_data)
+{
+    int32_t a, b;
+    if (JS_ToInt32(ctx, &a, func_data[0]) || JS_ToInt32(ctx, &b, argv[0]))
+        return JS_EXCEPTION;
+    return JS_NewInt32(ctx, a + b + magic);
+}
+
+static JSValue cfunc_plain(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv)
+{
+    return JS_NewInt32(ctx, argc);
+}
+
+static int closure_calls, closure_finalized;
+
+static JSValue closure_func(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv, int magic,
+                            void *opaque)
+{
+    int *counter = opaque;
+    /* at least 'length' arguments are readable */
+    if (argc < 3)
+        CHECK(JS_IsUndefined(argv[2]));
+    if (JS_IsString(argv[0]))
+        return JS_ThrowTypeError(ctx, "from closure");
+    closure_calls++;
+    return JS_NewInt32(ctx, ++*counter * 100 + magic);
+}
+
+static void closure_finalize(void *opaque)
+{
+    CHECK(*(int *)opaque > 0);
+    closure_finalized++;
+}
+
+static void test_cfunctions(void)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue data = JS_NewInt32(ctx, 40), proto, f;
+    static int counter1, counter2;
+
+    /* JS_NewCFunctionData2() */
+    set_global(ctx, "fd", JS_NewCFunctionData2(ctx, cfunc_data_sum, "fdname",
+                                               1, 7, 1, &data));
+    set_global(ctx, "fd0", JS_NewCFunctionData2(ctx, cfunc_data_sum, NULL,
+                                                3, 0, 1, &data));
+    CHECK(eval_bool(ctx, "fd.name === 'fdname' && fd.length === 1 && fd(2) === 49"));
+    CHECK(eval_bool(ctx, "fd0.name === '' && fd0.length === 3"));
+
+    /* JS_NewCFunction3(): explicit prototype */
+    proto = eval_str(ctx, "({ marker: 1 })");
+    CHECK(!JS_IsException(proto));
+    f = JS_NewCFunction3(ctx, cfunc_plain, "f3", 2, JS_CFUNC_generic, 0,
+                         proto, 0);
+    CHECK(!JS_IsException(f));
+    set_global(ctx, "proto3", proto);
+    set_global(ctx, "f3", f);
+    CHECK(eval_bool(ctx, "Object.getPrototypeOf(f3) === proto3 && f3.marker === 1 && "
+                    "f3.name === 'f3' && f3.length === 2 && f3(1, 2, 3) === 3"));
+
+    /* JS_NewCClosure(): opaque and magic given to each call */
+    set_global(ctx, "c1", JS_NewCClosure(ctx, closure_func, "cclosure",
+                                         closure_finalize, 3, 5, &counter1));
+    set_global(ctx, "c2", JS_NewCClosure(ctx, closure_func, NULL,
+                                         closure_finalize, 3, 6, &counter2));
+    CHECK(eval_bool(ctx, "c1.name === 'cclosure' && c1.length === 3 && "
+                    "c2.name === '' && typeof c1 === 'function' && "
+                    "c1() === 105 && c1() === 205 && c2() === 106"));
+    CHECK(closure_calls == 3 && counter1 == 2 && counter2 == 1);
+    CHECK(JS_IsException(eval_str(ctx, "c1('throw')")));
+    CHECK(exception_contains(ctx, "TypeError: from closure"));
+    CHECK(JS_IsException(eval_str(ctx, "c1('throw')")));
+    CHECK(exception_contains(ctx, "at cclosure (native)"));
+    CHECK(eval_bool(ctx, "c1.call({}, 1, 2, 3) === 305 && "
+                    "c1.bind(null)() === 405"));
+
+    /* the opaque finalizer runs when the closure is freed */
+    CHECK(eval_bool(ctx, "delete globalThis.c2"));
+    JS_RunGC(rt);
+    CHECK(closure_finalized == 1);
+    JS_FreeContext(ctx);
+    CHECK(closure_finalized == 1);
+    JS_FreeRuntime(rt);
+    CHECK(closure_finalized == 2);
+}
+
+/* proxy handler logging every trap call in 'traps' */
+static const char proxy_handler_src[] =
+    "globalThis.traps = [];"
+    "globalThis.handler = {};"
+    "for (const t of ['get', 'set', 'has', 'defineProperty', 'deleteProperty',"
+    "                 'getOwnPropertyDescriptor', 'ownKeys'])"
+    "    handler[t] = (...args) => { traps.push(t); return Reflect[t](...args); };";
+
+static void test_private_symbols(void)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue pub, priv, priv2, obj, proxy, v, s;
+    JSAtom pub_atom, priv_atom, priv2_atom;
+    uint8_t *buf;
+    size_t len;
+
+    pub = JS_NewSymbol(ctx, "public", 0);
+    priv = JS_NewPrivateSymbol(ctx, "private");
+    priv2 = JS_NewPrivateSymbol(ctx, NULL);
+    CHECK(JS_IsSymbol(pub) && JS_IsSymbol(priv) && JS_IsSymbol(priv2));
+    pub_atom = JS_ValueToAtom(ctx, pub);
+    priv_atom = JS_ValueToAtom(ctx, priv);
+    priv2_atom = JS_ValueToAtom(ctx, priv2);
+
+    obj = eval_str(ctx, "({ str: 1 })");
+    CHECK(JS_DefinePropertyValue(ctx, obj, pub_atom, JS_NewInt32(ctx, 2),
+                                 JS_PROP_C_W_E) == 1);
+    CHECK(JS_DefinePropertyValue(ctx, obj, priv_atom, JS_NewInt32(ctx, 3),
+                                 JS_PROP_C_W_E) == 1);
+    CHECK(JS_SetProperty(ctx, obj, priv2_atom, JS_NewInt32(ctx, 4)) == 1);
+    set_global(ctx, "o", JS_DupValue(ctx, obj));
+    set_global(ctx, "pub", JS_DupValue(ctx, pub));
+
+    /* visible to C */
+    v = JS_GetProperty(ctx, obj, priv_atom);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 3);
+    CHECK(JS_HasProperty(ctx, obj, priv2_atom) == 1);
+    /* hidden from JS reflection */
+    CHECK(eval_bool(ctx, "Object.getOwnPropertySymbols(o).length === 1 && "
+                    "Object.getOwnPropertySymbols(o)[0] === pub"));
+    CHECK(eval_bool(ctx, "Reflect.ownKeys(o).length === 2"));
+    CHECK(eval_bool(ctx, "Object.getOwnPropertySymbols(Object.assign({}, o)).length === 1"));
+    CHECK(eval_bool(ctx, "JSON.stringify(Object.getOwnPropertyDescriptors(o)).length < 200 && "
+                    "Object.keys(Object.getOwnPropertyDescriptors(o)).length === 1"));
+
+    /* proxies: never given to the traps, own properties of the proxy */
+    v = eval_str(ctx, proxy_handler_src);
+    CHECK(!JS_IsException(v));
+    JS_FreeValue(ctx, v);
+    proxy = eval_str(ctx, "new Proxy(o, handler)");
+    CHECK(!JS_IsException(proxy));
+    set_global(ctx, "p", JS_DupValue(ctx, proxy));
+    v = JS_GetProperty(ctx, proxy, priv_atom);
+    CHECK(JS_IsUndefined(v)); /* not forwarded to the target */
+    CHECK(JS_SetProperty(ctx, proxy, priv_atom, JS_NewInt32(ctx, 5)) == 1);
+    v = JS_GetProperty(ctx, proxy, priv_atom);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 5);
+    CHECK(JS_HasProperty(ctx, proxy, priv_atom) == 1);
+    CHECK(JS_DeleteProperty(ctx, proxy, priv_atom, 0) == 1);
+    CHECK(JS_HasProperty(ctx, proxy, priv_atom) == 0);
+    v = JS_GetProperty(ctx, obj, priv_atom);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 3);
+    CHECK(eval_bool(ctx, "traps.length === 0"));
+    CHECK(eval_bool(ctx, "Reflect.ownKeys(p).length === 2 && traps.join() === 'ownKeys'"));
+
+    /* JS_WriteObject() writes the enumerable string and symbol
+       properties but not the private symbols */
+    buf = JS_WriteObject(ctx, &len, obj, 0);
+    CHECK(buf != NULL);
+    v = JS_ReadObject(ctx, buf, len, 0);
+    js_free(ctx, buf);
+    CHECK(JS_IsObject(v));
+    CHECK(JS_HasProperty(ctx, v, priv_atom) == 0);
+    set_global(ctx, "copy", v);
+    CHECK(eval_bool(ctx, "Reflect.ownKeys(copy).length === 2 && "
+                    "Reflect.ownKeys(copy)[0] === 'str' && "
+                    "Reflect.ownKeys(copy)[1] !== pub && "
+                    "Reflect.ownKeys(copy)[1].description === 'public' && "
+                    "copy[Reflect.ownKeys(copy)[1]] === 2"));
+
+    /* a private symbol keeps its description */
+    s = JS_GetPropertyStr(ctx, priv, "description");
+    CHECK(JS_IsString(s));
+    JS_FreeValue(ctx, s);
+    s = JS_GetPropertyStr(ctx, priv2, "description");
+    CHECK(JS_IsUndefined(s));
+
+    JS_FreeAtom(ctx, pub_atom);
+    JS_FreeAtom(ctx, priv_atom);
+    JS_FreeAtom(ctx, priv2_atom);
+    JS_FreeValue(ctx, proxy);
+    JS_FreeValue(ctx, obj);
+    JS_FreeValue(ctx, pub);
+    JS_FreeValue(ctx, priv);
+    JS_FreeValue(ctx, priv2);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static JSValue eval2(JSContext *ctx, const char *str, const char *filename,
+                     int line_num, int eval_flags)
+{
+    JSEvalOptions options = {
+        .version = JS_EVAL_OPTIONS_VERSION,
+        .eval_flags = eval_flags,
+        .filename = filename,
+        .line_num = line_num,
+    };
+    return JS_Eval2(ctx, str, strlen(str), &options);
+}
+
+static void test_eval2(void)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSEvalOptions options = { .version = JS_EVAL_OPTIONS_VERSION + 1 };
+    JSValue v, this_obj;
+    int32_t res;
+
+    /* file name and first line number */
+    v = eval2(ctx, "1;\nthrow new Error('at line 2')", "file.js", 10,
+              JS_EVAL_TYPE_GLOBAL);
+    CHECK(JS_IsException(v));
+    CHECK(exception_contains(ctx, "file.js:11"));
+    v = eval2(ctx, "1;\n\n  (", "syntax.js", 5, JS_EVAL_TYPE_GLOBAL);
+    CHECK(JS_IsException(v));
+    CHECK(exception_contains(ctx, "syntax.js:7"));
+    v = eval2(ctx, "function f() {\n  return new Error().stack;\n}\nf()",
+              "fn.js", 100, JS_EVAL_TYPE_GLOBAL);
+    CHECK(JS_IsString(v));
+    set_global(ctx, "st", v);
+    CHECK(eval_bool(ctx, "st.includes('fn.js:101') && st.includes('fn.js:103')"));
+    /* defaults: "<unnamed>", line 1 */
+    v = JS_Eval2(ctx, "throw new Error()", 17, NULL);
+    CHECK(JS_IsException(v));
+    CHECK(exception_contains(ctx, "<unnamed>:1"));
+    v = eval2(ctx, "new Error().stack", NULL, 0, JS_EVAL_TYPE_GLOBAL);
+    set_global(ctx, "st", v);
+    CHECK(eval_bool(ctx, "st.includes('<unnamed>:1')"));
+
+    /* our extra eval flags */
+    v = eval2(ctx, "let x: number = 41; x + 1", "a.ts", 1,
+              JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_TYPESCRIPT);
+    CHECK(JS_ToInt32(ctx, &res, v) == 0 && res == 42);
+    v = eval2(ctx, "let y: number = 41; y + 1", "a.js", 1, JS_EVAL_TYPE_GLOBAL);
+    CHECK(JS_IsException(v));
+    CHECK(exception_contains(ctx, "SyntaxError"));
+    v = eval2(ctx, "function deco(c: any) { c.tagged = true; }\n"
+              "@deco class C {}\nC.tagged", "d.ts", 1,
+              JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_TYPESCRIPT |
+              JS_EVAL_FLAG_TS_LEGACY_DECORATORS);
+    CHECK(JS_IsBool(v) && JS_ToBool(ctx, v));
+    v = eval2(ctx, "export const z: number = 1;", "m.ts", 1,
+              JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_TYPESCRIPT |
+              JS_EVAL_FLAG_COMPILE_ONLY);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_MODULE);
+    JS_FreeValue(ctx, v);
+
+    /* JS_EvalThis2() */
+    this_obj = eval_str(ctx, "({ answer: 42 })");
+    options.version = JS_EVAL_OPTIONS_VERSION;
+    options.eval_flags = JS_EVAL_TYPE_GLOBAL;
+    v = JS_EvalThis2(ctx, this_obj, "this.answer", 11, &options);
+    CHECK(JS_ToInt32(ctx, &res, v) == 0 && res == 42);
+    JS_FreeValue(ctx, this_obj);
+
+    /* unknown options version */
+    options.version = JS_EVAL_OPTIONS_VERSION + 1;
+    v = JS_Eval2(ctx, "1", 1, &options);
+    CHECK(JS_IsException(v));
+    CHECK(exception_contains(ctx, "JSEvalOptions"));
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static int buf_contains(const uint8_t *buf, size_t len, const char *str)
+{
+    size_t i, n = strlen(str);
+    for(i = 0; i + n <= len; i++) {
+        if (!memcmp(buf + i, str, n))
+            return 1;
+    }
+    return 0;
+}
+
+static void test_write_strip(void)
+{
+    static const char src[] =
+        "function marker_fn() { return 'marker body'; }\n"
+        "function thrower() { throw new Error('x'); }\n"
+        "globalThis.marker_fn = marker_fn; globalThis.thrower = thrower;";
+    static const int strip_flags[3] = {
+        0, JS_WRITE_OBJ_STRIP_SOURCE, JS_WRITE_OBJ_STRIP_DEBUG,
+    };
+    size_t len[3];
+    int i;
+
+    for(i = 0; i < 3; i++) {
+        JSRuntime *rt = JS_NewRuntime();
+        JSContext *ctx = JS_NewContext(rt);
+        JSValue fun;
+        uint8_t *buf;
+        int has_source, has_filename;
+
+        fun = JS_Eval(ctx, src, strlen(src), "strip_test.js",
+                      JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        CHECK(!JS_IsException(fun));
+        buf = JS_WriteObject(ctx, &len[i], fun,
+                             JS_WRITE_OBJ_BYTECODE | strip_flags[i]);
+        CHECK(buf != NULL);
+        JS_FreeValue(ctx, fun);
+        has_source = buf_contains(buf, len[i], "return 'marker body'");
+        has_filename = buf_contains(buf, len[i], "strip_test.js");
+        CHECK(has_source == (i == 0));
+        CHECK(has_filename == (i != 2));
+
+        /* the stripped bytecode still runs */
+        fun = JS_ReadObject(ctx, buf, len[i], JS_READ_OBJ_BYTECODE);
+        js_free(ctx, buf);
+        CHECK(!JS_IsException(fun));
+        fun = JS_EvalFunction(ctx, fun);
+        CHECK(!JS_IsException(fun));
+        JS_FreeValue(ctx, fun);
+        CHECK(eval_bool(ctx, "marker_fn() === 'marker body'"));
+        CHECK(eval_contains(ctx, "marker_fn.toString()", "marker body") == (i == 0));
+        CHECK(JS_IsException(eval_str(ctx, "thrower()")));
+        CHECK(exception_contains(ctx, "strip_test.js:2") == (i != 2));
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+    }
+    CHECK(len[0] > len[1] && len[1] > len[2]);
+}
+
+/* reference counted SharedArrayBuffer memory */
+typedef struct {
+    int64_t ref_count;
+    uint8_t buf[];
+} TestSab;
+
+static TestSab *test_sab(void *ptr)
+{
+    return (TestSab *)((uint8_t *)ptr - offsetof(TestSab, buf));
+}
+
+static void *t_sab_alloc(void *opaque, size_t size)
+{
+    TestSab *sab = calloc(1, sizeof(*sab) + size);
+    CHECK(sab != NULL);
+    sab->ref_count = 1;
+    return sab->buf;
+}
+
+static void t_sab_free(void *opaque, void *ptr)
+{
+    if (--test_sab(ptr)->ref_count == 0)
+        free(test_sab(ptr));
+}
+
+static void t_sab_dup(void *opaque, void *ptr)
+{
+    test_sab(ptr)->ref_count++;
+}
+
+static const JSSharedArrayBufferFunctions t_sab_funcs = {
+    t_sab_alloc, t_sab_free, t_sab_dup, NULL,
+};
+
+static void test_read_object2(void)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx;
+    JSValue sab, copy;
+    uint8_t *buf, **wtab, **rtab;
+    size_t len, wlen, rlen;
+
+    JS_SetSharedArrayBufferFunctions(rt, &t_sab_funcs);
+    ctx = JS_NewContext(rt);
+
+    sab = eval_str(ctx, "globalThis.sab = new SharedArrayBuffer(16); "
+                   "[sab, sab, new Uint8Array(sab)]");
+    CHECK(!JS_IsException(sab));
+    buf = JS_WriteObject2(ctx, &len, sab,
+                          JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE,
+                          &wtab, &wlen);
+    CHECK(buf != NULL && wlen == 1);
+    copy = JS_ReadObject2(ctx, buf, len,
+                          JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE,
+                          &rtab, &rlen);
+    CHECK(!JS_IsException(copy));
+    /* the memory of each SharedArrayBuffer read */
+    CHECK(rlen == 1 && rtab[0] == wtab[0]);
+    CHECK(test_sab(rtab[0])->ref_count == 2);
+    set_global(ctx, "copy", copy);
+    CHECK(eval_bool(ctx, "copy[0] === copy[1] && copy[0] !== sab && "
+                    "(new Uint8Array(sab)[3] = 7, copy[2][3] === 7)"));
+    js_free(ctx, rtab);
+    /* NULL tab: nothing returned */
+    copy = JS_ReadObject2(ctx, buf, len,
+                          JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE, NULL, &rlen);
+    CHECK(!JS_IsException(copy) && rlen == 1);
+    JS_FreeValue(ctx, copy);
+    /* SharedArrayBuffers are rejected without JS_READ_OBJ_SAB */
+    copy = JS_ReadObject2(ctx, buf, len, JS_READ_OBJ_REFERENCE, &rtab, &rlen);
+    CHECK(JS_IsException(copy));
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    js_free(ctx, rtab);
+    js_free(ctx, wtab);
+    js_free(ctx, buf);
+    JS_FreeValue(ctx, sab);
+    eval_bool(ctx, "delete globalThis.copy");
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static char finalizer_log[8];
+
+static void runtime_finalizer(JSRuntime *rt, void *arg)
+{
+    strncat(finalizer_log, arg, sizeof(finalizer_log) - strlen(finalizer_log) - 1);
+}
+
+static void test_runtime(void)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+
+    JS_SetGCThreshold(rt, 123456);
+    CHECK(JS_GetGCThreshold(rt) == 123456);
+    JS_SetGCThreshold(rt, -1);
+    CHECK(JS_GetGCThreshold(rt) == (size_t)-1);
+
+    CHECK(JS_AddRuntimeFinalizer(rt, runtime_finalizer, (void *)"a") == 0);
+    CHECK(JS_AddRuntimeFinalizer(rt, runtime_finalizer, (void *)"b") == 0);
+    JS_FreeContext(ctx);
+    CHECK(finalizer_log[0] == '\0');
+    JS_FreeRuntime(rt);
+    /* LIFO order, once */
+    CHECK(!strcmp(finalizer_log, "ba"));
+}
+
+static char normalize_log[256];
+
+static char *normalize2(JSContext *ctx, const char *base_name,
+                        const char *name, JSValueConst attributes,
+                        void *opaque)
+{
+    JSValue str = JS_JSONStringify(ctx, attributes, JS_UNDEFINED, JS_UNDEFINED);
+    const char *s = JS_IsException(str) ? NULL : JS_ToCString(ctx, str);
+    size_t len = strlen(normalize_log);
+    CHECK(opaque == normalize_log);
+    snprintf(normalize_log + len, sizeof(normalize_log) - len, "%s:%s;",
+             name, JS_IsUndefined(str) ? "undefined" : s);
+    JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, str);
+    return js_strdup(ctx, name);
+}
+
+static int loader_calls;
+
+static JSModuleDef *loader2(JSContext *ctx, const char *name, void *opaque,
+                            JSValueConst attributes)
+{
+    static const char src[] = "export default globalThis.counter = (globalThis.counter ?? 0) + 1;";
+    JSValue fun = JS_Eval(ctx, src, strlen(src), name,
+                          JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(fun))
+        return NULL;
+    loader_calls++;
+    JS_FreeValue(ctx, fun);
+    return JS_VALUE_GET_PTR(fun);
+}
+
+static void test_normalize2(void)
+{
+    static const char src[] =
+        "import a from 'dep.js';\n"
+        "import b from 'dep.js' with { kind: 'x' };\n"
+        "import c from 'dep.js' with { kind: 'x' };\n"
+        "globalThis.res = [a, b, c].join();\n"
+        "import('dep.js', { with: { kind: 'y' } }).then(ns => globalThis.dyn = ns.default);\n";
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue v;
+
+    JS_SetModuleLoaderFunc2(rt, NULL, loader2, NULL, normalize_log);
+    JS_SetModuleNormalizeFunc2(rt, normalize2);
+    v = JS_Eval(ctx, src, strlen(src), "main.js", JS_EVAL_TYPE_MODULE);
+    CHECK(!JS_IsException(v));
+    JS_FreeValue(ctx, v);
+    run_jobs(rt);
+    CHECK(!strcmp(normalize_log, "dep.js:undefined;dep.js:{\"kind\":\"x\"};"
+                  "dep.js:{\"kind\":\"x\"};dep.js:{\"kind\":\"y\"};"));
+    /* the modules are keyed by name and attributes */
+    CHECK(loader_calls == 3);
+    CHECK(eval_bool(ctx, "res === '1,2,2' && dyn === 3"));
+
+    /* JS_SetModuleLoaderFunc2() resets the attribute-aware normalizer */
+    JS_SetModuleLoaderFunc2(rt, NULL, loader2, NULL, normalize_log);
+    normalize_log[0] = '\0';
+    v = JS_Eval(ctx, "import d from 'other.js';", 25, "main2.js",
+                JS_EVAL_TYPE_MODULE);
+    CHECK(!JS_IsException(v));
+    JS_FreeValue(ctx, v);
+    run_jobs(rt);
+    CHECK(normalize_log[0] == '\0' && loader_calls == 4);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static int calloc_calls, calloc_large_calls;
+
+static void *t_calloc(JSMallocState *s, size_t count, size_t size)
+{
+    void *ptr = calloc(count, size);
+    if (ptr) {
+        calloc_calls++;
+        if (count * size >= 4096)
+            calloc_large_calls++;
+        s->malloc_count++;
+    }
+    return ptr;
+}
+
+static void *t_malloc(JSMallocState *s, size_t size)
+{
+    void *ptr = malloc(size);
+    if (ptr)
+        s->malloc_count++;
+    return ptr;
+}
+
+static void t_free(JSMallocState *s, void *ptr)
+{
+    if (ptr)
+        s->malloc_count--;
+    free(ptr);
+}
+
+static void *t_realloc(JSMallocState *s, void *ptr, size_t size)
+{
+    if (!ptr)
+        return size ? t_malloc(s, size) : NULL;
+    if (size == 0) {
+        t_free(s, ptr);
+        return NULL;
+    }
+    return realloc(ptr, size);
+}
+
+static const JSMallocFunctions t_mf = {
+    t_calloc, t_malloc, t_free, t_realloc, NULL,
+};
+
+static void test_calloc(void)
+{
+    JSRuntime *rt = JS_NewRuntime2(&t_mf, NULL);
+    JSContext *ctx;
+    uint8_t *p;
+    int i, n, ok;
+
+    CHECK(rt != NULL);
+    CHECK(calloc_calls > 0); /* the runtime itself, class table... */
+    ctx = JS_NewContext(rt);
+    n = calloc_large_calls;
+    /* large zero initialized engine allocations use the host calloc */
+    CHECK(eval_bool(ctx, "new Uint8Array(new ArrayBuffer(100000)).every(x => x === 0)"));
+    CHECK(calloc_large_calls > n);
+
+    p = js_calloc_rt(rt, 3, 7);
+    CHECK(p != NULL);
+    for(i = 0, ok = 1; i < 21; i++)
+        ok &= p[i] == 0;
+    CHECK(ok);
+    js_free_rt(rt, p);
+    p = js_calloc(ctx, 1000, 10);
+    CHECK(p != NULL && p[0] == 0 && p[9999] == 0);
+    js_free(ctx, p);
+    /* count * size overflow */
+    CHECK(js_calloc_rt(rt, SIZE_MAX / 2, 4) == NULL);
+    CHECK(js_calloc(ctx, SIZE_MAX / 2, 4) == NULL);
+    CHECK(exception_contains(ctx, "out of memory"));
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     JSRuntime *rt;
     JSContext *ctx;
 
     test_version();
+    test_dump_flags();
+    test_cfunctions();
+    test_private_symbols();
+    test_eval2();
+    test_write_strip();
+    test_read_object2();
+    test_runtime();
+    test_normalize2();
+    test_calloc();
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);

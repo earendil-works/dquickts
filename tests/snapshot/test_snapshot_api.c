@@ -804,6 +804,236 @@ static void test_errors(void)
     JS_FreeRuntime(rt);
 }
 
+static JSValue closure_get(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv, int magic,
+                           void *opaque)
+{
+    return JS_NewInt32(ctx, *(int *)opaque + magic);
+}
+
+/* the write of a C closure (JS_NewCClosure()) fails: its opaque pointer
+   is host state */
+static int write_fails_on_closure(JSContext *ctx, int flags)
+{
+    size_t size;
+    uint8_t *buf = JS_WriteSnapshot(ctx, &size, &host, NULL, 0, flags);
+    JSValue exc;
+    const char *str;
+    int ret;
+
+    if (buf) {
+        js_free(ctx, buf);
+        return 0;
+    }
+    exc = JS_GetException(ctx);
+    str = JS_ToCString(ctx, exc);
+    ret = str && strstr(str, "TypeError") && strstr(str, "C closure");
+    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, exc);
+    return ret;
+}
+
+static void test_c_closure(void)
+{
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = new_context(rt), *ctx2;
+    JSValue global = JS_GetGlobalObject(ctx);
+    static int state = 40;
+    uint8_t *buf;
+    size_t size;
+
+    buf = write_snapshot_flags(ctx, &size, NULL, 0, JS_SNAPSHOT_BASE);
+    CHECK(buf != NULL);
+    JS_SetPropertyStr(ctx, global, "cl",
+                      JS_NewCClosure(ctx, closure_get, "cl", NULL, 0, 2, &state));
+    CHECK(eval_int(ctx, "cl()") == 42);
+    CHECK(write_fails_on_closure(ctx, 0));
+    CHECK(write_fails_on_closure(ctx, JS_SNAPSHOT_DELTA));
+    /* only reachable from a closure variable */
+    JS_FreeValue(ctx, eval(ctx, "var get = ((f) => () => f())(cl); delete globalThis.cl;"));
+    CHECK(write_fails_on_closure(ctx, 0));
+    CHECK(eval_int(ctx, "get()") == 42);
+    /* the runtime still works and can be saved once the closure is gone */
+    JS_FreeValue(ctx, eval(ctx, "get = null"));
+    JS_RunGC(rt);
+    free(buf);
+    buf = write_snapshot(ctx, &size, NULL, 0);
+    CHECK(buf != NULL);
+    if (buf && (ctx2 = read_snapshot(buf, size, NULL, 0))) {
+        CHECK(eval_int(ctx2, "typeof cl === 'undefined' && get === null ? 1 : 0") == 1);
+        free_context_and_runtime(ctx2);
+    }
+    free(buf);
+    JS_FreeValue(ctx, global);
+    free_context_and_runtime(ctx);
+}
+
+/* roots: private symbol, private symbol without description, object */
+static void check_private_symbols(JSContext *ctx, JSValue *roots)
+{
+    JSAtom a0 = JS_ValueToAtom(ctx, roots[0]);
+    JSAtom a1 = JS_ValueToAtom(ctx, roots[1]);
+    JSValue v, fresh;
+
+    CHECK(JS_IsSymbol(roots[0]) && JS_IsSymbol(roots[1]));
+    v = JS_GetProperty(ctx, roots[2], a0);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 42);
+    v = JS_GetProperty(ctx, roots[2], a1);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 43);
+    CHECK_STRING(ctx, JS_GetPropertyStr(ctx, roots[0], "description"), "hidden");
+    v = JS_GetPropertyStr(ctx, roots[1], "description");
+    CHECK(JS_IsUndefined(v));
+    /* still hidden from JS, and distinct from a new private symbol */
+    CHECK(eval_int(ctx, "Reflect.ownKeys(o).length === 3 && "
+                   "Object.getOwnPropertySymbols(o).length === 1 ? 1 : 0") == 1);
+    fresh = JS_NewPrivateSymbol(ctx, "hidden");
+    CHECK(!JS_StrictEq(ctx, fresh, roots[0]));
+    JS_FreeValue(ctx, fresh);
+    JS_FreeAtom(ctx, a0);
+    JS_FreeAtom(ctx, a1);
+}
+
+static JSContext *read_with_roots(const uint8_t *buf, size_t size,
+                                  const uint8_t *delta, size_t delta_size,
+                                  JSValue *roots, int n)
+{
+    JSRuntime *rt = new_runtime();
+    JSSnapshotResult res;
+    JSContext *ctx;
+    char err[256];
+    int i;
+
+    if (JS_ReadSnapshot(rt, buf, size, delta, delta_size, &host, &res, err, sizeof(err)) ||
+        res.root_count != n) {
+        fprintf(stderr, "read: %s\n", err);
+        failures++;
+        JS_FreeRuntime(rt);
+        return NULL;
+    }
+    ctx = res.contexts[0];
+    for(i = 0; i < n; i++)
+        roots[i] = res.roots[i];
+    JS_FreeSnapshotResult(rt, &res);
+    return ctx;
+}
+
+static void free_roots(JSContext *ctx, JSValue *roots, int n)
+{
+    int i;
+    for(i = 0; i < n; i++)
+        JS_FreeValue(ctx, roots[i]);
+}
+
+static void test_private_symbols(void)
+{
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = new_context(rt), *ctx2;
+    JSValue roots[3], read_roots[3];
+    JSAtom atom;
+    uint8_t *base, *delta, *full;
+    size_t base_size, delta_size, full_size;
+
+    roots[2] = eval(ctx, "globalThis.o = { a: 1, [Symbol('pub')]: 2 }; Reflect.defineProperty(o, 'pub', { value: 3, enumerable: true }); o");
+    base = write_snapshot_flags(ctx, &base_size, NULL, 0, JS_SNAPSHOT_BASE);
+    roots[0] = JS_NewPrivateSymbol(ctx, "hidden");
+    roots[1] = JS_NewPrivateSymbol(ctx, NULL);
+    atom = JS_ValueToAtom(ctx, roots[0]);
+    JS_DefinePropertyValue(ctx, roots[2], atom, JS_NewInt32(ctx, 42), JS_PROP_C_W_E);
+    JS_FreeAtom(ctx, atom);
+    atom = JS_ValueToAtom(ctx, roots[1]);
+    JS_DefinePropertyValue(ctx, roots[2], atom, JS_NewInt32(ctx, 43), JS_PROP_C_W_E);
+    JS_FreeAtom(ctx, atom);
+    check_private_symbols(ctx, roots);
+
+    /* the private atom kind survives full snapshots and deltas */
+    full = write_snapshot(ctx, &full_size, roots, 3);
+    delta = write_snapshot_flags(ctx, &delta_size, roots, 3, JS_SNAPSHOT_DELTA);
+    CHECK(base && full && delta);
+    if (full && (ctx2 = read_with_roots(full, full_size, NULL, 0, read_roots, 3))) {
+        check_private_symbols(ctx2, read_roots);
+        free_roots(ctx2, read_roots, 3);
+        free_context_and_runtime(ctx2);
+    }
+    if (base && delta &&
+        (ctx2 = read_with_roots(base, base_size, delta, delta_size, read_roots, 3))) {
+        check_private_symbols(ctx2, read_roots);
+        free_roots(ctx2, read_roots, 3);
+        free_context_and_runtime(ctx2);
+    }
+    free(base);
+    free(delta);
+    free(full);
+    free_roots(ctx, roots, 3);
+    free_context_and_runtime(ctx);
+}
+
+static double eval_double(JSContext *ctx, const char *src)
+{
+    JSValue val = eval(ctx, src);
+    double d = -1;
+    JS_ToFloat64(ctx, &d, val);
+    JS_FreeValue(ctx, val);
+    return d;
+}
+
+/* performance.now() continues from its value at the write in the
+   restored runtime and performance.timeOrigin is kept; a base read
+   alone starts a new time origin */
+static void test_performance(void)
+{
+    JSContext *ctx = new_context(new_runtime());
+    JSContext *ctx_other = new_context(new_runtime());
+    JSContext *ctx2;
+    uint8_t *base, *base_other, *delta, *full;
+    size_t base_size, base_other_size, delta_size, full_size;
+    double origin, now, origin2;
+
+    /* no clock value in the heap: identical bases */
+    JS_FreeValue(ctx, eval(ctx, "performance.now() + performance.timeOrigin"));
+    JS_FreeValue(ctx_other, eval(ctx_other, "for (let i = 0; i < 1e5; i++);"
+                                 "performance.now() + performance.timeOrigin"));
+    base = write_snapshot_flags(ctx, &base_size, NULL, 0, JS_SNAPSHOT_BASE);
+    base_other = write_snapshot_flags(ctx_other, &base_other_size, NULL, 0, JS_SNAPSHOT_BASE);
+    CHECK(base && base_other && base_size == base_other_size &&
+          !memcmp(base, base_other, base_size));
+    free_context_and_runtime(ctx_other);
+
+    JS_FreeValue(ctx, eval(ctx, "var t0 = performance.now(); var origin = performance.timeOrigin;"));
+    origin = eval_double(ctx, "origin");
+    CHECK(origin > 1e12 && eval_double(ctx, "t0") >= 0);
+
+    JS_FreeValue(ctx, eval(ctx, "var t1 = performance.now();"
+                           "for (let i = 0; i < 1e5; i++); var t2 = performance.now();"));
+    CHECK(eval_int(ctx, "t2 >= t1 && t1 >= t0 ? 1 : 0") == 1);
+    full = write_snapshot(ctx, &full_size, NULL, 0);
+    delta = write_snapshot_flags(ctx, &delta_size, NULL, 0, JS_SNAPSHOT_DELTA);
+    now = eval_double(ctx, "performance.now()");
+    free_context_and_runtime(ctx);
+    CHECK(full && delta);
+    if (full && (ctx2 = read_snapshot(full, full_size, NULL, 0))) {
+        CHECK(eval_int(ctx2, "performance.now() >= t2 && "
+                       "performance.timeOrigin === origin ? 1 : 0") == 1);
+        /* not counted: the time between the write and the read */
+        CHECK(eval_double(ctx2, "performance.now()") < now + 1000);
+        free_context_and_runtime(ctx2);
+    }
+    if (base && delta && (ctx2 = read_snapshot(base, base_size, delta, delta_size))) {
+        CHECK(eval_int(ctx2, "performance.now() >= t2 && "
+                       "performance.timeOrigin === origin ? 1 : 0") == 1);
+        free_context_and_runtime(ctx2);
+    }
+    if (base && (ctx2 = read_snapshot(base, base_size, NULL, 0))) {
+        origin2 = eval_double(ctx2, "performance.timeOrigin");
+        CHECK(origin2 >= origin);
+        CHECK(eval_double(ctx2, "performance.now()") < 1000);
+        free_context_and_runtime(ctx2);
+    }
+    free(base);
+    free(base_other);
+    free(delta);
+    free(full);
+}
+
 int main(void)
 {
     JS_NewClassID(&counter_class_id);
@@ -816,6 +1046,9 @@ int main(void)
     test_reproducible_base();
     test_suspend_call();
     test_errors();
+    test_c_closure();
+    test_private_symbols();
+    test_performance();
     if (failures) {
         printf("FAIL test_snapshot_api: %d failures\n", failures);
         return 1;

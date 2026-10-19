@@ -83,6 +83,14 @@ static void *t_malloc(JSMallocState *s, size_t size)
     return ptr;
 }
 
+static void *t_calloc(JSMallocState *s, size_t count, size_t size)
+{
+    void *ptr = t_malloc(s, count * size);
+    if (ptr)
+        memset(ptr, 0, count * size);
+    return ptr;
+}
+
 static void t_free(JSMallocState *s, void *ptr)
 {
     if (!ptr)
@@ -115,7 +123,7 @@ static void *t_realloc(JSMallocState *s, void *ptr, size_t size)
 }
 
 static const JSMallocFunctions t_mf = {
-    t_malloc, t_free, t_realloc, t_usable_size,
+    t_calloc, t_malloc, t_free, t_realloc, t_usable_size,
 };
 
 /* run state */

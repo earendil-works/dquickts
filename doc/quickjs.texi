@@ -545,6 +545,23 @@ Same as print().
 
 @end table
 
+The @code{qjs} interpreter (and its workers) also defines:
+
+@table @code
+@item gc()
+Same as @code{std.gc()}.
+@item execArgv
+The whole command line of @code{qjs}, options included, as an array
+of strings.
+@item argv0
+The first element of @code{execArgv} (the name used to run @code{qjs}).
+@item navigator.userAgent
+The string @code{"quickjs/"} followed by the QuickJS version.
+@end table
+
+@code{performance.now()} and @code{performance.timeOrigin} are part of
+the engine (@code{JS_AddPerformance()}, added by @code{JS_NewContext()}).
+
 @subsection @code{std} module
 
 The @code{std} module provides wrappers to the libc @file{stdlib.h}
@@ -1144,6 +1161,13 @@ general rule, C functions take constant @code{JSValue}s as parameters
 (so they don't need to free them) and return a newly allocated (=live)
 @code{JSValue}.
 
+@code{JS_NewPrivateSymbol()} creates a symbol for host data attached to
+objects: like the private class members, its properties are never
+listed (@code{Reflect.ownKeys()}, @code{Object.getOwnPropertySymbols()},
+@code{JS_WriteObject()}...) and they are always own properties of the
+object, also on a Proxy (no trap is called) or on an object with exotic
+methods. Only C code holding the symbol can read them.
+
 @subsection Exceptions
 
 Exceptions: most C functions can return a Javascript exception. It
@@ -1159,6 +1183,11 @@ occurred. The actual exception object is stored in the
 @subsection Script evaluation
 
 Use @code{JS_Eval()} to evaluate a script or module source.
+@code{JS_Eval2()} and @code{JS_EvalThis2()} take a
+@code{JSEvalOptions} structure (@code{version} must be
+@code{JS_EVAL_OPTIONS_VERSION}) with the evaluation flags, including
+@code{JS_EVAL_FLAG_TYPESCRIPT} and the decorator flags, the file name
+and the line number of the first line of the source.
 
 If the script or module was compiled to bytecode with @code{qjsc}, it
 can be evaluated by calling @code{js_std_eval_binary()}. The advantage
@@ -1211,9 +1240,25 @@ Use @code{JS_SetMemoryLimit()} to set a global memory allocation limit
 to a given JSRuntime.
 
 Custom memory allocation functions can be provided with
-@code{JS_NewRuntime2()}.
+@code{JS_NewRuntime2()}. The @code{js_calloc} member of
+@code{JSMallocFunctions} is required: the engine uses it for its zero
+initialized allocations (@code{js_calloc()}, @code{js_mallocz()}...).
+
+@code{JS_GetGCThreshold()} returns the allocation size triggering the
+next automatic garbage collection. Functions registered with
+@code{JS_AddRuntimeFinalizer()} are called in reverse order at the end
+of @code{JS_FreeRuntime()}, for example to release host data shared by
+the finalizers of the objects.
 
 The maximum system stack size can be set with @code{JS_SetMaxStackSize()}.
+
+Debug dumps (bytecode, GC, leaks, module resolution, ...) on stdout
+are selected per runtime with @code{JS_SetDumpFlags()} and the
+@code{JS_DUMP_xxx} flags (@code{JS_GetDumpFlags()} returns them). They
+are only compiled if @code{ENABLE_DUMPS} is defined (Makefile:
+@code{CONFIG_DUMPS=y}); otherwise the flags are ignored and
+@code{JS_GetDumpFlags()} returns 0. @code{JS_ABORT_ON_LEAKS} makes
+@code{JS_FreeRuntime()} abort on leaked objects, strings or atoms.
 
 @subsection Execution timeout and interrupts
 
@@ -1323,10 +1368,17 @@ host natives. Modules loaded after the restore (e.g. by
 Weak references whose target is already collected are restored as
 dead. Objects which are only weakly reachable are freed by the restored
 runtime. The time based functions (@code{Date.now()}, ...) observe the
-time spent while hibernated.
+time spent while hibernated. @code{performance.now()} does not: in a
+context restored from a full snapshot or a delta, it continues from its
+value when the snapshot was written, so it stays monotonic for the
+restored program, and @code{performance.timeOrigin} is unchanged. Like
+the @code{Math.random()} state, the time origin is not part of a base: a
+base read without a delta starts a new time origin. Private symbols
+(@code{JS_NewPrivateSymbol()}) and their properties are restored.
 
 @code{JS_WriteSnapshot()} fails for contexts with the Intl or Temporal
-intrinsics, for SharedArrayBuffers whose memory may be shared with
+intrinsics, for C closures (@code{JS_NewCClosure()}), for
+SharedArrayBuffers whose memory may be shared with
 another thread and for host-class objects with opaque data when no
 @code{save_opaque} hook is given. Like bytecode, a snapshot is trusted
 input: truncated or mismatched snapshots are rejected, malicious ones

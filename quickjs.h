@@ -381,9 +381,22 @@ static inline JSValue __JS_NewShortBigInt(JSContext *ctx, int64_t d)
    it exists at run time. */
 #define JS_EVAL_FLAG_TS_DECORATOR_METADATA (1 << 10)
 
+#define JS_EVAL_OPTIONS_VERSION 1
+
+/* options of JS_Eval2() and JS_EvalThis2() */
+typedef struct JSEvalOptions {
+    int version; /* must be JS_EVAL_OPTIONS_VERSION */
+    int eval_flags; /* JS_EVAL_TYPE_x and JS_EVAL_FLAG_x */
+    const char *filename; /* "<unnamed>" if NULL */
+    int line_num; /* line number of the first line (1 if 0) */
+    /* new fields are added by incrementing JS_EVAL_OPTIONS_VERSION */
+} JSEvalOptions;
+
 typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 typedef JSValue JSCFunctionData(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *func_data);
+/* C function of JS_NewCClosure() */
+typedef JSValue JSCClosure(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, void *opaque);
 
 typedef struct JSMallocState {
     size_t malloc_count;
@@ -393,11 +406,44 @@ typedef struct JSMallocState {
 } JSMallocState;
 
 typedef struct JSMallocFunctions {
+    /* zero initialized allocation of 'count' * 'size' bytes (required) */
+    void *(*js_calloc)(JSMallocState *s, size_t count, size_t size);
     void *(*js_malloc)(JSMallocState *s, size_t size);
     void (*js_free)(JSMallocState *s, void *ptr);
     void *(*js_realloc)(JSMallocState *s, void *ptr, size_t size);
     size_t (*js_malloc_usable_size)(const void *ptr);
 } JSMallocFunctions;
+
+/* Debug trace system: the debug output is produced on stdout if the
+   dumps are compiled in (ENABLE_DUMPS) and JS_SetDumpFlags() is
+   invoked with the corresponding bit set. */
+#define JS_DUMP_BYTECODE_FINAL   0x01  /* dump pass 3 final byte code */
+#define JS_DUMP_BYTECODE_PASS2   0x02  /* dump pass 2 code */
+#define JS_DUMP_BYTECODE_PASS1   0x04  /* dump pass 1 code */
+#define JS_DUMP_BYTECODE_HEX     0x10  /* dump bytecode in hex */
+#define JS_DUMP_BYTECODE_PC2LINE 0x20  /* dump line number table */
+#define JS_DUMP_BYTECODE_STACK   0x40  /* dump compute_stack_size */
+#define JS_DUMP_READ_OBJECT     0x100  /* dump the marshalled objects at load time */
+#define JS_DUMP_FREE            0x200  /* dump every object free */
+#define JS_DUMP_GC              0x400  /* dump the occurrence of the automatic GC */
+#define JS_DUMP_GC_FREE         0x800  /* dump objects freed by the GC */
+#define JS_DUMP_MODULE_RESOLVE 0x1000  /* dump module resolution steps */
+#define JS_DUMP_PROMISE        0x2000  /* dump promise steps */
+#define JS_DUMP_LEAKS          0x4000  /* dump leaked objects and strings in JS_FreeRuntime */
+#define JS_DUMP_ATOM_LEAKS     0x8000  /* dump leaked atoms in JS_FreeRuntime */
+#define JS_DUMP_MEM           0x10000  /* dump memory usage in JS_FreeContext */
+#define JS_DUMP_OBJECTS       0x20000  /* dump objects in JS_FreeContext */
+#define JS_DUMP_ATOMS         0x40000  /* dump atoms in JS_FreeContext */
+#define JS_DUMP_SHAPES        0x80000  /* dump shapes in JS_FreeContext */
+#define JS_ABORT_ON_LEAKS    0x10C000  /* abort on atom/object/string leaks; for testing */
+#define JS_DUMP_MODULE_EXEC  0x200000  /* dump module evaluation steps */
+#define JS_DUMP_CLOSURE      0x400000  /* dump closure variables (reserved) */
+#define JS_DUMP_ROPE_REBALANCE 0x800000 /* dump string rope rebalancing */
+
+/* runtime finalizers run in LIFO order at the very end of
+   JS_FreeRuntime(), once the runtime is no longer usable. They are
+   host state: heap snapshots do not save them. */
+typedef void JSRuntimeFinalizer(JSRuntime *rt, void *arg);
 
 typedef struct JSGCObjectHeader JSGCObjectHeader;
 
@@ -405,6 +451,13 @@ JSRuntime *JS_NewRuntime(void);
 /* info lifetime must exceed that of rt */
 void JS_SetRuntimeInfo(JSRuntime *rt, const char *info);
 void JS_SetMemoryLimit(JSRuntime *rt, size_t limit);
+/* select the debug dumps (JS_DUMP_xxx flags). Ignored unless the
+   library is compiled with ENABLE_DUMPS (Makefile: CONFIG_DUMPS=y) */
+void JS_SetDumpFlags(JSRuntime *rt, uint64_t flags);
+/* return the debug dump flags (always 0 without ENABLE_DUMPS) */
+uint64_t JS_GetDumpFlags(JSRuntime *rt);
+/* return the malloc size triggering the next automatic GC */
+size_t JS_GetGCThreshold(JSRuntime *rt);
 void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold);
 /* use 0 to disable maximum stack size check */
 void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
@@ -415,6 +468,10 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque);
 void JS_FreeRuntime(JSRuntime *rt);
 void *JS_GetRuntimeOpaque(JSRuntime *rt);
 void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque);
+/* call finalizer(rt, arg) at the end of JS_FreeRuntime(). Return -1 if
+   out of memory. */
+int JS_AddRuntimeFinalizer(JSRuntime *rt, JSRuntimeFinalizer *finalizer,
+                           void *arg);
 typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);
 void JS_MarkValue(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 void JS_RunGC(JSRuntime *rt);
@@ -468,6 +525,12 @@ int JS_AddIntrinsicWeakRef(JSContext *ctx);
 int JS_AddIntrinsicDOMException(JSContext *ctx);
 /* btoa() and atob() */
 int JS_AddIntrinsicAToB(JSContext *ctx);
+/* 'performance' object with now() and timeOrigin. A context restored
+   from a full snapshot or a delta keeps its time origin and
+   performance.now() continues from its value at the write (the time
+   between the write and the read is not counted); a base read alone
+   starts a new time origin. */
+int JS_AddPerformance(JSContext *ctx);
 #ifdef CONFIG_TEMPORAL_INTL
 int JS_AddIntrinsicTemporal(JSContext *ctx);
 int JS_AddIntrinsicIntl(JSContext *ctx);
@@ -476,12 +539,16 @@ int JS_AddIntrinsicIntl(JSContext *ctx);
 JSValue js_string_codePointRange(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv);
 
+/* zero initialized, NULL if 'count' * 'size' overflows */
+void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size);
 void *js_malloc_rt(JSRuntime *rt, size_t size);
 void js_free_rt(JSRuntime *rt, void *ptr);
 void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size);
 size_t js_malloc_usable_size_rt(JSRuntime *rt, const void *ptr);
 void *js_mallocz_rt(JSRuntime *rt, size_t size);
 
+/* same as js_calloc_rt(), throws out of memory in case of error */
+void *js_calloc(JSContext *ctx, size_t count, size_t size);
 void *js_malloc(JSContext *ctx, size_t size);
 void js_free(JSContext *ctx, void *ptr);
 void *js_realloc(JSContext *ctx, void *ptr, size_t size);
@@ -901,6 +968,10 @@ void JS_FreeCStringRT_UTF16(JSRuntime *rt, const uint16_t *ptr);
 int JS_ToUTF32String(JSContext *ctx, uint32_t **pbuf, JSValueConst val);
 
 JSValue JS_NewSymbol(JSContext *ctx, const char *description, JS_BOOL is_global);
+/* symbol only visible to C code: its properties are not enumerated
+   (Reflect.ownKeys(), Object.getOwnPropertySymbols()...) and are own
+   properties of the object even on proxies (no trap is called) */
+JSValue JS_NewPrivateSymbol(JSContext *ctx, const char *description);
 
 JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto, JSClassID class_id);
 JSValue JS_NewObjectClass(JSContext *ctx, int class_id);
@@ -1021,6 +1092,14 @@ JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
 JSValue JS_EvalThis(JSContext *ctx, JSValueConst this_obj,
                     const char *input, size_t input_len,
                     const char *filename, int eval_flags);
+/* same as JS_Eval() with the filename, first line number and flags in
+   'options' (may be NULL) */
+JSValue JS_Eval2(JSContext *ctx, const char *input, size_t input_len,
+                 JSEvalOptions *options);
+/* same as JS_Eval2() with an explicit 'this_obj' parameter */
+JSValue JS_EvalThis2(JSContext *ctx, JSValueConst this_obj,
+                     const char *input, size_t input_len,
+                     JSEvalOptions *options);
 JSValue JS_GetGlobalObject(JSContext *ctx);
 /* Function.prototype of the context */
 JSValue JS_GetFunctionProto(JSContext *ctx);
@@ -1251,6 +1330,12 @@ typedef struct JSModuleDef JSModuleDef;
 typedef char *JSModuleNormalizeFunc(JSContext *ctx,
                                     const char *module_base_name,
                                     const char *module_name, void *opaque);
+/* same as JSModuleNormalizeFunc with the import attributes (object or
+   undefined) */
+typedef char *JSModuleNormalizeFunc2(JSContext *ctx,
+                                     const char *module_base_name,
+                                     const char *module_name,
+                                     JSValueConst attributes, void *opaque);
 typedef JSModuleDef *JSModuleLoaderFunc(JSContext *ctx,
                                         const char *module_name, void *opaque);
 typedef JSModuleDef *JSModuleLoaderFunc2(JSContext *ctx,
@@ -1272,6 +1357,12 @@ void JS_SetModuleLoaderFunc2(JSRuntime *rt,
                              JSModuleLoaderFunc2 *module_loader,
                              JSModuleCheckSupportedImportAttributes *module_check_attrs,
                              void *opaque);
+/* replace the module normalizer with one receiving the import attributes
+   (NULL for the default normalizer). Call it after
+   JS_SetModuleLoaderFunc*(), which reset it. The modules stay keyed by
+   name and attributes. */
+void JS_SetModuleNormalizeFunc2(JSRuntime *rt,
+                                JSModuleNormalizeFunc2 *module_normalize);
 /* return the import.meta object of a module */
 JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);
 JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m);
@@ -1294,6 +1385,16 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
 #define JS_WRITE_OBJ_REFERENCE (1 << 3) /* allow object references to
                                            encode arbitrary object
                                            graph */
+/* the strip flags apply when writing, JS_SetStripInfo() when compiling */
+#define JS_WRITE_OBJ_STRIP_SOURCE (1 << 4) /* do not write the function source code */
+#define JS_WRITE_OBJ_STRIP_DEBUG  (1 << 5) /* do not write the debug info (file name, line numbers, source code) */
+/* The output starts with a version byte and a checksum of the rest of
+   the output: JS_ReadObject() rejects a different version ("invalid
+   version") and a corrupted input ("checksum error", both
+   SyntaxError). Besides the JSON values, the Date, RegExp (source and
+   flags, lastIndex is reset), Map, Set, ArrayBuffer, typed array,
+   Number/String/Boolean/BigInt objects and the symbols (Symbol.for()
+   and well-known symbols keep their identity) are supported. */
 uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj,
                         int flags);
 uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
@@ -1305,6 +1406,10 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
 #define JS_READ_OBJ_REFERENCE (1 << 3) /* allow object references */
 JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                       int flags);
+/* same as JS_ReadObject() and return in *psab_tab (allocated with
+   js_malloc(), if not NULL) the memory of the SharedArrayBuffers read */
+JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+                       int flags, uint8_t ***psab_tab, size_t *psab_tab_len);
 /* instantiate and evaluate a bytecode function. Only used when
    reading a script or module with JS_ReadObject() */
 JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
@@ -1339,8 +1444,9 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
    same way (same host natives, same code run) write the same base bytes,
    in any process. A host can therefore rebuild a base instead of storing
    it and only keep the deltas (qjs --drepl does). The state of
-   Math.random() is not part of a base: full snapshots and deltas save
-   it, and a base read without a delta gets a fresh seed.
+   Math.random() and the time origin of performance.now() are not part
+   of a base: full snapshots and deltas save them, and a base read
+   without a delta gets a fresh seed and time origin.
 
    While a base is attached, the runtime references every cell, string
    and atom of the base so that they keep their identity: they are not
@@ -1351,7 +1457,8 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
    buffers are copied and their free function is not kept).
 
    Unsupported (JS_WriteSnapshot() fails with a TypeError): host-class
-   objects with opaque data when no save_opaque hook is given, contexts
+   objects with opaque data when no save_opaque hook is given, C closures
+   (JS_NewCClosure()), contexts
    with the Intl or Temporal intrinsics, SharedArrayBuffers whose memory may be
    shared (host SharedArrayBuffer allocator or host memory), and JS code
    running on the C stack (snapshots are taken between jobs or while
@@ -1466,9 +1573,28 @@ typedef union JSCFunctionType {
 JSValue JS_NewCFunction2(JSContext *ctx, JSCFunction *func,
                          const char *name,
                          int length, JSCFunctionEnum cproto, int magic);
+/* same as JS_NewCFunction2() with an explicit prototype 'proto_val' and
+   room preallocated for 'n_fields' properties */
+JSValue JS_NewCFunction3(JSContext *ctx, JSCFunction *func,
+                         const char *name,
+                         int length, JSCFunctionEnum cproto, int magic,
+                         JSValueConst proto_val, int n_fields);
 JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                             int length, int magic, int data_len,
                             JSValueConst *data);
+/* same as JS_NewCFunctionData() with a function name (NULL for '') */
+JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
+                             const char *name,
+                             int length, int magic, int data_len,
+                             JSValueConst *data);
+/* called with the 'opaque' pointer when the closure is freed */
+typedef void JSCClosureFinalizerFunc(void *opaque);
+/* C function with a host 'opaque' pointer, given to 'func' on each call
+   and to 'opaque_finalize' (if not NULL) when the function is freed.
+   JS_WriteSnapshot() rejects C closures. */
+JSValue JS_NewCClosure(JSContext *ctx, JSCClosure *func, const char *name,
+                       JSCClosureFinalizerFunc *opaque_finalize,
+                       int length, int magic, void *opaque);
 
 static inline JSValue JS_NewCFunction(JSContext *ctx, JSCFunction *func, const char *name,
                                       int length)

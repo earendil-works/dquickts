@@ -39,9 +39,11 @@
  *
  * A base is reproducible: the same build with the same host setup
  * writes the same base bytes in every process, so a host may rebuild a
- * base instead of storing it. The state of Math.random() is therefore not
- * part of the context cells: full snapshots and deltas carry it in their
- * roots, and a base read without a delta gets a fresh seed.
+ * base instead of storing it. The state of Math.random() and the time
+ * origin of performance.now() are therefore not part of the context
+ * cells: full snapshots and deltas carry them in their roots (the elapsed
+ * time, so that performance.now() continues from its value at the write),
+ * and a base read without a delta gets a fresh seed and time origin.
  *
  * Code pointers stored in the heap (C functions, job functions, lazily
  * instantiated function list entries...) are encoded as indexes in a
@@ -55,7 +57,7 @@
  */
 
 static const uint8_t snap_magic[8] = { 'Q', 'J', 'S', 'S', 'N', 'A', 'P', '\n' };
-#define SNAP_FORMAT_VERSION 7
+#define SNAP_FORMAT_VERSION 8
 
 typedef enum {
     SNAP_KIND_FULL,
@@ -294,6 +296,8 @@ static const struct {
     DEF(js_async_generator_function_proto_funcs),
     DEF(js_async_generator_proto_funcs),
     DEF(js_global_funcs),
+    DEF(js_performance_funcs),
+    DEF(js_performance_obj),
     DEF(js_date_funcs),
     DEF(js_date_proto_funcs),
     DEF(js_bigint_funcs),
@@ -1161,6 +1165,10 @@ static int snap_write_payload(SnapWriter *w, JSObject *p)
             }
         }
         break;
+    case JS_CLASS_C_CLOSURE:
+        /* the opaque pointer and its finalizer are host state */
+        JS_ThrowTypeError(ctx, "snapshot: unsupported C closure (JS_NewCClosure())");
+        return -1;
     case JS_CLASS_GLOBAL_OBJECT:
         return snap_put_value(w, p->u.global_object.uninitialized_vars);
     case JS_CLASS_REGEXP:
@@ -1707,9 +1715,15 @@ uint8_t *JS_WriteSnapshot(JSContext *ctx, size_t *psize,
         JSContext *ctx1 = list_entry(el, JSContext, link);
         if (snap_put_ref(w, SNAP_CELL_CONTEXT, ctx1))
             goto fail;
-        /* a base is the same for every seed */
-        if (!(flags & JS_SNAPSHOT_BASE))
+        /* a base is the same for every seed and clock */
+        if (!(flags & JS_SNAPSHOT_BASE)) {
+            JSFloat64Union u;
             bc_put_u64(&w->bc, ctx1->random_state);
+            /* performance.now() continues from its value at the write */
+            u.d = ctx1->time_origin;
+            bc_put_u64(&w->bc, u.u64);
+            bc_put_u64(&w->bc, js_performance_elapsed_ns(ctx1));
+        }
     }
     n = 0;
     list_for_each(el, &rt->job_list)
@@ -3250,12 +3264,20 @@ static int snap_read_roots(SnapReader *r, JSSnapshotResult *res)
         if (!ctx)
             return snap_error(r, "invalid context list");
         if (r->roots_seeded) {
+            JSFloat64Union u;
+            uint64_t elapsed_ns;
             if (bc_get_u64(&r->bc, &ctx->random_state))
                 return -1;
             if (ctx->random_state == 0)
                 return snap_error(r, "invalid random state");
+            if (bc_get_u64(&r->bc, &u.u64) ||
+                bc_get_u64(&r->bc, &elapsed_ns))
+                return -1;
+            ctx->time_origin = u.d;
+            ctx->time_origin_ns = js_hrtime_ns() - (int64_t)elapsed_ns;
         } else {
             js_random_init(ctx);
+            js_performance_init(ctx);
         }
         list_del(&ctx->link);
         list_add_tail(&ctx->link, &rt->context_list);
