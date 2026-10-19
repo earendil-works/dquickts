@@ -67,6 +67,11 @@ extern int _NSGetExecutablePath(char *buf, uint32_t *bufsize);
 #endif
 #endif /* __APPLE__ */
 
+#if defined(__COSMOPOLITAN__)
+/* from <cosmo.h> */
+extern char *GetProgramExecutableName(void);
+#endif
+
 #endif
 
 /* enable the os.Worker API. It relies on POSIX threads */
@@ -3305,6 +3310,13 @@ static JSValue js_os_exePath(JSContext *ctx, JSValueConst this_val,
     if (len <= 0 || len >= (ssize_t)sizeof(buf))
         return JS_UNDEFINED;
     return JS_NewStringLen(ctx, buf, len);
+#elif defined(__COSMOPOLITAN__)
+    char buf[PATH_MAX];
+
+    /* the returned path may contain symbolic links */
+    if (!realpath(GetProgramExecutableName(), buf))
+        return JS_UNDEFINED;
+    return JS_NewString(ctx, buf);
 #elif defined(__FreeBSD__)
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
     char buf[PATH_MAX];
