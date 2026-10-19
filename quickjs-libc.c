@@ -49,6 +49,7 @@
 #include <poll.h>
 
 #if defined(__FreeBSD__)
+#include <sys/sysctl.h>
 extern char **environ;
 #endif
 
@@ -3304,6 +3305,14 @@ static JSValue js_os_exePath(JSContext *ctx, JSValueConst this_val,
     if (len <= 0 || len >= (ssize_t)sizeof(buf))
         return JS_UNDEFINED;
     return JS_NewStringLen(ctx, buf, len);
+#elif defined(__FreeBSD__)
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
+    char buf[PATH_MAX];
+    size_t len = sizeof(buf);
+
+    if (sysctl(mib, 4, buf, &len, NULL, 0) != 0)
+        return JS_UNDEFINED;
+    return JS_NewString(ctx, buf);
 #else
     return JS_UNDEFINED;
 #endif
