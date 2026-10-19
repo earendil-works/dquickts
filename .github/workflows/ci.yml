@@ -204,8 +204,9 @@ jobs:
         run: |
           mkdir ~/cosmocc
           cd ~/cosmocc
-          wget https://cosmo.zip/pub/cosmocc/cosmocc.zip
-          unzip cosmocc.zip
+          # a pinned release from GitHub: cosmo.zip is not reliably reachable
+          wget -q https://github.com/jart/cosmopolitan/releases/download/4.0.2/cosmocc-4.0.2.zip
+          unzip -q cosmocc-4.0.2.zip
           echo "$HOME/cosmocc/bin" >> "$GITHUB_PATH"
       - name: Build
         run: |
