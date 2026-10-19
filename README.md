@@ -16,12 +16,14 @@ git clone https://github.com/stencil-hq/dquickts
 cd dquickts
 make                 # builds qjs, qjsc and libquickjs.a
 ./qjs hello.ts
+./qjs --drepl session.snap   # a REPL whose state survives restarts
 make test-snapshot   # builds and runs the suspension and snapshot test hosts
 ```
 
 ## Contents
 
 - [What this fork adds](#what-this-fork-adds)
+- [Durable REPL](#durable-repl)
 - [Snapshots](#snapshots)
   - [What a snapshot is](#what-a-snapshot-is)
   - [When you can take one](#when-you-can-take-one)
@@ -54,9 +56,66 @@ fork adds:
 | Explicit resource management (ES2026) | `using`, `await using`, `DisposableStack`, `AsyncDisposableStack` |
 | Ports from [quickjs-ng](https://github.com/quickjs-ng/quickjs) | `queueMicrotask()`, `atob()`/`btoa()`, `DOMException`, the V8 stack trace API, promise hooks, `os.setInterval()`, and bug fixes |
 | Embedder helpers | `JS_IsEqual()`, `JS_NewProxy()`, `JS_GetProxyTarget()`, `JS_PromiseMarkAsHandled()`, and others |
+| A REPL whose functions and variables survive restarts | `qjs --drepl FILE` |
 | Rust bindings built on this engine | [`rquickjs/`](rquickjs/README.md) |
 
 The full list is under `unreleased` in [`Changelog`](Changelog).
+
+## Durable REPL
+
+`qjs --drepl FILE` starts the usual REPL, with highlighting, history and tab completion, and
+input is TypeScript. After every command, the whole session is saved to `FILE`. When you start
+`qjs --drepl FILE` again, the session comes back with the same functions, variables, objects and
+closures:
+
+```text
+$ ./qjs --drepl session.snap
+QuickJS - Type "\h" for help
+Created the durable session session.snap
+qjs > function add(a: number, b: number): number { return a + b }
+undefined
+qjs > let total: number = add(2, 3)
+undefined
+qjs > class Counter { constructor(private n = 0) {} inc(): number { return ++this.n } }
+undefined
+qjs > const c = new Counter()
+undefined
+qjs > c.inc()
+1
+qjs > ^C
+(Press Ctrl-C again to quit)
+qjs > ^C
+$ ./qjs --drepl session.snap
+QuickJS - Type "\h" for help
+Restored the durable session session.snap
+qjs > add(total, 10)
+15
+qjs > c.inc()
+2
+```
+
+The commands don't run in the REPL's own runtime. They run in a separate runtime that holds only
+the standard objects plus `print()` and `console.log()`:
+
+- The line editor (`repl.js`) stays in the main runtime and passes each command to the durable
+  runtime. The durable runtime runs the command and its promise jobs, so top-level `await` works,
+  and sends back the rendered result.
+- After each command, the durable runtime is written with `JS_WriteSnapshot()`. It goes to a
+  temporary file that is then renamed over `FILE`, so the file always holds a complete session.
+  A small session is about 14 KB.
+- At startup, `JS_ReadSnapshot()` rebuilds the session from `FILE`. If the file is missing, a new
+  session starts.
+
+Limits:
+
+- The `std` and `os` modules are not available. Their files, timers and handlers are host state
+  that a snapshot cannot save.
+- `\load file` evaluates a file inside the session.
+- Ctrl-C interrupts a running command. The session is not affected.
+- A session file only loads into the `qjs` build that wrote it.
+- Tab completion lists properties of the global object. Like the regular REPL, it does not list
+  top-level `let`, `const` and `class` names, but it does complete their members (`c.in` →
+  `c.inc()`).
 
 ## Snapshots
 
@@ -449,7 +508,8 @@ hi ts Info warn 8
 
 - `qjs`, `qjsc` and the `quickjs-libc` module loader treat `.ts`, `.mts` (module) and `.cts`
   (script) files as TypeScript.
-- `qjs --typescript` does the same for `-e` and for stdin (`-`).
+- `qjs --typescript` does the same for `-e`, for stdin (`-`) and for REPL commands. With
+  `qjs --drepl`, REPL input is always TypeScript.
 - From C, pass `JS_EVAL_FLAG_TYPESCRIPT` to `JS_Eval()`.
 - From JS, use `std.evalScript(src, { typescript: true })`.
 - Direct `eval()` and `Function()` bodies are always JavaScript.

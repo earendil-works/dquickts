@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <time.h>
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
@@ -348,6 +349,422 @@ static size_t get_suffixed_size(const char *str)
     return v;
 }
 
+/* Durable REPL (qjs --drepl FILE)
+
+   The commands run in a second runtime, the durable runtime, saved to
+   FILE with JS_WriteSnapshot() after each command and restored from it
+   at startup: the declarations survive the process. The line editor
+   (repl.js) stays in the main runtime and drives the durable runtime
+   through the 'durable' object of its options. No value crosses the
+   runtimes: the durable runtime renders its results to text and copies
+   the completion data through JSON.
+
+   The durable runtime only has the standard objects, print() and
+   console.log(): the 'std' and 'os' modules hold host state (files,
+   timers, handlers) that a snapshot cannot save. Its commands are
+   TypeScript. */
+
+typedef struct {
+    JSRuntime *rt; /* NULL without --drepl */
+    JSContext *ctx;
+    const char *path;
+    int eval_flags;
+    BOOL restored; /* TRUE if restored from 'path' */
+    void (*prev_sigint)(int); /* Ctrl-C handler of the main runtime */
+} DurableRepl;
+
+static DurableRepl drepl;
+
+/* the C functions that the durable heap references */
+static const void * const drepl_natives[] = {
+    (const void *)js_std_print,
+    (const void *)js_std_console_log,
+};
+
+static const JSSnapshotHost drepl_host = {
+    .natives = drepl_natives,
+    .native_count = countof(drepl_natives),
+};
+
+/* set by Ctrl-C while the durable runtime runs */
+static volatile sig_atomic_t drepl_sigint;
+
+static void drepl_sigint_handler(int sig_num)
+{
+    drepl_sigint = 1;
+}
+
+static int drepl_interrupt_handler(JSRuntime *rt, void *opaque)
+{
+    return drepl_sigint;
+}
+
+/* while the durable runtime runs, Ctrl-C interrupts it instead of
+   reaching the main runtime */
+static void drepl_enter(void)
+{
+    /* it is called from a C function of the main runtime */
+    JS_UpdateStackTop(drepl.rt);
+    drepl_sigint = 0;
+    drepl.prev_sigint = signal(SIGINT, drepl_sigint_handler);
+}
+
+static void drepl_leave(void)
+{
+    signal(SIGINT, drepl.prev_sigint);
+    /* make the "interrupted" error catchable, as std.evalScript() does */
+    if (drepl_sigint && JS_HasException(drepl.ctx))
+        JS_SetUncatchableException(drepl.ctx, FALSE);
+    drepl_sigint = 0;
+}
+
+static void drepl_write(void *opaque, const char *buf, size_t len)
+{
+    dbuf_put(opaque, (const uint8_t *)buf, len);
+}
+
+/* 'prefix' followed by the rendering of 'val', a value of the durable
+   runtime, as a string of 'ctx' */
+static JSValue drepl_render(JSContext *ctx, JSValueConst val,
+                            const char *prefix)
+{
+    DynBuf dbuf;
+    JSValue str;
+
+    dbuf_init(&dbuf);
+    dbuf_putstr(&dbuf, prefix);
+    JS_PrintValue(drepl.ctx, drepl_write, &dbuf, val, NULL);
+    if (dbuf_error(&dbuf))
+        str = JS_ThrowOutOfMemory(ctx);
+    else
+        str = JS_NewStringLen(ctx, (const char *)dbuf.buf, dbuf.size);
+    dbuf_free(&dbuf);
+    return str;
+}
+
+/* throw in 'ctx' the rendering of the exception of the durable runtime */
+static JSValue drepl_rethrow(JSContext *ctx)
+{
+    JSValue exc, text;
+
+    exc = JS_GetException(drepl.ctx);
+    text = drepl_render(ctx, exc, "");
+    JS_FreeValue(drepl.ctx, exc);
+    if (JS_IsException(text))
+        return text;
+    return JS_Throw(ctx, text);
+}
+
+/* write the durable runtime to its file, through a temporary file
+   renamed over it so that the file always holds a complete snapshot.
+   The errors are reported on stderr. */
+static int drepl_save(void)
+{
+    JSContext *dctx = drepl.ctx;
+    uint8_t *buf;
+    size_t len, len_tmp, written;
+    char *tmp;
+    FILE *f;
+    int ret = -1;
+
+    buf = JS_WriteSnapshot(dctx, &len, &drepl_host, NULL, 0, 0);
+    if (!buf) {
+        JSValue exc = JS_GetException(dctx);
+        DynBuf dbuf;
+        dbuf_init(&dbuf);
+        JS_PrintValue(dctx, drepl_write, &dbuf, exc, NULL);
+        fprintf(stderr, "qjs: %s not saved: %.*s\n", drepl.path,
+                (int)dbuf.size, (const char *)dbuf.buf);
+        dbuf_free(&dbuf);
+        JS_FreeValue(dctx, exc);
+        return -1;
+    }
+    len_tmp = strlen(drepl.path) + 5;
+    tmp = malloc(len_tmp);
+    if (tmp) {
+        snprintf(tmp, len_tmp, "%s.tmp", drepl.path);
+        f = fopen(tmp, "wb");
+        if (f) {
+            written = fwrite(buf, 1, len, f);
+            if (fclose(f) == 0 && written == len) {
+#ifdef _WIN32
+                /* rename() does not replace an existing file */
+                remove(drepl.path);
+#endif
+                if (rename(tmp, drepl.path) == 0)
+                    ret = 0;
+            }
+        }
+    }
+    if (ret < 0) {
+        fprintf(stderr, "qjs: %s not saved: %s\n", drepl.path,
+                strerror(errno));
+        if (tmp)
+            remove(tmp);
+    }
+    free(tmp);
+    js_free(dctx, buf);
+    return ret;
+}
+
+/* Run the jobs of the command whose async evaluation returned
+   'promise', then return its completion value (JS_EXCEPTION if it
+   threw). A promise still pending awaits something that no job
+   settles: it is the completion value. */
+static JSValue drepl_settle(JSValue promise)
+{
+    JSContext *dctx = drepl.ctx, *ctx1;
+    JSValue res, val;
+    int ret;
+
+    if (JS_IsException(promise))
+        return promise;
+    while ((ret = JS_ExecutePendingJob(drepl.rt, &ctx1)) != 0) {
+        if (ret < 0) {
+            /* e.g. interrupted: the other jobs run after the next
+               command */
+            JS_FreeValue(dctx, promise);
+            return JS_EXCEPTION;
+        }
+    }
+    switch (JS_PromiseState(dctx, promise)) {
+    case JS_PROMISE_FULFILLED:
+        res = JS_PromiseResult(dctx, promise);
+        val = JS_GetPropertyStr(dctx, res, "value");
+        JS_FreeValue(dctx, res);
+        break;
+    case JS_PROMISE_REJECTED:
+        val = JS_Throw(dctx, JS_PromiseResult(dctx, promise));
+        break;
+    default:
+        return promise;
+    }
+    JS_FreeValue(dctx, promise);
+    return val;
+}
+
+/* a copy in 'ctx' of 'val' if it is a number or a bigint (for the
+   hexadecimal display of repl.js), undefined otherwise */
+static JSValue drepl_copy_number(JSContext *ctx, JSValueConst val)
+{
+    JSValue global, ctor, str, ret;
+    const char *s;
+
+    if (JS_IsNumber(val))
+        return val; /* not reference counted */
+    if (!JS_IsBigInt(drepl.ctx, val))
+        return JS_UNDEFINED;
+    s = JS_ToCString(drepl.ctx, val);
+    if (!s)
+        return drepl_rethrow(ctx);
+    str = JS_NewString(ctx, s);
+    JS_FreeCString(drepl.ctx, s);
+    if (JS_IsException(str))
+        return str;
+    global = JS_GetGlobalObject(ctx);
+    ctor = JS_GetPropertyStr(ctx, global, "BigInt");
+    ret = JS_Call(ctx, ctor, JS_UNDEFINED, 1, (JSValueConst *)&str);
+    JS_FreeValue(ctx, ctor);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, str);
+    return ret;
+}
+
+/* durable.eval(src): run the command 'src' and its jobs in the durable
+   runtime, then save it. Returns {text, value, error}: 'text' renders
+   the completion value or, if 'error', the exception; 'value' is the
+   completion value if it is a number or a bigint. */
+static JSValue js_drepl_eval(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv)
+{
+    static const char *props[] = { "text", "value", "error" };
+    JSContext *dctx = drepl.ctx;
+    JSValue val, global, values[3];
+    const char *str;
+    size_t len;
+    BOOL error;
+
+    str = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!str)
+        return JS_EXCEPTION;
+    drepl_enter();
+    val = drepl_settle(JS_Eval(dctx, str, len, "<input>", drepl.eval_flags));
+    drepl_leave();
+    JS_FreeCString(ctx, str);
+    error = JS_IsException(val);
+    if (error) {
+        val = JS_GetException(dctx);
+    } else {
+        /* the last result, as in the local REPL (a non writable '_'
+           keeps its value) */
+        global = JS_GetGlobalObject(dctx);
+        if (JS_SetPropertyStr(dctx, global, "_", JS_DupValue(dctx, val)) < 0)
+            JS_FreeValue(dctx, JS_GetException(dctx));
+        JS_FreeValue(dctx, global);
+    }
+    /* repl.js prints the same prefix for its own exceptions */
+    values[0] = drepl_render(ctx, val,
+                             (error && !JS_IsError(dctx, val)) ? "Throw: " : "");
+    values[1] = error ? JS_UNDEFINED : drepl_copy_number(ctx, val);
+    values[2] = JS_NewBool(ctx, error);
+    JS_FreeValue(dctx, val);
+    drepl_save();
+    if (JS_IsException(values[0]) || JS_IsException(values[1])) {
+        JS_FreeValue(ctx, values[0]);
+        JS_FreeValue(ctx, values[1]);
+        return JS_EXCEPTION;
+    }
+    return JS_NewObjectFromStr(ctx, countof(props), props, values);
+}
+
+/* durable.query(src): a copy (through JSON) of the value of the
+   expression 'src' in the durable runtime, for the completions. The
+   durable runtime is not saved. */
+static JSValue js_drepl_query(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    JSContext *dctx = drepl.ctx;
+    JSValue val, json;
+    const char *str;
+    size_t len;
+
+    str = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!str)
+        return JS_EXCEPTION;
+    drepl_enter();
+    val = JS_Eval(dctx, str, len, "<completion>", JS_EVAL_TYPE_GLOBAL);
+    JS_FreeCString(ctx, str);
+    if (!JS_IsException(val)) {
+        json = JS_JSONStringify(dctx, val, JS_UNDEFINED, JS_UNDEFINED);
+        JS_FreeValue(dctx, val);
+        val = json;
+    }
+    drepl_leave();
+    if (JS_IsException(val))
+        return drepl_rethrow(ctx);
+    if (JS_IsUndefined(val))
+        return val; /* no JSON representation */
+    str = JS_ToCStringLen(dctx, &len, val);
+    JS_FreeValue(dctx, val);
+    if (!str)
+        return drepl_rethrow(ctx);
+    val = JS_ParseJSON(ctx, str, len, "<completion>");
+    JS_FreeCString(dctx, str);
+    return val;
+}
+
+/* Set up the durable runtime 'rt' for 'path': restored from the file if
+   it exists, otherwise new and saved at once (so that an unwritable path
+   fails before the REPL starts). 'ts_flags' are the TypeScript decorator
+   flags of the commands. */
+static int drepl_open(JSRuntime *rt, const char *path, int ts_flags)
+{
+    JSSnapshotResult res;
+    JSContext *ctx;
+    JSValue global, console;
+    char err[256];
+    uint8_t *buf;
+    size_t len;
+    int i, ret;
+
+    drepl.rt = rt;
+    drepl.path = path;
+    drepl.eval_flags = JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_ASYNC |
+        JS_EVAL_FLAG_BACKTRACE_BARRIER | JS_EVAL_FLAG_TYPESCRIPT | ts_flags;
+    JS_SetInterruptHandler(rt, drepl_interrupt_handler, NULL);
+
+    buf = js_load_file(NULL, &len, path);
+    if (buf) {
+        ret = JS_ReadSnapshot(rt, buf, len, NULL, 0, &drepl_host, &res,
+                              err, sizeof(err));
+        free(buf);
+        if (ret < 0) {
+            fprintf(stderr, "qjs: %s: %s\n", path, err);
+            return -1;
+        }
+        if (res.context_count != 1) {
+            for(i = 0; i < res.context_count; i++)
+                JS_FreeContext(res.contexts[i]);
+            JS_FreeSnapshotResult(rt, &res);
+            fprintf(stderr, "qjs: %s: not a --drepl session\n", path);
+            return -1;
+        }
+        drepl.ctx = res.contexts[0];
+        JS_FreeSnapshotResult(rt, &res);
+        drepl.restored = TRUE;
+        return 0;
+    }
+    if (errno != ENOENT) {
+        perror(path);
+        return -1;
+    }
+    ctx = JS_NewContext(rt);
+    if (!ctx) {
+        fprintf(stderr, "qjs: cannot allocate JS context\n");
+        return -1;
+    }
+    drepl.ctx = ctx;
+    global = JS_GetGlobalObject(ctx);
+    console = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, console, "log",
+                      JS_NewCFunction(ctx, js_std_console_log, "log", 1));
+    JS_SetPropertyStr(ctx, global, "console", console);
+    JS_SetPropertyStr(ctx, global, "print",
+                      JS_NewCFunction(ctx, js_std_print, "print", 1));
+    JS_FreeValue(ctx, global);
+    return drepl_save();
+}
+
+static void drepl_close(void)
+{
+    if (!drepl.rt)
+        return;
+    if (drepl.ctx)
+        JS_FreeContext(drepl.ctx);
+    JS_FreeRuntime(drepl.rt);
+}
+
+/* Define the options of repl.js: 'typescript' and, with --drepl, the
+   'durable' object which runs the commands. */
+static int set_repl_options(JSContext *ctx, BOOL typescript)
+{
+    static const JSCFunctionListEntry durable_funcs[] = {
+        JS_CFUNC_DEF("eval", 1, js_drepl_eval ),
+        JS_CFUNC_DEF("query", 1, js_drepl_query ),
+    };
+    JSValue options, durable, global;
+    int ret;
+
+    options = JS_NewObject(ctx);
+    if (JS_IsException(options))
+        return -1;
+    JS_SetPropertyStr(ctx, options, "typescript", JS_NewBool(ctx, typescript));
+    if (drepl.rt) {
+        durable = JS_NewObject(ctx);
+        JS_SetPropertyFunctionList(ctx, durable, durable_funcs,
+                                   countof(durable_funcs));
+        JS_SetPropertyStr(ctx, durable, "path", JS_NewString(ctx, drepl.path));
+        JS_SetPropertyStr(ctx, durable, "restored",
+                          JS_NewBool(ctx, drepl.restored));
+        JS_SetPropertyStr(ctx, options, "durable", durable);
+    }
+    global = JS_GetGlobalObject(ctx);
+    ret = JS_SetPropertyStr(ctx, global, "__repl", options);
+    JS_FreeValue(ctx, global);
+    return ret;
+}
+
+/* apply the --memory-limit, --stack-size and strip options */
+static void set_runtime_limits(JSRuntime *rt, size_t memory_limit,
+                               size_t stack_size, int strip_flags)
+{
+    if (memory_limit != 0)
+        JS_SetMemoryLimit(rt, memory_limit);
+    if (stack_size != 0)
+        JS_SetMaxStackSize(rt, stack_size);
+    JS_SetStripInfo(rt, strip_flags);
+}
+
 #define PROG_NAME "qjs"
 
 void help(void)
@@ -357,6 +774,9 @@ void help(void)
            "-h  --help         list options\n"
            "-e  --eval EXPR    evaluate EXPR\n"
            "-i  --interactive  go to interactive mode\n"
+           "    --drepl file   durable interactive mode: the TypeScript commands\n"
+           "                   run in a runtime saved to 'file' after each command\n"
+           "                   and restored from it at startup\n"
            "-m  --module       load as ES6 module (default=autodetect)\n"
            "    --script       load as ES6 script (default=autodetect)\n"
            "    --strict       force strict mode\n"
@@ -402,6 +822,7 @@ int main(int argc, char **argv)
     int i, include_count = 0;
     int strip_flags = 0;
     size_t stack_size = 0;
+    const char *drepl_path = NULL;
 
     /* cannot use getopt because we want to pass the command line to
        the script */
@@ -454,6 +875,14 @@ int main(int argc, char **argv)
             }
             if (opt == 'i' || !strcmp(longopt, "interactive")) {
                 interactive++;
+                continue;
+            }
+            if (!strcmp(longopt, "drepl")) {
+                if (optind >= argc) {
+                    fprintf(stderr, "qjs: missing file for --drepl\n");
+                    exit(2);
+                }
+                drepl_path = argv[optind++];
                 continue;
             }
             if (opt == 'm' || !strcmp(longopt, "module")) {
@@ -550,11 +979,29 @@ int main(int argc, char **argv)
         fprintf(stderr, "qjs: cannot allocate JS runtime\n");
         exit(2);
     }
-    if (memory_limit != 0)
-        JS_SetMemoryLimit(rt, memory_limit);
-    if (stack_size != 0)
-        JS_SetMaxStackSize(rt, stack_size);
-    JS_SetStripInfo(rt, strip_flags);
+    set_runtime_limits(rt, memory_limit, stack_size, strip_flags);
+    if (drepl_path) {
+        JSRuntime *drt;
+        if (expr || optind < argc || include_count || load_std
+#ifdef CONFIG_TEMPORAL_INTL
+            || enable_experimental
+#endif
+            ) {
+            fprintf(stderr, "qjs: --drepl cannot be combined with a script, -e, -I, --std or --experimental\n");
+            exit(2);
+        }
+        drt = JS_NewRuntime();
+        if (!drt) {
+            fprintf(stderr, "qjs: cannot allocate JS runtime\n");
+            exit(2);
+        }
+        set_runtime_limits(drt, memory_limit, stack_size, strip_flags);
+        if (drepl_open(drt, drepl_path, ts_flags) < 0) {
+            drepl_close();
+            JS_FreeRuntime(rt);
+            return 1;
+        }
+    }
     js_std_set_worker_new_context_func(JS_NewCustomContext);
     js_std_init_handlers(rt);
     js_std_set_typescript_flags(rt, ts_flags);
@@ -614,6 +1061,10 @@ int main(int argc, char **argv)
         }
         if (interactive) {
             JS_SetHostPromiseRejectionTracker(rt, NULL, NULL);
+            if (set_repl_options(ctx, typescript || drepl_path) < 0) {
+                js_std_dump_error(ctx);
+                goto fail;
+            }
             js_std_eval_binary(ctx, qjsc_repl, qjsc_repl_size, 0);
         }
         js_std_loop(ctx);
@@ -627,6 +1078,7 @@ int main(int argc, char **argv)
     js_std_free_handlers(rt);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
+    drepl_close();
 
     if (empty_run && dump_memory) {
         clock_t t[5];
@@ -657,5 +1109,6 @@ int main(int argc, char **argv)
     js_std_free_handlers(rt);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
+    drepl_close();
     return 1;
 }

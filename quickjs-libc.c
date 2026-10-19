@@ -4444,8 +4444,8 @@ JSModuleDef *js_init_module_os(JSContext *ctx, const char *module_name)
 
 /**********************************************************/
 
-static JSValue js_print(JSContext *ctx, JSValueConst this_val,
-                        int argc, JSValueConst *argv)
+JSValue js_std_print(JSContext *ctx, JSValueConst this_val,
+                     int argc, JSValueConst *argv)
 {
     int i;
     JSValueConst v;
@@ -4470,11 +4470,11 @@ static JSValue js_print(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
-static JSValue js_console_log(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv)
+JSValue js_std_console_log(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv)
 {
     JSValue ret;
-    ret = js_print(ctx, this_val, argc, argv);
+    ret = js_std_print(ctx, this_val, argc, argv);
     fflush(stdout);
     return ret;
 }
@@ -4489,7 +4489,7 @@ void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
 
     console = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, console, "log",
-                      JS_NewCFunction(ctx, js_console_log, "log", 1));
+                      JS_NewCFunction(ctx, js_std_console_log, "log", 1));
     JS_SetPropertyStr(ctx, global_obj, "console", console);
 
     performance = JS_NewObject(ctx);
@@ -4507,7 +4507,7 @@ void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
     }
 
     JS_SetPropertyStr(ctx, global_obj, "print",
-                      JS_NewCFunction(ctx, js_print, "print", 1));
+                      JS_NewCFunction(ctx, js_std_print, "print", 1));
     JS_SetPropertyStr(ctx, global_obj, "__loadScript",
                       JS_NewCFunction(ctx, js_loadScript, "__loadScript", 1));
 

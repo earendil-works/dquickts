@@ -104,10 +104,10 @@ List options.
 Evaluate EXPR.
 
 @item --typescript
-Parse the scripts (including @code{-e} and the standard input given
-as file @code{-}) as TypeScript. Files with the @code{.ts},
-@code{.mts} and @code{.cts} extensions are always TypeScript (see the
-TypeScript section).
+Parse the scripts (including @code{-e}, the standard input given as
+file @code{-} and the commands of the interactive mode) as TypeScript.
+Files with the @code{.ts}, @code{.mts} and @code{.cts} extensions are
+always TypeScript (see the TypeScript section).
 
 @item --experimental-decorators
 The TypeScript sources use the legacy decorators (@code{tsc}
@@ -124,6 +124,16 @@ get the @code{design:type}, @code{design:paramtypes} and
 @item -i
 @item --interactive
 Go to interactive mode (it is not the default when files are provided on the command line).
+
+@item --drepl file
+Durable interactive mode. The commands are TypeScript and run in a
+separate runtime which is saved to @code{file} with
+@code{JS_WriteSnapshot()} after each command, and restored from it
+when @code{qjs --drepl file} starts again: the functions, variables
+and objects of a session are still there in the next one. The runtime
+only has the standard objects, @code{print()} and
+@code{console.log()} (not the @code{std} and @code{os} modules, whose
+host state cannot be saved). @code{\load} evaluates a file in it.
 
 @item -m
 @item --module

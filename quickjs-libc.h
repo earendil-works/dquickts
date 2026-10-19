@@ -81,6 +81,12 @@ char *js_module_normalize(JSContext *ctx, const char *base_name,
 JSModuleDef *js_module_loader(JSContext *ctx,
                               const char *module_name, void *opaque,
                               JSValueConst attributes);
+/* print() and console.log() of js_std_add_helpers(). Exported so that
+   a JSSnapshotHost can list them in its natives (see qjs --drepl). */
+JSValue js_std_print(JSContext *ctx, JSValueConst this_val,
+                     int argc, JSValueConst *argv);
+JSValue js_std_console_log(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv);
 void js_std_eval_binary(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                         int flags);
 void js_std_eval_binary_json_module(JSContext *ctx,

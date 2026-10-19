@@ -30,6 +30,16 @@ import * as os from "os";
     g.os = os;
     g.std = std;
 
+    /* options set by qjs (see set_repl_options() in qjs.c) */
+    var options = g.__repl || {};
+    delete g.__repl;
+    /* the commands are TypeScript */
+    var typescript = !!options.typescript;
+    /* qjs --drepl: the commands run in another runtime, saved after
+       each command. It keeps the values: it returns their rendering
+       and answers the completion queries with JSON copies. */
+    var durable = options.durable;
+
     /* close global objects */
     var Object = g.Object;
     var String = g.String;
@@ -562,63 +572,93 @@ import * as os from "os";
         }
         return s;
     }
-    function get_context_object(line, pos) {
-        var obj, base, c;
+    /* the JS expression of the object whose properties complete the
+       word ending at 'pos' (undefined if none). The completions are
+       computed by JS sources evaluated with query(), so that they also
+       work in the durable runtime. */
+    function get_context_expr(line, pos) {
+        var base, c, expr;
         if (pos <= 0 || " ~!%^&*(-+={[|:;,<>?/".indexOf(line[pos - 1]) >= 0)
-            return g;
+            return "globalThis";
         if (pos >= 2 && line[pos - 1] === ".") {
             pos--;
-            obj = {};
             switch (c = line[pos - 1]) {
             case '\'':
             case '\"':
-                return "a";
+                return '""';
             case ']':
-                return [];
+                return "[]";
             case '}':
-                return {};
+                return "({})";
             case '/':
-                return / /;
+                return "/ /";
             default:
                 if (is_word(c)) {
                     base = get_context_word(line, pos);
                     if (["true", "false", "null", "this"].includes(base) || !isNaN(+base))
-                        return eval(base);
+                        return "(" + base + ")";
                     // Check if `base` is a set of regexp flags
                     if (pos - base.length >= 3 && line[pos - base.length - 1] === '/')
-                        return new RegExp('', base);
-                    obj = get_context_object(line, pos - base.length);
-                    if (obj === null || obj === void 0)
-                        return obj;
-                    if (obj === g && obj[base] === void 0)
-                        return eval(base);
-                    else
-                        return obj[base];
+                        return "new RegExp('', '" + base + "')";
+                    expr = get_context_expr(line, pos - base.length);
+                    if (expr === void 0)
+                        return expr;
+                    /* a global name can be a lexical declaration */
+                    if (expr === "globalThis")
+                        return base;
+                    return expr + "." + base;
                 }
-                return {};
+                return "({})";
             }
         }
         return void 0;
     }
 
+    /* the value of the JS source 'src' in the runtime of the commands
+       (a JSON copy for the durable runtime), or 'def' if it throws
+       (e.g. if a name of the line is not defined) */
+    function query(src, def) {
+        try {
+            return durable ? durable.query(src) : (0, eval)(src);
+        } catch (e) {
+            return def;
+        }
+    }
+
+    /* the names of the properties of the value of 'expr' and of its
+       prototypes */
+    function query_names(expr) {
+        return query("(function (o) {" +
+                     " var r = [], i;" +
+                     " for (i = 0; i < 10 && o !== null && o !== void 0; i++) {" +
+                     "  r = r.concat(Object.getOwnPropertyNames(o));" +
+                     "  o = Object.getPrototypeOf(o);" +
+                     " }" +
+                     " return r; })(" + expr + ")", []);
+    }
+
+    /* the text completing the property 'name' of the value of 'expr':
+       "()" for a function without parameters, "(" for other functions,
+       "." for objects */
+    function query_suffix(expr, name) {
+        return query("(function (m) {" +
+                     " if (typeof m == 'function') return m.length ? '(' : '()';" +
+                     " return typeof m == 'object' ? '.' : ''; })(" +
+                     expr + "[" + JSON.stringify(name) + "])", "");
+    }
+
     function get_completions(line, pos) {
-        var s, obj, ctx_obj, r, i, j, paren;
+        var s, expr, props, r, i, j;
 
         s = get_context_word(line, pos);
-        ctx_obj = get_context_object(line, pos - s.length);
+        expr = get_context_expr(line, pos - s.length);
+        props = (expr === void 0) ? [] : query_names(expr);
         r = [];
-        /* enumerate properties from object and its prototype chain,
-           add non-numeric regular properties with s as e prefix
-         */
-        for (i = 0, obj = ctx_obj; i < 10 && obj !== null && obj !== void 0; i++) {
-            var props = Object.getOwnPropertyNames(obj);
-            /* add non-numeric regular properties */
-            for (j = 0; j < props.length; j++) {
-                var prop = props[j];
-                if (typeof prop == "string" && ""+(+prop) != prop && prop.startsWith(s))
-                    r.push(prop);
-            }
-            obj = Object.getPrototypeOf(obj);
+        /* add non-numeric regular properties with s as prefix */
+        for (j = 0; j < props.length; j++) {
+            var prop = props[j];
+            if (""+(+prop) != prop && prop.startsWith(s))
+                r.push(prop);
         }
         if (r.length > 1) {
             /* sort list with internal names last and remove duplicates */
@@ -644,7 +684,7 @@ import * as os from "os";
         }
         /* 'tab' = list of completions, 'pos' = cursor position inside
            the completions */
-        return { tab: r, pos: s.length, ctx: ctx_obj };
+        return { tab: r, pos: s.length, expr: expr };
     }
 
     function completion() {
@@ -670,14 +710,7 @@ import * as os from "os";
         }
         if (last_fun === completion && tab.length == 1) {
             /* append parentheses to function names */
-            var m = res.ctx[tab[0]];
-            if (typeof m == "function") {
-                insert('(');
-                if (m.length == 0)
-                    insert(')');
-            } else if (typeof m == "object") {
-                insert('.');
-            }
+            insert(query_suffix(res.expr, tab[0]));
         }
         /* show the possible completions */
         if (last_fun === completion && tab.length >= 2) {
@@ -906,10 +939,7 @@ import * as os from "os";
         if (cmd === "h" || cmd === "?" || cmd == "help") {
             help();
         } else if (cmd === "load") {
-            var filename = expr.substring(cmd.length + 1).trim();
-            if (filename.lastIndexOf(".") <= filename.lastIndexOf("/"))
-                filename += ".js";
-            std.loadScript(filename);
+            std.loadScript(directive_filename(cmd, expr));
             return false;
         } else if (cmd === "x") {
             hex_mode = true;
@@ -928,6 +958,15 @@ import * as os from "os";
         return true;
     }
 
+    /* the file name argument of the directive 'cmd' of 'expr' (".js" if
+       it has no extension) */
+    function directive_filename(cmd, expr) {
+        var filename = expr.substring(cmd.length + 1).trim();
+        if (filename.lastIndexOf(".") <= filename.lastIndexOf("/"))
+            filename += ".js";
+        return filename;
+    }
+
     function help() {
         function sel(n) {
             return n ? "*": " ";
@@ -942,6 +981,10 @@ import * as os from "os";
 
     function cmd_start() {
         std.puts('QuickJS - Type "\\h" for help\n');
+        if (durable) {
+            std.puts((durable.restored ? "Restored" : "Created") +
+                     " the durable session " + durable.path + "\n");
+        }
 
         cmd_readline_start();
     }
@@ -969,6 +1012,17 @@ import * as os from "os";
             return false;
         }
         cmd = extract_directive(expr);
+        if (cmd === "load" && durable) {
+            /* the file is a command of the durable runtime */
+            var filename = directive_filename(cmd, expr);
+            expr = std.loadFile(filename);
+            if (expr === null) {
+                std.puts("Cannot load " + filename + "\n");
+                return false;
+            }
+            eval_and_print_start(expr);
+            return true;
+        }
         if (cmd.length > 0) {
             if (!handle_directive(cmd, expr)) {
                 return false;
@@ -997,50 +1051,77 @@ import * as os from "os";
     function eval_and_print_start(expr) {
         var result;
 
+        eval_start_time = os.now();
+        if (durable) {
+            /* synchronous: the durable runtime also runs the jobs of
+               the command */
+            result = durable.eval(expr);
+            if (result.error)
+                print_eval_error(result);
+            else
+                print_eval_result(result);
+            return;
+        }
         try {
-            eval_start_time = os.now();
             /* eval as a script */
-            result = std.evalScript(expr, { backtrace_barrier: true, async: true });
+            result = std.evalScript(expr, { backtrace_barrier: true, async: true,
+                                            typescript: typescript });
             /* result is a promise */
-            result.then(print_eval_result, print_eval_error);
+            result.then(print_eval_result, function (error) {
+                print_eval_error({ value: error });
+            });
         } catch (error) {
-            print_eval_error(error);
+            print_eval_error({ value: error });
         }
     }
 
+    /* print 'result.value', or 'result.text', its rendering by the
+       durable runtime which holds the value */
+    function print_value(result) {
+        if (durable)
+            std.puts(result.text);
+        else
+            std.__printObject(result.value);
+    }
+
+    /* 'result.value' is the completion value (with the durable
+       runtime: only if it is a number or a bigint) */
     function print_eval_result(result) {
+        var value = result.value;
         var default_print = true;
 
-        result = result.value;
         eval_time = os.now() - eval_start_time;
         std.puts(colors[styles.result]);
         if (hex_mode) {
-            if (typeof result == "number" &&
-                result === Math.floor(result)) {
-                std.puts(number_to_string_hex(result));
+            if (typeof value == "number" &&
+                value === Math.floor(value)) {
+                std.puts(number_to_string_hex(value));
                 default_print = false;
-            } else if (typeof result == "bigint") {
-                std.puts(number_to_string_hex(result));
+            } else if (typeof value == "bigint") {
+                std.puts(number_to_string_hex(value));
                 std.puts("n");
                 default_print = false;
             }
         }
         if (default_print) {
-            std.__printObject(result);
+            print_value(result);
         }
         std.puts("\n");
         std.puts(colors.none);
-        /* set the last result */
-        g._ = result;
+        /* set the last result (the durable runtime sets its own) */
+        if (!durable)
+            g._ = value;
 
         handle_cmd_end();
     }
 
-    function print_eval_error(error) {
+    /* 'result.value' is the exception */
+    function print_eval_error(result) {
         std.puts(colors[styles.error_msg]);
-        if (!(error instanceof Error))
+        /* the durable runtime includes it in 'result.text' */
+        if (!durable && !(result.value instanceof Error))
             std.puts("Throw: ");
-        std.__printObject(error);
+        print_value(result);
         std.puts("\n");
         std.puts(colors.none);
 
@@ -1167,6 +1248,12 @@ import * as os from "os";
 
         var js_no_regex = "|this|super|undefined|null|true|false|Infinity|NaN|arguments|";
         var js_types = "|void|var|";
+
+        if (typescript) {
+            js_keywords += "abstract|accessor|as|asserts|declare|infer|is|keyof|" +
+                "namespace|override|readonly|satisfies|type|unique|";
+            js_types += "any|bigint|boolean|never|number|object|string|symbol|unknown|";
+        }
 
         function parse_identifier() {
             can_regex = 1;

@@ -20,6 +20,10 @@ unreleased:
   parsing; enums, namespaces and parameter properties are compiled to
   bytecode; const enum members are folded; imports only used as types
   are elided
+- qjs --drepl file: durable REPL whose TypeScript commands run in a
+  runtime saved to 'file' after each command and restored from it at
+  startup; qjs --typescript also applies to the REPL commands
+- quickjs-libc: exported js_std_print() and js_std_console_log()
 - quickjs-libc: js_module_normalize() resolves './x.js' / './x' to an
   existing './x.ts' ('./x.mjs' to './x.mts'); std.evalScript()
   'typescript' option; qjs: '-' as file name reads stdin
