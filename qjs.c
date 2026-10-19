@@ -353,11 +353,13 @@ static size_t get_suffixed_size(const char *str)
 
    The commands run in a second runtime, the durable runtime, saved to
    FILE with JS_WriteSnapshot() after each command and restored from it
-   at startup: the declarations survive the process. The line editor
-   (repl.js) stays in the main runtime and drives the durable runtime
-   through the 'durable' object of its options. No value crosses the
-   runtimes: the durable runtime renders its results to text and copies
-   the completion data through JSON.
+   at startup: the declarations survive the process. FILE only holds a
+   delta (JS_SNAPSHOT_DELTA) of a new session: a base is reproducible, so
+   the base of a new session is rebuilt at startup instead of being
+   stored. The line editor (repl.js) stays in the main runtime and drives
+   the durable runtime through the 'durable' object of its options. No
+   value crosses the runtimes: the durable runtime renders its results
+   to text and copies the completion data through JSON.
 
    The durable runtime only has the standard objects, print() and
    console.log(): the 'std' and 'os' modules hold host state (files,
@@ -455,9 +457,23 @@ static JSValue drepl_rethrow(JSContext *ctx)
     return JS_Throw(ctx, text);
 }
 
-/* write the durable runtime to its file, through a temporary file
-   renamed over it so that the file always holds a complete snapshot.
-   The errors are reported on stderr. */
+/* report the pending exception of the durable runtime on stderr */
+static void drepl_report(const char *what)
+{
+    JSValue exc = JS_GetException(drepl.ctx);
+    DynBuf dbuf;
+
+    dbuf_init(&dbuf);
+    JS_PrintValue(drepl.ctx, drepl_write, &dbuf, exc, NULL);
+    fprintf(stderr, "qjs: %s %s: %.*s\n", drepl.path, what,
+            (int)dbuf.size, (const char *)dbuf.buf);
+    dbuf_free(&dbuf);
+    JS_FreeValue(drepl.ctx, exc);
+}
+
+/* write the delta of the durable runtime to its file, through a
+   temporary file renamed over it so that the file always holds a
+   complete delta. The errors are reported on stderr. */
 static int drepl_save(void)
 {
     JSContext *dctx = drepl.ctx;
@@ -467,16 +483,9 @@ static int drepl_save(void)
     FILE *f;
     int ret = -1;
 
-    buf = JS_WriteSnapshot(dctx, &len, &drepl_host, NULL, 0, 0);
+    buf = JS_WriteSnapshot(dctx, &len, &drepl_host, NULL, 0, JS_SNAPSHOT_DELTA);
     if (!buf) {
-        JSValue exc = JS_GetException(dctx);
-        DynBuf dbuf;
-        dbuf_init(&dbuf);
-        JS_PrintValue(dctx, drepl_write, &dbuf, exc, NULL);
-        fprintf(stderr, "qjs: %s not saved: %.*s\n", drepl.path,
-                (int)dbuf.size, (const char *)dbuf.buf);
-        dbuf_free(&dbuf);
-        JS_FreeValue(dctx, exc);
+        drepl_report("not saved");
         return -1;
     }
     len_tmp = strlen(drepl.path) + 5;
@@ -656,19 +665,104 @@ static JSValue js_drepl_query(JSContext *ctx, JSValueConst this_val,
     return val;
 }
 
+/* A new session: the standard objects, print() and console.log(). Every
+   lazily created builtin (Math, the methods of the prototypes...) is
+   instantiated, so that using one does not change the heap: the deltas
+   only hold what the commands create. */
+static JSContext *drepl_new_context(JSRuntime *rt)
+{
+    static const char instantiate[] =
+        "(() => {"
+        "  const seen = new Set();"
+        "  (function walk(o) {"
+        "    if ((typeof o !== 'object' && typeof o !== 'function') ||"
+        "        o === null || seen.has(o))"
+        "      return;"
+        "    seen.add(o);"
+        "    for (const k of Reflect.ownKeys(o)) {"
+        "      const d = Object.getOwnPropertyDescriptor(o, k);"
+        "      walk(d.value); walk(d.get); walk(d.set);"
+        "    }"
+        "    walk(Object.getPrototypeOf(o));"
+        "  })(globalThis);"
+        "})()";
+    JSContext *ctx;
+    JSValue global, console, val;
+
+    ctx = JS_NewContext(rt);
+    if (!ctx)
+        return NULL;
+    global = JS_GetGlobalObject(ctx);
+    console = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, console, "log",
+                      JS_NewCFunction(ctx, js_std_console_log, "log", 1));
+    JS_SetPropertyStr(ctx, global, "console", console);
+    JS_SetPropertyStr(ctx, global, "print",
+                      JS_NewCFunction(ctx, js_std_print, "print", 1));
+    JS_FreeValue(ctx, global);
+    val = JS_Eval(ctx, instantiate, sizeof(instantiate) - 1, "<drepl>",
+                  JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(val)) {
+        JS_FreeContext(ctx);
+        return NULL;
+    }
+    JS_FreeValue(ctx, val);
+    return ctx;
+}
+
+/* Restore the durable runtime from 'delta', a delta of a new session
+   whose base is rebuilt: the same bytes in every process of this qjs
+   build. */
+static int drepl_restore(const uint8_t *delta, size_t delta_len)
+{
+    JSSnapshotResult res;
+    JSRuntime *base_rt;
+    JSContext *base_ctx = NULL;
+    uint8_t *base = NULL;
+    size_t base_len;
+    char err[256];
+    int i, ret = -1;
+
+    base_rt = JS_NewRuntime();
+    if (base_rt)
+        base_ctx = drepl_new_context(base_rt);
+    if (base_ctx)
+        base = JS_WriteSnapshot(base_ctx, &base_len, &drepl_host, NULL, 0,
+                                JS_SNAPSHOT_BASE);
+    if (!base) {
+        snprintf(err, sizeof(err), "cannot rebuild the base of the session");
+    } else if (JS_ReadSnapshot(drepl.rt, base, base_len, delta, delta_len,
+                               &drepl_host, &res, err, sizeof(err)) == 0) {
+        if (res.context_count == 1) {
+            drepl.ctx = res.contexts[0];
+            ret = 0;
+        } else {
+            for(i = 0; i < res.context_count; i++)
+                JS_FreeContext(res.contexts[i]);
+            snprintf(err, sizeof(err), "not a --drepl session");
+        }
+        JS_FreeSnapshotResult(drepl.rt, &res);
+    }
+    if (base)
+        js_free(base_ctx, base);
+    if (base_ctx)
+        JS_FreeContext(base_ctx);
+    if (base_rt)
+        JS_FreeRuntime(base_rt);
+    if (ret < 0)
+        fprintf(stderr, "qjs: %s: %s\n", drepl.path, err);
+    return ret;
+}
+
 /* Set up the durable runtime 'rt' for 'path': restored from the file if
    it exists, otherwise new and saved at once (so that an unwritable path
    fails before the REPL starts). 'ts_flags' are the TypeScript decorator
    flags of the commands. */
 static int drepl_open(JSRuntime *rt, const char *path, int ts_flags)
 {
-    JSSnapshotResult res;
-    JSContext *ctx;
-    JSValue global, console;
-    char err[256];
     uint8_t *buf;
     size_t len;
-    int i, ret;
+    int ret;
 
     drepl.rt = rt;
     drepl.path = path;
@@ -678,43 +772,28 @@ static int drepl_open(JSRuntime *rt, const char *path, int ts_flags)
 
     buf = js_load_file(NULL, &len, path);
     if (buf) {
-        ret = JS_ReadSnapshot(rt, buf, len, NULL, 0, &drepl_host, &res,
-                              err, sizeof(err));
+        ret = drepl_restore(buf, len);
         free(buf);
-        if (ret < 0) {
-            fprintf(stderr, "qjs: %s: %s\n", path, err);
-            return -1;
-        }
-        if (res.context_count != 1) {
-            for(i = 0; i < res.context_count; i++)
-                JS_FreeContext(res.contexts[i]);
-            JS_FreeSnapshotResult(rt, &res);
-            fprintf(stderr, "qjs: %s: not a --drepl session\n", path);
-            return -1;
-        }
-        drepl.ctx = res.contexts[0];
-        JS_FreeSnapshotResult(rt, &res);
-        drepl.restored = TRUE;
-        return 0;
+        drepl.restored = (ret == 0);
+        return ret;
     }
     if (errno != ENOENT) {
         perror(path);
         return -1;
     }
-    ctx = JS_NewContext(rt);
-    if (!ctx) {
+    drepl.ctx = drepl_new_context(rt);
+    if (!drepl.ctx) {
         fprintf(stderr, "qjs: cannot allocate JS context\n");
         return -1;
     }
-    drepl.ctx = ctx;
-    global = JS_GetGlobalObject(ctx);
-    console = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, console, "log",
-                      JS_NewCFunction(ctx, js_std_console_log, "log", 1));
-    JS_SetPropertyStr(ctx, global, "console", console);
-    JS_SetPropertyStr(ctx, global, "print",
-                      JS_NewCFunction(ctx, js_std_print, "print", 1));
-    JS_FreeValue(ctx, global);
+    /* the base of the deltas saved after each command */
+    buf = JS_WriteSnapshot(drepl.ctx, &len, &drepl_host, NULL, 0,
+                           JS_SNAPSHOT_BASE);
+    if (!buf) {
+        drepl_report("not saved");
+        return -1;
+    }
+    js_free(drepl.ctx, buf);
     return drepl_save();
 }
 

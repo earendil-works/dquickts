@@ -134,6 +134,9 @@ and objects of a session are still there in the next one. The runtime
 only has the standard objects, @code{print()} and
 @code{console.log()} (not the @code{std} and @code{os} modules, whose
 host state cannot be saved). @code{\load} evaluates a file in it.
+@code{file} only holds a delta of a new session (see the heap
+snapshots): the base, a new session with every builtin instantiated,
+is rebuilt at startup.
 
 @item -m
 @item --module

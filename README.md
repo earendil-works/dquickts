@@ -102,11 +102,13 @@ the standard objects plus `print()` and `console.log()`:
 - The line editor (`repl.js`) stays in the main runtime and passes each command to the durable
   runtime. The durable runtime runs the command and its promise jobs, so top-level `await` works,
   and sends back the rendered result.
-- After each command, the durable runtime is written with `JS_WriteSnapshot()`. It goes to a
-  temporary file that is then renamed over `FILE`, so the file always holds a complete session.
-  A small session is about 14 KB.
-- At startup, `JS_ReadSnapshot()` rebuilds the session from `FILE`. If the file is missing, a new
-  session starts.
+- After each command, the durable runtime is written with `JS_WriteSnapshot()` as a delta of a
+  new session. It goes to a temporary file that is then renamed over `FILE`, so the file always
+  holds a complete delta. The session in the transcript above takes about 400 bytes.
+- At startup, `qjs` rebuilds the base, which is a new session with every lazily created builtin
+  already instantiated. [Bases are reproducible](#incremental-snapshots), so this rebuilt base is
+  byte-identical to the one the deltas were written against. `JS_ReadSnapshot()` then applies
+  `FILE` on top of it. If the file is missing, a new session starts.
 
 Limits:
 
