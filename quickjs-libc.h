@@ -37,11 +37,28 @@ JSModuleDef *js_init_module_std(JSContext *ctx, const char *module_name);
 JSModuleDef *js_init_module_os(JSContext *ctx, const char *module_name);
 void js_std_add_helpers(JSContext *ctx, int argc, char **argv);
 void js_std_loop(JSContext *ctx);
+/* one step of js_std_loop() for a host which runs its own event loop:
+   run the pending jobs, then the handler of at most one expired timer.
+   Return 0 if there is more work to do now, the delay in ms until the
+   next timer, -1 if there is no job and no timer (the I/O, signal and
+   worker handlers are run by js_std_poll_io()) or -2 if a job or a
+   handler threw (the exception is pending in the runtime). */
+int js_std_loop_once(JSContext *ctx);
+/* wait at most 'timeout_ms' ms (forever if < 0, unless there is nothing
+   to wait for) for a signal, a file descriptor of
+   os.setReadHandler()/os.setWriteHandler() or a worker message and run
+   its handler. Return 0, -1 if poll() failed or -2 if the handler threw
+   (the exception is pending in the runtime). The timers are not run. */
+int js_std_poll_io(JSContext *ctx, int timeout_ms);
 JSValue js_std_await(JSContext *ctx, JSValue obj);
 void js_std_init_handlers(JSRuntime *rt);
 void js_std_free_handlers(JSRuntime *rt);
 void js_std_dump_error(JSContext *ctx);
 uint8_t *js_load_file(JSContext *ctx, size_t *pbuf_len, const char *filename);
+/* file reader of js_module_load(): return the contents of 'filename'
+   allocated with js_malloc() or NULL */
+typedef uint8_t *JSLoadFileFunc(JSContext *ctx, size_t *pbuf_len,
+                                const char *filename);
 int js_module_set_import_meta(JSContext *ctx, JSValueConst func_val,
                               JS_BOOL use_realpath, JS_BOOL is_main);
 /* module types selected by the 'type' import attribute */
@@ -81,6 +98,11 @@ char *js_module_normalize(JSContext *ctx, const char *base_name,
 JSModuleDef *js_module_loader(JSContext *ctx,
                               const char *module_name, void *opaque,
                               JSValueConst attributes);
+/* js_module_loader() without the shared library ('.so') modules and
+   with the file reader 'load_file' */
+JSModuleDef *js_module_load(JSContext *ctx, const char *module_name,
+                            void *opaque, JSValueConst attributes,
+                            JSLoadFileFunc *load_file);
 /* print() and console.log() of js_std_add_helpers(). Exported so that
    a JSSnapshotHost can list them in its natives (see qjs --drepl). */
 JSValue js_std_print(JSContext *ctx, JSValueConst this_val,
@@ -95,6 +117,9 @@ void js_std_eval_binary_json_module(JSContext *ctx,
 void js_std_promise_rejection_tracker(JSContext *ctx, JSValueConst promise,
                                       JSValueConst reason,
                                       JS_BOOL is_handled, void *opaque);
+/* create the runtime of the new workers (JS_NewRuntime() by default).
+   No effect without worker support. */
+void js_std_set_worker_new_runtime_func(JSRuntime *(*func)(void));
 void js_std_set_worker_new_context_func(JSContext *(*func)(JSRuntime *rt));
 
 #ifdef __cplusplus

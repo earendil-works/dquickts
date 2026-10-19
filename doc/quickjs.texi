@@ -1262,9 +1262,72 @@ Examples are available in @file{quickjs-libc.c}.
 @subsection C Modules
 
 Native ES6 modules are supported and can be dynamically or statically
-linked. Look at the @file{test_bjson} and @file{bjson.so}
-examples. The standard library @file{quickjs-libc.c} is also a good example
-of a native module.
+linked. Look at the @file{examples/point.c} and
+@file{examples/fib.c} examples. The standard library
+@file{quickjs-libc.c} is also a good example of a native module.
+
+@subsection Standard library C API
+
+@file{quickjs-libc.h} gives the C API of the standard library:
+
+@table @code
+@item js_init_module_std(ctx, name)
+@item js_init_module_os(ctx, name)
+@item js_init_module_bjson(ctx, name)
+Declare the @code{std}, @code{os} and @code{bjson} modules under the
+module name @code{name}.
+
+@item js_std_init_handlers(rt)
+@item js_std_free_handlers(rt)
+Allocate and free the state of the @code{os} timers, handlers and
+workers of a runtime.
+
+@item js_module_loader(ctx, name, opaque, attributes)
+@item js_module_load(ctx, name, opaque, attributes, load_file)
+Module loaders: @code{js_module_load()} is @code{js_module_loader()}
+without the shared library (@code{.so}) modules and with the file
+reader @code{load_file} (@code{js_load_file()} for
+@code{js_module_loader()}).
+
+@item js_std_loop(ctx)
+Run the jobs, timers and handlers until there is nothing left to do.
+The exceptions of the handlers are printed.
+
+@item js_std_loop_once(ctx)
+@item js_std_poll_io(ctx, timeout_ms)
+The steps of @code{js_std_loop()} for a host which runs its own event
+loop. @code{js_std_loop_once()} runs the pending jobs, then the handler
+of at most one expired timer, and returns 0 if there is more to do
+now, the delay in ms until the next timer, or -1 if there is no job
+and no timer. @code{js_std_poll_io()} waits at most @code{timeout_ms}
+ms (forever if negative, unless there is nothing to wait for) for a
+signal, a file descriptor of @code{os.setReadHandler()} or
+@code{os.setWriteHandler()}, or a worker message, and runs its
+handler. It returns 0, or -1 if @code{poll()} failed. Both return -2
+if a job or handler threw: the exception is left pending
+(@code{JS_GetException()}). A host loop:
+@example
+for(;;) @{
+    ret = js_std_loop_once(ctx);
+    if (ret == -2)
+        handle_exception(ctx);
+    else if (ret != 0)
+        js_std_poll_io(ctx, ret); /* ret == -1: no timer */
+@}
+@end example
+
+@item js_std_set_worker_new_runtime_func(func)
+@item js_std_set_worker_new_context_func(func)
+Set the functions creating the runtime (@code{JS_NewRuntime()} by
+default) and the context of the new workers.
+@end table
+
+The module name normalizer set with @code{JS_SetModuleLoaderFunc()} or
+@code{JS_SetModuleLoaderFunc2()} can be replaced, after them, by
+@code{JS_SetModuleNormalizeFunc2()}, whose normalizer also gets the
+import attributes (an object, or @code{undefined} without
+@code{with} clause). Modules are keyed by their normalized name and
+their attributes.
 
 @subsection Memory handling
 
