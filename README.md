@@ -63,6 +63,8 @@ The full list is under `unreleased` in [`Changelog`](Changelog).
 
 ## Durable REPL
 
+![qjs --drepl: TypeScript declarations survive quitting and restarting the REPL](doc/drepl-demo.gif)
+
 `qjs --drepl FILE` starts the usual REPL, with highlighting, history and tab completion, and
 input is TypeScript. After every command, the whole session is saved to `FILE`. When you start
 `qjs --drepl FILE` again, the session comes back with the same functions, variables, objects and
