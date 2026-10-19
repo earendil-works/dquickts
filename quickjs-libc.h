@@ -35,6 +35,8 @@ extern "C" {
 
 JSModuleDef *js_init_module_std(JSContext *ctx, const char *module_name);
 JSModuleDef *js_init_module_os(JSContext *ctx, const char *module_name);
+/* the 'bjson' module: JS_ReadObject() and JS_WriteObject() from JS */
+JSModuleDef *js_init_module_bjson(JSContext *ctx, const char *module_name);
 void js_std_add_helpers(JSContext *ctx, int argc, char **argv);
 void js_std_loop(JSContext *ctx);
 /* one step of js_std_loop() for a host which runs its own event loop:

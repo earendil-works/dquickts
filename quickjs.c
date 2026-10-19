@@ -1406,6 +1406,8 @@ static int JS_ToUint8ClampFree(JSContext *ctx, int32_t *pres, JSValue val);
 static JSValue js_new_string8_len(JSContext *ctx, const char *buf, int len);
 static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
                                  JSValueConst flags);
+static JSValue js_compile_regexp_flags(JSContext *ctx, JSValueConst pattern,
+                                       int re_flags);
 static JSValue JS_NewRegexp(JSContext *ctx, JSValue pattern, JSValue bc);
 static void gc_decref(JSRuntime *rt);
 static int JS_NewClass1(JSRuntime *rt, JSClassID class_id,
@@ -46764,9 +46766,33 @@ typedef enum BCTagEnum {
     BC_TAG_DATE,
     BC_TAG_OBJECT_VALUE,
     BC_TAG_OBJECT_REFERENCE,
+    BC_TAG_REGEXP,
+    BC_TAG_MAP,
+    BC_TAG_SET,
+    BC_TAG_SYMBOL,
 } BCTagEnum;
 
-#define BC_VERSION 6
+/* type of the entries of the atom table (JS_WriteObjectAtoms()): the
+   string atoms and the symbols are written as their string, the
+   well-known symbols as their atom index */
+typedef enum BCAtomTypeEnum {
+    BC_ATOM_WELL_KNOWN_SYMBOL = 0,
+    BC_ATOM_STRING = JS_ATOM_TYPE_STRING,
+    BC_ATOM_GLOBAL_SYMBOL = JS_ATOM_TYPE_GLOBAL_SYMBOL,
+    BC_ATOM_SYMBOL = JS_ATOM_TYPE_SYMBOL,
+} BCAtomTypeEnum;
+
+/* size of the version and checksum fields at the start of the output
+   of JS_WriteObject() */
+#define BC_HEADER_SIZE 5
+
+/* RegExp flags written by JS_WriteRegExp() (LRE_FLAG_x) */
+#define BC_REGEXP_FLAGS (LRE_FLAG_GLOBAL | LRE_FLAG_IGNORECASE |       \
+                         LRE_FLAG_MULTILINE | LRE_FLAG_DOTALL |         \
+                         LRE_FLAG_UNICODE | LRE_FLAG_STICKY |           \
+                         LRE_FLAG_INDICES | LRE_FLAG_UNICODE_SETS)
+
+#define BC_VERSION 7
 
 typedef struct BCWriterState {
     JSContext *ctx;
@@ -46812,6 +46838,10 @@ static const char * const bc_tag_str[] = {
     "Date",
     "ObjectValue",
     "ObjectReference",
+    "RegExp",
+    "Map",
+    "Set",
+    "Symbol",
 };
 #endif
 
@@ -46919,6 +46949,37 @@ static int bc_put_atom(BCWriterState *s, JSAtom atom)
     }
     bc_put_leb128(s, v);
     return 0;
+}
+
+/* checksum of the payload following the header. It detects the data
+   corruptions (bit flips, truncation), not the adversarial input. The
+   bytes are read as little endian words so that the result does not
+   depend on the host. */
+static uint32_t bc_csum(const uint8_t *p, size_t n)
+{
+    uint32_t h, v;
+    size_t i;
+
+    h = (uint32_t)n;
+    for(i = 0; i + 4 <= n; i += 4) {
+        v = p[i] | (p[i + 1] << 8) | (p[i + 2] << 16) | ((uint32_t)p[i + 3] << 24);
+        h = (h + v) * 0x9e370001;
+    }
+    v = 0;
+    switch(n - i) {
+    case 3:
+        v |= p[i + 2] << 16;
+        /* fall through */
+    case 2:
+        v |= p[i + 1] << 8;
+        /* fall through */
+    case 1:
+        v |= p[i];
+        break;
+    default:
+        break;
+    }
+    return (h + v) * 0x9e370001;
 }
 
 static void bc_byte_swap(uint8_t *bc_buf, int bc_len)
@@ -47398,6 +47459,38 @@ static int JS_WriteSharedArrayBuffer(BCWriterState *s, JSValueConst obj)
     return 0;
 }
 
+/* the source and the flags: the regexp is compiled again when read */
+static int JS_WriteRegExp(BCWriterState *s, JSRegExp *re)
+{
+    int re_flags;
+
+    re_flags = lre_get_flags(re->bytecode->u.str8) & BC_REGEXP_FLAGS;
+    bc_put_u8(s, BC_TAG_REGEXP);
+    JS_WriteString(s, re->pattern);
+    bc_put_leb128(s, re_flags);
+    return 0;
+}
+
+/* the live records in insertion order */
+static int JS_WriteMap(BCWriterState *s, JSMapState *ms, BOOL is_set)
+{
+    struct list_head *el;
+    JSMapRecord *mr;
+
+    bc_put_u8(s, is_set ? BC_TAG_SET : BC_TAG_MAP);
+    bc_put_leb128(s, ms->record_count);
+    list_for_each(el, &ms->records) {
+        mr = list_entry(el, JSMapRecord, link);
+        if (mr->empty)
+            continue;
+        if (JS_WriteObjectRec(s, mr->key))
+            return -1;
+        if (!is_set && JS_WriteObjectRec(s, mr->value))
+            return -1;
+    }
+    return 0;
+}
+
 static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
 {
     uint32_t tag;
@@ -47505,6 +47598,14 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
                 bc_put_u8(s, BC_TAG_DATE);
                 ret = JS_WriteObjectRec(s, p->u.object_data);
                 break;
+            case JS_CLASS_REGEXP:
+                ret = JS_WriteRegExp(s, &p->u.regexp);
+                break;
+            case JS_CLASS_MAP:
+            case JS_CLASS_SET:
+                ret = JS_WriteMap(s, p->u.map_state,
+                                  p->class_id == JS_CLASS_SET);
+                break;
             case JS_CLASS_NUMBER:
             case JS_CLASS_STRING:
             case JS_CLASS_BOOLEAN:
@@ -47532,6 +47633,19 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
         if (JS_WriteBigInt(s, obj))
             goto fail;
         break;
+    case JS_TAG_SYMBOL:
+        {
+            JSAtomStruct *p = JS_VALUE_GET_PTR(obj);
+            JSAtom atom = js_get_atom_index(s->ctx->rt, p);
+            if (js_atom_is_private(s->ctx->rt, atom)) {
+                JS_ThrowTypeError(s->ctx, "private symbols cannot be serialized");
+                goto fail;
+            }
+            bc_put_u8(s, BC_TAG_SYMBOL);
+            if (bc_put_atom(s, atom))
+                goto fail;
+        }
+        break;
     default:
     invalid_tag:
         JS_ThrowInternalError(s->ctx, "unsupported tag (%d)", tag);
@@ -47553,11 +47667,20 @@ static int JS_WriteObjectAtoms(BCWriterState *s)
     dbuf1 = s->dbuf;
     js_dbuf_init(s->ctx, &s->dbuf);
     bc_put_u8(s, BC_VERSION);
+    bc_put_u32(s, 0); /* checksum, set by JS_WriteObject2() */
 
     bc_put_leb128(s, s->idx_to_atom_count);
     for(i = 0; i < s->idx_to_atom_count; i++) {
-        JSAtomStruct *p = rt->atom_array[s->idx_to_atom[i]];
-        JS_WriteString(s, p);
+        JSAtom atom = s->idx_to_atom[i];
+        JSAtomStruct *p = rt->atom_array[atom];
+        if (__JS_AtomIsConst(atom) && p->atom_type == JS_ATOM_TYPE_SYMBOL) {
+            bc_put_u8(s, BC_ATOM_WELL_KNOWN_SYMBOL);
+            bc_put_leb128(s, atom);
+        } else {
+            /* the private symbols are never written */
+            bc_put_u8(s, p->atom_type);
+            JS_WriteString(s, p);
+        }
     }
     /* XXX: should check for OOM in above phase */
 
@@ -47582,6 +47705,7 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
                          int flags, uint8_t ***psab_tab, size_t *psab_tab_len)
 {
     BCWriterState ss, *s = &ss;
+    uint32_t h;
 
     memset(s, 0, sizeof(*s));
     s->ctx = ctx;
@@ -47602,6 +47726,9 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
         goto fail;
     if (JS_WriteObjectAtoms(s))
         goto fail;
+    /* the version and checksum fields are not checksummed */
+    h = bc_csum(s->dbuf.buf + BC_HEADER_SIZE, s->dbuf.size - BC_HEADER_SIZE);
+    put_u32(s->dbuf.buf + 1, is_be() ? bswap32(h) : h);
     js_object_list_end(ctx, &s->object_list);
     js_free(ctx, s->atom_to_idx);
     js_free(ctx, s->idx_to_atom);
@@ -48664,6 +48791,109 @@ static JSValue JS_ReadObjectValue(BCReaderState *s)
     return JS_EXCEPTION;
 }
 
+static JSValue JS_ReadRegExp(BCReaderState *s)
+{
+    JSContext *ctx = s->ctx;
+    JSString *p;
+    JSValue pattern, bc, obj;
+    uint32_t re_flags;
+
+    p = JS_ReadString(s);
+    if (!p)
+        return JS_EXCEPTION;
+    pattern = JS_MKPTR(JS_TAG_STRING, p);
+    if (bc_get_leb128(s, &re_flags))
+        goto fail;
+    if (re_flags & ~BC_REGEXP_FLAGS) {
+        JS_ThrowSyntaxError(ctx, "invalid regular expression flags");
+        goto fail;
+    }
+    if (!ctx->regexp_shape) {
+        JS_ThrowTypeError(ctx, "RegExp is not supported");
+        goto fail;
+    }
+    bc = js_compile_regexp_flags(ctx, pattern, re_flags);
+    if (JS_IsException(bc))
+        goto fail;
+    obj = JS_NewRegexp(ctx, pattern, bc);
+    if (JS_IsException(obj))
+        return JS_EXCEPTION;
+    if (BC_add_object_ref(s, obj)) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    return obj;
+ fail:
+    JS_FreeValue(ctx, pattern);
+    return JS_EXCEPTION;
+}
+
+static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
+                                  int argc, JSValueConst *argv, int magic);
+static JSValue js_map_set(JSContext *ctx, JSValueConst this_val,
+                          int argc, JSValueConst *argv, int magic);
+
+static JSValue JS_ReadMap(BCReaderState *s, BOOL is_set)
+{
+    JSContext *ctx = s->ctx;
+    JSValue obj, ret, args[2];
+    uint32_t i, count;
+    int magic = is_set; /* MAGIC_SET */
+
+    args[0] = JS_UNDEFINED;
+    args[1] = JS_UNDEFINED;
+    obj = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, magic);
+    if (JS_IsException(obj))
+        return JS_EXCEPTION;
+    if (BC_add_object_ref(s, obj))
+        goto fail;
+    if (bc_get_leb128(s, &count))
+        goto fail;
+    for(i = 0; i < count; i++) {
+        args[0] = JS_ReadObjectRec(s);
+        if (JS_IsException(args[0]))
+            goto fail;
+        if (!is_set) {
+            args[1] = JS_ReadObjectRec(s);
+            if (JS_IsException(args[1]))
+                goto fail;
+        }
+        ret = js_map_set(ctx, obj, 2, (JSValueConst *)args, magic);
+        if (JS_IsException(ret))
+            goto fail;
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, args[0]);
+        JS_FreeValue(ctx, args[1]);
+        args[0] = JS_UNDEFINED;
+        args[1] = JS_UNDEFINED;
+    }
+    return obj;
+ fail:
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, args[1]);
+    JS_FreeValue(ctx, obj);
+    return JS_EXCEPTION;
+}
+
+static JSValue JS_ReadSymbol(BCReaderState *s)
+{
+    JSContext *ctx = s->ctx;
+    JSValue obj;
+    JSAtom atom;
+
+    if (bc_get_atom(s, &atom))
+        return JS_EXCEPTION;
+    if (atom == JS_ATOM_NULL || __JS_AtomIsTaggedInt(atom) ||
+        JS_AtomGetKind(ctx, atom) != JS_ATOM_KIND_SYMBOL) {
+        JS_FreeAtom(ctx, atom);
+        return JS_ThrowSyntaxError(ctx, "invalid symbol (pos=%u)",
+                                   (unsigned int)(s->ptr - s->buf_start));
+    }
+    obj = JS_AtomToValue(ctx, atom);
+    JS_FreeAtom(ctx, atom);
+    return obj;
+}
+
 static JSValue JS_ReadObjectRec(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
@@ -48720,12 +48950,14 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
         break;
     case BC_TAG_FUNCTION_BYTECODE:
         if (!s->allow_bytecode)
-            goto invalid_tag;
+            goto no_allow_bytecode;
         obj = JS_ReadFunctionTag(s);
         break;
     case BC_TAG_MODULE:
-        if (!s->allow_bytecode)
-            goto invalid_tag;
+        if (!s->allow_bytecode) {
+        no_allow_bytecode:
+            return JS_ThrowSyntaxError(ctx, "no bytecode allowed");
+        }
         obj = JS_ReadModule(s);
         break;
     case BC_TAG_OBJECT:
@@ -48755,6 +48987,16 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
     case BC_TAG_BIG_INT:
         obj = JS_ReadBigInt(s);
         break;
+    case BC_TAG_REGEXP:
+        obj = JS_ReadRegExp(s);
+        break;
+    case BC_TAG_MAP:
+    case BC_TAG_SET:
+        obj = JS_ReadMap(s, tag == BC_TAG_SET);
+        break;
+    case BC_TAG_SYMBOL:
+        obj = JS_ReadSymbol(s);
+        break;
     case BC_TAG_OBJECT_REFERENCE:
         {
             uint32_t val;
@@ -48782,8 +49024,9 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
 
 static int JS_ReadObjectAtoms(BCReaderState *s)
 {
-    uint8_t v8;
+    uint8_t v8, type;
     JSString *p;
+    uint32_t h, idx;
     int i;
     JSAtom atom;
 
@@ -48794,10 +49037,24 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
                             v8, BC_VERSION);
         return -1;
     }
+    if (bc_get_u32(s, &h))
+        return -1;
+    /* UINT32_MAX disables the check (hand written test inputs) */
+    if (h != UINT32_MAX && h != bc_csum(s->ptr, s->buf_end - s->ptr)) {
+        JS_ThrowSyntaxError(s->ctx, "checksum error");
+        return -1;
+    }
     if (bc_get_leb128(s, &s->idx_to_atom_count))
         return -1;
+    /* each entry takes at least 2 bytes */
+    if (s->idx_to_atom_count > (s->buf_end - s->ptr) / 2) {
+        JS_ThrowSyntaxError(s->ctx, "invalid atom count (%u)",
+                            s->idx_to_atom_count);
+        s->idx_to_atom_count = 0;
+        return s->error_state = -1;
+    }
 
-    bc_read_trace(s, "%d atom indexes {\n", s->idx_to_atom_count);
+    bc_read_trace(s, "%u atom indexes {\n", s->idx_to_atom_count);
 
     if (s->idx_to_atom_count != 0) {
         s->idx_to_atom = js_mallocz(s->ctx, s->idx_to_atom_count *
@@ -48806,10 +49063,35 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
             return s->error_state = -1;
     }
     for(i = 0; i < s->idx_to_atom_count; i++) {
-        p = JS_ReadString(s);
-        if (!p)
+        if (bc_get_u8(s, &type))
             return -1;
-        atom = JS_NewAtomStr(s->ctx, p);
+        switch(type) {
+        case BC_ATOM_WELL_KNOWN_SYMBOL:
+            if (bc_get_leb128(s, &idx))
+                return -1;
+            if (idx == JS_ATOM_NULL || idx >= JS_ATOM_END ||
+                s->ctx->rt->atom_array[idx]->atom_type != JS_ATOM_TYPE_SYMBOL ||
+                js_atom_is_private(s->ctx->rt, idx)) {
+                JS_ThrowSyntaxError(s->ctx, "invalid well-known symbol (%u)", idx);
+                return s->error_state = -1;
+            }
+            atom = idx;
+            break;
+        case BC_ATOM_STRING:
+        case BC_ATOM_GLOBAL_SYMBOL:
+        case BC_ATOM_SYMBOL:
+            p = JS_ReadString(s);
+            if (!p)
+                return -1;
+            if (type == BC_ATOM_STRING)
+                atom = JS_NewAtomStr(s->ctx, p);
+            else
+                atom = __JS_NewAtom(s->ctx->rt, p, type);
+            break;
+        default:
+            JS_ThrowSyntaxError(s->ctx, "invalid atom type (%d)", type);
+            return s->error_state = -1;
+        }
         if (atom == JS_ATOM_NULL)
             return s->error_state = -1;
         s->idx_to_atom[i] = atom;
@@ -58709,11 +58991,7 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
 {
     const char *str;
     int re_flags, mask;
-    uint8_t *re_bytecode_buf;
     size_t i, len;
-    int re_bytecode_len;
-    JSValue ret;
-    char error_msg[64];
 
     re_flags = 0;
     if (!JS_IsUndefined(flags)) {
@@ -58760,12 +59038,26 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
         JS_FreeCString(ctx, str);
     }
 
+    return js_compile_regexp_flags(ctx, pattern, re_flags);
+ bad_flags1:
+    return JS_ThrowSyntaxError(ctx, "invalid regular expression flags");
+}
+
+/* 're_flags' is a combination of LRE_FLAG_x. Return the bytecode string */
+static JSValue js_compile_regexp_flags(JSContext *ctx, JSValueConst pattern,
+                                       int re_flags)
+{
+    const char *str;
+    uint8_t *re_bytecode_buf;
+    size_t len;
+    int re_bytecode_len;
+    JSValue ret;
+    char error_msg[64];
+
     /* 'u' and 'v' cannot be both set */
-    if ((re_flags & LRE_FLAG_UNICODE_SETS) && (re_flags & LRE_FLAG_UNICODE)) {
-    bad_flags1:
+    if ((re_flags & LRE_FLAG_UNICODE_SETS) && (re_flags & LRE_FLAG_UNICODE))
         return JS_ThrowSyntaxError(ctx, "invalid regular expression flags");
-    }
-    
+
     str = JS_ToCStringLen2(ctx, &len, pattern, !(re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)));
     if (!str)
         return JS_EXCEPTION;

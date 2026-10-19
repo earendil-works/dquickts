@@ -1173,11 +1173,15 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
     JSThreadState *ts = JS_GetRuntimeOpaque(rt);
-    const char *str;
-    size_t len;
+    const char *str = NULL;
+    size_t len = 0;
     JSValue ret;
-    JSValueConst options_obj;
+    JSValueConst options_obj, arg;
     BOOL backtrace_barrier = FALSE;
+    BOOL eval_function = FALSE;
+    BOOL eval_module = FALSE;
+    BOOL compile_only = FALSE;
+    BOOL compile_module = FALSE;
     BOOL is_async = FALSE;
     BOOL is_typescript = FALSE;
     BOOL legacy_decorators, decorator_metadata;
@@ -1189,6 +1193,18 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
         options_obj = argv[1];
         if (get_bool_option(ctx, &backtrace_barrier, options_obj,
                             "backtrace_barrier"))
+            return JS_EXCEPTION;
+        if (get_bool_option(ctx, &eval_function, options_obj,
+                            "eval_function"))
+            return JS_EXCEPTION;
+        if (get_bool_option(ctx, &eval_module, options_obj,
+                            "eval_module"))
+            return JS_EXCEPTION;
+        if (get_bool_option(ctx, &compile_only, options_obj,
+                            "compile_only"))
+            return JS_EXCEPTION;
+        if (get_bool_option(ctx, &compile_module, options_obj,
+                            "compile_module"))
             return JS_EXCEPTION;
         if (get_bool_option(ctx, &is_async, options_obj,
                             "async"))
@@ -1204,18 +1220,38 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
             return JS_EXCEPTION;
     }
 
-    str = JS_ToCStringLen(ctx, &len, argv[0]);
-    if (!str)
-        return JS_EXCEPTION;
+    if (eval_module) {
+        /* evaluate a module compiled with 'compile_module' */
+        arg = argv[0];
+        if (JS_VALUE_GET_TAG(arg) != JS_TAG_MODULE)
+            return JS_ThrowTypeError(ctx, "not a module");
+        if (JS_ResolveModule(ctx, arg) < 0)
+            return JS_EXCEPTION;
+        if (js_module_set_import_meta(ctx, arg, FALSE, FALSE) < 0)
+            return JS_EXCEPTION;
+        return JS_EvalFunction(ctx, JS_DupValue(ctx, arg));
+    }
+
+    if (eval_function) {
+        /* evaluate a script compiled with 'compile_only' */
+        if (JS_VALUE_GET_TAG(argv[0]) != JS_TAG_FUNCTION_BYTECODE)
+            return JS_ThrowTypeError(ctx, "not a compiled script");
+    } else {
+        str = JS_ToCStringLen(ctx, &len, argv[0]);
+        if (!str)
+            return JS_EXCEPTION;
+    }
     if (!ts->recv_pipe && ++ts->eval_script_recurse == 1) {
         /* install the interrupt handler */
         ts->prev_interrupt_handler =
             JS_GetInterruptHandler(rt, &ts->prev_interrupt_opaque);
         JS_SetInterruptHandler(rt, interrupt_handler, ts);
     }
-    flags = JS_EVAL_TYPE_GLOBAL;
+    flags = compile_module ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL;
     if (backtrace_barrier)
         flags |= JS_EVAL_FLAG_BACKTRACE_BARRIER;
+    if (compile_only)
+        flags |= JS_EVAL_FLAG_COMPILE_ONLY;
     if (is_async)
         flags |= JS_EVAL_FLAG_ASYNC;
     if (is_typescript) {
@@ -1225,8 +1261,12 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
         if (decorator_metadata)
             flags |= JS_EVAL_FLAG_TS_DECORATOR_METADATA;
     }
-    ret = JS_Eval(ctx, str, len, "<evalScript>", flags);
-    JS_FreeCString(ctx, str);
+    if (eval_function) {
+        ret = JS_EvalFunction(ctx, JS_DupValue(ctx, argv[0]));
+    } else {
+        ret = JS_Eval(ctx, str, len, "<evalScript>", flags);
+        JS_FreeCString(ctx, str);
+    }
     if (!ts->recv_pipe && --ts->eval_script_recurse == 0) {
         BOOL is_sigint = (os_pending_signals >> SIGINT) & 1;
         /* restore the interrupt handler of the host */
@@ -4636,6 +4676,82 @@ JSModuleDef *js_init_module_os(JSContext *ctx, const char *module_name)
 #ifdef USE_WORKER
     JS_AddModuleExport(ctx, m, "Worker");
 #endif
+    return m;
+}
+
+/**********************************************************/
+/* bjson module */
+
+static JSValue js_bjson_read(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv)
+{
+    uint8_t *buf;
+    uint64_t pos, len;
+    size_t size;
+    int flags;
+
+    if (JS_ToIndex(ctx, &pos, argv[1]))
+        return JS_EXCEPTION;
+    if (JS_ToIndex(ctx, &len, argv[2]))
+        return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &flags, argv[3]))
+        return JS_EXCEPTION;
+    /* the SharedArrayBuffers are only transferred to the workers and
+       the result must not reference the memory of 'buf' */
+    flags &= ~(JS_READ_OBJ_SAB | JS_READ_OBJ_ROM_DATA);
+    buf = JS_GetArrayBuffer(ctx, &size, argv[0]);
+    if (!buf)
+        return JS_EXCEPTION;
+    if (pos + len > size)
+        return JS_ThrowRangeError(ctx, "array buffer overflow");
+    return JS_ReadObject(ctx, buf + pos, len, flags);
+}
+
+static JSValue js_bjson_write(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    size_t len;
+    uint8_t *buf;
+    JSValue array;
+    int flags;
+
+    if (JS_ToInt32(ctx, &flags, argv[1]))
+        return JS_EXCEPTION;
+    flags &= ~JS_WRITE_OBJ_SAB;
+    buf = JS_WriteObject(ctx, &len, argv[0], flags);
+    if (!buf)
+        return JS_EXCEPTION;
+    array = JS_NewArrayBufferCopy(ctx, buf, len);
+    js_free(ctx, buf);
+    return array;
+}
+
+static const JSCFunctionListEntry js_bjson_funcs[] = {
+    JS_CFUNC_DEF("read", 4, js_bjson_read ),
+    JS_CFUNC_DEF("write", 2, js_bjson_write ),
+#define DEF(x) JS_PROP_INT32_DEF(#x, JS_ ## x, JS_PROP_CONFIGURABLE)
+    DEF(READ_OBJ_BYTECODE),
+    DEF(READ_OBJ_REFERENCE),
+    DEF(WRITE_OBJ_BYTECODE),
+    DEF(WRITE_OBJ_REFERENCE),
+    DEF(WRITE_OBJ_STRIP_DEBUG),
+    DEF(WRITE_OBJ_STRIP_SOURCE),
+#undef DEF
+};
+
+static int js_bjson_init(JSContext *ctx, JSModuleDef *m)
+{
+    return JS_SetModuleExportList(ctx, m, js_bjson_funcs,
+                                  countof(js_bjson_funcs));
+}
+
+JSModuleDef *js_init_module_bjson(JSContext *ctx, const char *module_name)
+{
+    JSModuleDef *m;
+    m = JS_NewCModule(ctx, module_name, js_bjson_init);
+    if (!m)
+        return NULL;
+    JS_AddModuleExportList(ctx, m, js_bjson_funcs, countof(js_bjson_funcs));
     return m;
 }
 

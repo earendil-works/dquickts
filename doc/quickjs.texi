@@ -541,8 +541,8 @@ Other types are rejected with a @code{TypeError}.
 @section Standard library
 
 The standard library is included by default in the command line
-interpreter. It contains the two modules @code{std} and @code{os} and
-a few global objects.
+interpreter. It contains the three modules @code{std}, @code{os} and
+@code{bjson} and a few global objects.
 
 @subsection Global objects
 
@@ -594,6 +594,23 @@ optional properties:
   @item backtrace_barrier
   Boolean (default = false). If true, error backtraces do not list the
   stack frames below the evalScript.
+  @item compile_only
+  Boolean (default = false). If true, @code{str} is only compiled and
+  the compiled script (or module with @code{compile_module}) is
+  returned without being run. It can be serialized with
+  @code{bjson.write(obj, bjson.WRITE_OBJ_BYTECODE)}.
+  @item compile_module
+  Boolean (default = false). If true, @code{str} is evaluated (or
+  compiled with @code{compile_only}) as a module.
+  @item eval_function
+  Boolean (default = false). If true, @code{str} is a script returned
+  by @code{compile_only} (or read back by @code{bjson.read()}) and it
+  is run.
+  @item eval_module
+  Boolean (default = false). If true, @code{str} is a module returned
+  by @code{compile_only} and @code{compile_module}: its imports are
+  resolved, then it is evaluated and the promise of its evaluation is
+  returned.
   @item async
   Boolean (default = false). If true, @code{await} is accepted in the
   script and a promise is returned. The promise is resolved with an
@@ -1127,6 +1144,42 @@ The worker instances have the following properties:
 
 @end table
 
+@subsection @code{bjson} module
+
+The @code{bjson} module reads and writes the binary object format of
+@code{JS_ReadObject()} and @code{JS_WriteObject()} (see Binary
+JSON).
+
+Available exports:
+
+@table @code
+@item write(obj, flags = 0)
+Serialize @code{obj} and return an ArrayBuffer. @code{flags} is a
+combination of @code{WRITE_OBJ_BYTECODE} (allow functions and
+modules), @code{WRITE_OBJ_REFERENCE} (allow shared and circular
+object references), @code{WRITE_OBJ_STRIP_SOURCE} (omit the source of
+the functions) and @code{WRITE_OBJ_STRIP_DEBUG} (also omit the file
+names and line number tables).
+
+@item read(buffer, position, length, flags = 0)
+Deserialize the @code{length} bytes at byte position @code{position}
+of the ArrayBuffer @code{buffer}. @code{flags} is a combination of
+@code{READ_OBJ_BYTECODE} and @code{READ_OBJ_REFERENCE}, which must
+match the flags given to @code{write()}. Bytecode is trusted input:
+only read the bytecode you wrote. A SyntaxError is thrown if
+@code{buffer} was written by another version of the format
+(@code{invalid version}) or if it is corrupted (@code{checksum
+error}).
+
+@item READ_OBJ_BYTECODE
+@item READ_OBJ_REFERENCE
+@item WRITE_OBJ_BYTECODE
+@item WRITE_OBJ_REFERENCE
+@item WRITE_OBJ_STRIP_SOURCE
+@item WRITE_OBJ_STRIP_DEBUG
+Constants for the @code{flags} arguments.
+@end table
+
 @section QuickJS C API
 
 The C API was designed to be simple and efficient. The C API is
@@ -1526,12 +1579,55 @@ compiler.
 
 @code{qjsc} works by compiling scripts or modules and then serializing
 them to a binary format. A subset of this format (without functions or
-modules) can be used as binary JSON. The example @file{test_bjson.js}
-shows how to use it.
+modules) can be used as binary JSON. The @code{bjson} module gives
+access to it from Javascript (see @file{tests/test_bjson.js}).
 
 Warning: the binary JSON format may change without notice, so it
 should not be used to store persistent data. The @file{test_bjson.js}
 example is only used to test the binary object format functions.
+
+Besides the JSON values (including @code{undefined}, the BigInts and
+the arrays with holes), the following values can be serialized:
+
+@itemize
+@item Date, ArrayBuffer (including the resizable ones), typed arrays and
+the Number, String, Boolean and BigInt objects.
+@item RegExp: its source and flags are written and the regular
+expression is compiled again when read. Its @code{lastIndex} is reset
+to 0.
+@item Map and Set: their entries in insertion order. The keys and values
+are serialized recursively, so object keys, shared entries and cycles
+need @code{JS_WRITE_OBJ_REFERENCE}. WeakMap and WeakSet cannot be
+serialized (TypeError).
+@item Symbols, as values or as property keys. The registered symbols
+(@code{Symbol.for()}) and the well-known symbols are read as the same
+symbols; the other symbols are read as new symbols with the same
+description, a symbol written several times in an output being read
+as the same symbol. The private class fields are never written.
+@end itemize
+
+The other objects (functions, Proxy, Promise, WeakRef...) raise a
+TypeError. With @code{JS_WRITE_OBJ_BYTECODE}, the compiled scripts and
+modules (not yet evaluated, see @code{std.evalScript()} with
+@code{compile_only}) can also be serialized.
+
+The output starts with a version byte followed by a 32 bit checksum of
+the rest of the output. The checksum detects the accidental
+corruptions (bit flips, truncation), not the malicious changes: the
+input of @code{JS_ReadObject()} must be trusted. A checksum of
+@code{0xffffffff} disables the check (hand written test inputs). An
+input written before the checksum field was added is rejected with a
+@code{checksum error}.
+
+With @code{JS_WRITE_OBJ_STRIP_SOURCE}, @code{JS_WriteObject()} omits the
+source code of the functions (@code{Function.prototype.toString()}
+then returns a native code placeholder); with
+@code{JS_WRITE_OBJ_STRIP_DEBUG}, it also omits the file names and the
+line number tables. Unlike @code{JS_SetStripInfo()}, which strips at
+compile time, they only change the written bytecode.
+@code{JS_ReadObject2()} returns the memory of the SharedArrayBuffers
+read, like @code{JS_WriteObject2()} for the written ones, so that the
+host can adjust its reference counts.
 
 @section Runtime
 

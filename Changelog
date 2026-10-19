@@ -47,7 +47,7 @@ unreleased:
   (JS_EVAL_FLAG_TS_DECORATOR_METADATA, qjs --emit-decorator-metadata),
   js_std_set_typescript_flags() and the std.evalScript() decorator options
 - private getters and setters are named 'get #x' / 'set #x'
-- bytecode version 6
+- bytecode version 7
 - ported from quickjs-ng:
   - queueMicrotask(), atob()/btoa(), DOMException
     (JS_AddIntrinsicAToB(), JS_AddIntrinsicDOMException(),

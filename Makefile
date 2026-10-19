@@ -472,7 +472,7 @@ doc/%.html: doc/%.html.pre
 # tests
 
 ifdef CONFIG_SHARED_LIBS
-test: tests/bjson.so examples/point.so
+test: examples/point.so
 endif
 
 test: qjs$(EXE) tests/test_std_api$(EXE) tests/test_api$(EXE)
@@ -494,13 +494,13 @@ test: qjs$(EXE) tests/test_std_api$(EXE) tests/test_api$(EXE)
 	$(WINE) ./qjs$(EXE) tests/test_detect_module.js
 	$(WINE) ./qjs$(EXE) tests/test_using.js
 	$(WINE) ./qjs$(EXE) tests/test_worker.js
+	$(WINE) ./qjs$(EXE) tests/test_bjson.js
 ifndef CONFIG_WIN32
 	$(WINE) ./qjs$(EXE) tests/test_std.js
 	$(WINE) ./tests/test_std_api$(EXE)
 	$(WINE) ./qjs$(EXE) tests/test_rw_handler.js
 endif
 ifdef CONFIG_SHARED_LIBS
-	$(WINE) ./qjs$(EXE) tests/test_bjson.js
 	$(WINE) ./qjs$(EXE) examples/test_point.js
 endif
 ifdef CONFIG_TEMPORAL_INTL
@@ -578,9 +578,6 @@ bench-v8: qjs
 node-bench-v8:
 	make -C tests/bench-v8
 	node --jitless tests/bench-v8/combined.js
-
-tests/bjson.so: $(OBJDIR)/tests/bjson.pic.o
-	$(CC) $(LDFLAGS) -shared -o $@ $^ $(LIBS)
 
 BENCHMARKDIR=../quickjs-benchmarks
 
