@@ -8,7 +8,7 @@ readme = "README.md"
 description = "QuickJS bindings for rquickjs"
 keywords = ["quickjs", "ecmascript", "javascript", "es6", "es2020"]
 categories = ["external-ffi-bindings"]
-repository = "https://github.com/DelSkayn/rquickjs.git"
+repository = "https://github.com/stencil-hq/dquickts"
 publish = false
 
 [build-dependencies]

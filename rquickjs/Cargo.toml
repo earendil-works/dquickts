@@ -9,7 +9,7 @@ readme = "README.md"
 description = "High level bindings to the QuickJS JavaScript engine"
 keywords = ["quickjs", "ecmascript", "javascript", "es6", "es2020"]
 categories = ["api-bindings"]
-repository = "https://github.com/DelSkayn/rquickjs.git"
+repository = "https://github.com/stencil-hq/dquickts"
 # vendored: rquickjs-sys builds the QuickJS tree it lives in
 publish = false
 
