@@ -28,6 +28,7 @@
 #include <malloc.h>
 #endif
 
+#include "cutils.h"
 #include "quickjs.h"
 
 static int n_failures;
