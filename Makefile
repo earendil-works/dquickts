@@ -485,6 +485,8 @@ test: qjs$(EXE) tests/test_std_api$(EXE) tests/test_api$(EXE)
 	$(WINE) ./qjs$(EXE) tests/test_decorators.js
 	$(WINE) ./qjs$(EXE) --std --emit-decorator-metadata tests/test_decorators_legacy.ts
 	$(WINE) ./qjs$(EXE) tests/test_ng_fixes.js
+	$(WINE) ./qjs$(EXE) tests/test_dynamic_import_line_numbers.js
+	$(WINE) ./qjs$(EXE) tests/test_detect_module.js
 	$(WINE) ./qjs$(EXE) tests/test_using.js
 	$(WINE) ./qjs$(EXE) tests/test_worker.js
 ifndef CONFIG_WIN32

@@ -141,8 +141,9 @@ is rebuilt at startup.
 @item -m
 @item --module
 Load as ES6 module (default=autodetect). A module is autodetected if
-the filename extension is @code{.mjs} or if the first keyword of the
-source is @code{import}.
+the filename extension is @code{.mjs}, if the first keyword of the
+source is @code{import}, or if the source uses top-level @code{await}
+and is not a valid script.
 
 @item --script
 Load as ES6 script (default=autodetect).

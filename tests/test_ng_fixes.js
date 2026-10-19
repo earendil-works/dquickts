@@ -311,6 +311,121 @@ function test_class_fields()
     assert(p.static(), 42);
 }
 
+/* ng #1811: each substitution of an untagged template is converted with
+   ToString right after it is evaluated (ECMA-262 13.2.8.6), and
+   String.prototype.concat is not involved */
+function test_template_tostring_order()
+{
+    var log = [];
+    var o = { toString() { log.push("o"); return "O"; } };
+    assert(`${o}${(log.push("next"), "n")}`, "On");
+    assert(log.join(), "o,next");
+
+    var c = { n: 0, toString() { return "" + this.n; } };
+    assert(`${c} ${c.n++}`, "0 0");
+
+    var d = new Date(2024, 0, 15, 12);
+    assert(`${d}|${d.setFullYear(2000)}`.indexOf("2024"), 11);
+
+    var p = { [Symbol.toPrimitive](hint) { return hint; } };
+    assert(`${p}`, "string");
+    var v = { valueOf() { return 1; }, toString() { return "s"; } };
+    assert(`${v}`, "s");
+    assert(`${1}${2n}${-0}${null}${undefined}${[1, 2]}`, "120nullundefined1,2");
+    assert(`${""}`, "");
+    assert(`a${""}b${""}`, "ab");
+
+    var concat = String.prototype.concat;
+    String.prototype.concat = function() { return "concat"; };
+    try {
+        assert(`a${1}b${2}`, "a1b2");
+    } finally {
+        String.prototype.concat = concat;
+    }
+
+    assertThrows(TypeError, () => `${Symbol()}`);
+    log = [];
+    assertThrows(TypeError, () => `${Symbol()}${log.push("next")}`);
+    assert(log.length, 0);
+
+    /* tagged templates get the values unconverted */
+    function tag(strings, ...values) { return [strings.raw, values]; }
+    var r = tag`a${o}\n${1}`;
+    assertArrayEquals(r[0], ["a", "\\n", ""]);
+    assert(r[1][0], o);
+    assert(r[1][1], 1);
+    log = [];
+    assert(String.raw`x${o}\n${2}`, "xO\\n2");
+    assert(log.join(), "o");
+}
+
+/* ng 65e766e: a SyntaxError reports the column of the offending token,
+   relative to the start of its line */
+function test_syntax_error_column()
+{
+    function location(src) {
+        try {
+            eval(src);
+        } catch (e) {
+            var m = /<input>:(\d+):(\d+)/.exec(e.stack);
+            if (m)
+                return [+m[1], +m[2]];
+        }
+        return null;
+    }
+    assertArrayEquals(location("let x = ;"), [1, 9]);
+    assertArrayEquals(location("1 + + ;"), [1, 7]);
+    assertArrayEquals(location("hocuspocus("), [1, 12]);
+    assertArrayEquals(location("a b"), [1, 3]);
+    assertArrayEquals(location("let ok = 1\nlet z = @"), [2, 9]);
+    assertArrayEquals(location("`line1\nline2\nline3`; let y = @"), [3, 17]);
+    assertArrayEquals(location("a\n /* x\n */ let z = ]"), [3, 13]);
+    /* the column counts code points */
+    assertArrayEquals(location("a\n'\u00e9'; let z = ]"), [2, 14]);
+    /* an invalid decorator is reported at its '@' */
+    assertArrayEquals(location("a\n@ 1 class {}"), [2, 1]);
+    assertArrayEquals(location("class A { @1 m() {} }"), [1, 11]);
+}
+
+/* ng 140b26d: legacy date strings accept Unicode white space such as
+   U+202F, emitted by ICU toLocaleString() before AM/PM, but not line
+   terminators */
+function test_date_parse_spaces()
+{
+    assert(new Date('Apr 7 2024 1:00\u202fPM GMT').toISOString(),
+           '2024-04-07T13:00:00.000Z');
+    assert(new Date('Apr\u00a07\u30002024 1:00\tPM GMT').toISOString(),
+           '2024-04-07T13:00:00.000Z');
+    for (var c of ['\x85', '\u180e', '\u200b', '\u2028', '\u2029']) {
+        assert(Date.parse(`Apr 7 2024 1:00${c}PM GMT`), NaN);
+    }
+}
+
+/* ng 6b3bed1: Array.isArray() walks a proxy chain of any depth */
+function test_proxy_is_array()
+{
+    var r, o, y, rev;
+
+    for (r = new Proxy([], {}), o = new Proxy({}, {}), y = 0; y < 331072; y++) {
+        r = new Proxy(r, {});
+        o = new Proxy(o, {});
+    }
+    assert(Array.isArray(r), true);
+    assert(Array.isArray(o), false);
+
+    /* a revoked proxy anywhere in the chain throws */
+    rev = Proxy.revocable([], {});
+    for (r = rev.proxy, y = 0; y < 1000; y++)
+        r = new Proxy(r, {});
+    assert(Array.isArray(r), true);
+    rev.revoke();
+    assertThrows(TypeError, () => Array.isArray(r));
+    rev = Proxy.revocable(new Proxy([], {}), {});
+    r = new Proxy(rev.proxy, {});
+    rev.revoke();
+    assertThrows(TypeError, () => Array.isArray(r));
+}
+
 /* ng #1577, #1580: for-await does not call return() on normal completion
    and awaits its result on break or return */
 async function test_for_await_close()
@@ -425,5 +540,9 @@ test_null_property_message();
 test_iterator_concat_return();
 test_prevent_extensions_resizable();
 test_property_hash();
+test_template_tostring_order();
+test_syntax_error_column();
+test_date_parse_spaces();
+test_proxy_is_array();
 await test_for_await_close();
 await test_modules();

@@ -444,6 +444,31 @@ static void test_with_resolvers_oom(void)
     CHECK(ok);
 }
 
+static int detect_module(const char *src)
+{
+    return JS_DetectModule(src, strlen(src));
+}
+
+static void test_detect_module(void)
+{
+    CHECK(detect_module("import { a } from 'x';"));
+    CHECK(detect_module("/* c */ export default 1;"));
+    CHECK(!detect_module("import('x').then(print);"));
+    CHECK(!detect_module("var x = 1; // await"));
+    /* top-level await (ng bug832.js) */
+    CHECK(detect_module("const m = await import('./empty.js')\nprint(m)"));
+    CHECK(detect_module("#!/usr/bin/env qjs\nfor await (const x of [/a/]) `${x}`;"));
+    CHECK(detect_module("if (1) { await 0; }"));
+    /* 'await' as an identifier: valid scripts stay scripts */
+    CHECK(!detect_module("var await = 1; print(await);"));
+    CHECK(!detect_module("function await(x) {}\nawait(1);"));
+    CHECK(!detect_module("var r = await(1);")); /* also a valid module */
+    CHECK(!detect_module("async function f() { await 1; }"));
+    CHECK(!detect_module("var f = async () => await 1;"));
+    /* neither a script nor a module */
+    CHECK(!detect_module("await 1; let x = @;"));
+}
+
 static void test_version(void)
 {
     CHECK(!strcmp(JS_GetVersion(), QJS_VERSION_STRING));
@@ -476,6 +501,7 @@ int main(void)
 
     test_promise_hooks();
     test_with_resolvers_oom();
+    test_detect_module();
     printf("test_api: OK\n");
     return 0;
 }

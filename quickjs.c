@@ -26412,11 +26412,71 @@ static void skip_shebang(const uint8_t **pp, const uint8_t *buf_end)
     }
 }
 
+static inline BOOL is_ascii_ident_next(uint8_t c)
+{
+    return c < 128 && lre_js_is_ident_next(c);
+}
+
+/* return TRUE if the word 'await' may appear in the zero terminated
+   'input' (including in comments and strings) */
+static BOOL contains_await_word(const uint8_t *p, const uint8_t *p_end)
+{
+    const uint8_t *q;
+
+    for(q = p; q + 5 <= p_end; q++) {
+        if (!memcmp(q, "await", 5) &&
+            (q == p || !is_ascii_ident_next(q[-1])) &&
+            !is_ascii_ident_next(q[5]))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* return TRUE if 'input' is a module using top-level await which is not
+   a valid script, so that a script using 'await' as an identifier keeps
+   its meaning. 'input' must be zero terminated. */
+static BOOL detect_top_level_await(const char *input, size_t input_len)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSValue val;
+    BOOL ret;
+
+    rt = JS_NewRuntime();
+    if (!rt)
+        return FALSE;
+    ctx = JS_NewContextRaw(rt);
+    if (!ctx) {
+        JS_FreeRuntime(rt);
+        return FALSE;
+    }
+    JS_AddIntrinsicEval(ctx);
+    JS_AddIntrinsicRegExpCompiler(ctx); /* needed to parse regexp literals */
+    ret = FALSE;
+    val = JS_Eval(ctx, input, input_len, "<input>",
+                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (!JS_IsException(val)) {
+        ret = ((JSModuleDef *)JS_VALUE_GET_PTR(val))->has_tla;
+        JS_FreeValue(ctx, val);
+        if (ret) {
+            val = JS_Eval(ctx, input, input_len, "<input>",
+                          JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+            ret = JS_IsException(val);
+            JS_FreeValue(ctx, val);
+        }
+    }
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return ret;
+}
+
 /* return true if 'input' contains the source of a module
    (heuristic). 'input' must be a zero terminated.
 
    Heuristic: skip comments and expect 'import' keyword not followed
-   by '(' or '.' or export keyword.
+   by '(' or '.' or export keyword. Otherwise, if the source contains
+   'await', it is a module if it only compiles as a module using
+   top-level await.
 */
 BOOL JS_DetectModule(const char *input, size_t input_len)
 {
@@ -26427,12 +26487,17 @@ BOOL JS_DetectModule(const char *input, size_t input_len)
     switch(simple_next_token(&p, FALSE)) {
     case TOK_IMPORT:
         tok = simple_next_token(&p, FALSE);
-        return (tok != '.' && tok != '(');
+        if (tok != '.' && tok != '(')
+            return TRUE;
+        break;
     case TOK_EXPORT:
         return TRUE;
     default:
-        return FALSE;
+        break;
     }
+    return contains_await_word((const uint8_t *)input,
+                               (const uint8_t *)input + input_len) &&
+        detect_top_level_await(input, input_len);
 }
 
 static inline int get_prev_opcode(JSFunctionDef *fd) {
@@ -27187,8 +27252,8 @@ static __exception int js_parse_template(JSParseState *s, int call, int *argc)
                 if (depth == 0) {
                     if (s->token.u.str.sep == '`')
                         goto done1;
-                    emit_op(s, OP_get_field2);
-                    emit_atom(s, JS_ATOM_concat);
+                } else {
+                    emit_op(s, OP_add);
                 }
                 depth++;
             } else {
@@ -27201,11 +27266,17 @@ static __exception int js_parse_template(JSParseState *s, int call, int *argc)
             return -1;
         if (js_parse_expr(s))
             return -1;
+        if (!call) {
+            /* ToString right away, before the next substitution is
+               evaluated (ECMA-262 13.2.8.6). OP_to_propkey keeps a
+               symbol, which OP_add then rejects as ToString does. */
+            emit_op(s, OP_to_propkey);
+            emit_op(s, OP_add);
+        }
         depth++;
         if (s->token.val != '}') {
             return js_parse_error(s, "expected '}' after template expression");
         }
-        /* XXX: should convert to string at this stage? */
         free_token(s, &s->token);
         /* Resume TOK_TEMPLATE parsing (s->token.line_num and
          * s->token.ptr are OK) */
@@ -27221,9 +27292,6 @@ static __exception int js_parse_template(JSParseState *s, int call, int *argc)
         seal_template_obj(ctx, raw_array);
         seal_template_obj(ctx, template_object);
         *argc = depth + 1;
-    } else {
-        emit_op(s, OP_call_method);
-        emit_u16(s, depth - 1);
     }
  done1:
     return next_token(s);
@@ -29359,16 +29427,20 @@ static void emit_dec_thunk_call(JSParseState *s, DecThunk *t)
 }
 
 /* '@' DecoratorMemberExpression | '@' DecoratorCallExpression |
-   '@' '(' Expression ')'. With 'with_receiver', the receiver of the
-   call ('a' in '@a.b') is pushed after the decorator. */
+   '@' '(' Expression ')', starting at the '@' token. With
+   'with_receiver', the receiver of the call ('a' in '@a.b') is pushed
+   after the decorator. */
 static __exception int js_parse_decorator_expr(JSParseState *s,
                                                BOOL with_receiver)
 {
     JSFunctionDef *fd;
+    const uint8_t *at_ptr = s->token.ptr;
     int op;
 
+    if (next_token(s))
+        return -1;
     if (s->token.val != TOK_IDENT && s->token.val != '(')
-        return js_parse_error(s, "invalid decorator");
+        return js_parse_error_pos(s, at_ptr, "invalid decorator");
     if (js_parse_postfix_expr(s, PF_POSTFIX_CALL | PF_DECORATOR))
         return -1;
     if (with_receiver) {
@@ -29398,7 +29470,7 @@ static __exception int js_parse_decorators(JSParseState *s, DecThunk *thunk)
     if (thunk)
         s->cur_func = thunk->fd;
     while (s->token.val == '@') {
-        if (next_token(s) || js_parse_decorator_expr(s, !thunk))
+        if (js_parse_decorator_expr(s, !thunk))
             goto fail;
         n++;
     }
@@ -30086,7 +30158,7 @@ static __exception int js_parse_param_decorators(JSParseState *s,
     }
     s->cur_func = dp->thunk->fd;
     while (s->token.val == '@') {
-        if (next_token(s) || js_parse_decorator_expr(s, FALSE))
+        if (js_parse_decorator_expr(s, FALSE))
             goto fail;
         emit_op(s, OP_push_i32);
         emit_u32(s, index);
@@ -32850,6 +32922,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
         }
         break;
     case TOK_IMPORT:
+        op_token_ptr = s->token.ptr;
         if (next_token(s))
             return -1;
         if (s->token.val == '.') {
@@ -32889,6 +32962,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
             }
             if (js_parse_expect(s, ')'))
                 return -1;
+            emit_source_pos(s, op_token_ptr);
             emit_op(s, OP_import);
         }
         break;
@@ -61958,9 +62032,10 @@ static JSValue js_proxy_call(JSContext *ctx, JSValueConst func_obj,
    `throw_exception` controls whether exceptions are thown or not
    - return -1 in case of error
    - otherwise return 0
+   A proxy target is fixed at creation, so the chain is finite and
+   acyclic and is walked without a depth limit.
  */
 static int js_resolve_proxy(JSContext *ctx, JSValueConst *pval, BOOL throw_exception) {
-    int depth = 0;
     JSObject *p;
     JSProxyData *s;
 
@@ -61968,11 +62043,6 @@ static int js_resolve_proxy(JSContext *ctx, JSValueConst *pval, BOOL throw_excep
         p = JS_VALUE_GET_OBJ(*pval);
         if (p->class_id != JS_CLASS_PROXY)
             break;
-        if (depth++ > 1000) {
-            if (throw_exception)
-                JS_ThrowStackOverflow(ctx);
-            return -1;
-        }
         s = p->u.opaque;
         if (s->is_revoked) {
             if (throw_exception)
@@ -67661,7 +67731,12 @@ static JSValue js_Date_parse(JSContext *ctx, JSValueConst this_val,
     /* convert the string as a byte array */
     for (i = 0; i < sp->len && i < (int)countof(buf) - 1; i++) {
         c = string_get(sp, i);
-        if (c > 255)
+        /* as V8: white space (such as U+202F emitted by ICU before
+           AM/PM) is a regular space in legacy dates, but not the line
+           terminators U+2028 and U+2029 */
+        if (c != 0x2028 && c != 0x2029 && lre_is_space(c))
+            c = ' ';
+        else if (c > 255)
             c = (c == 0x2212) ? '-' : 'x';
         buf[i] = c;
     }
