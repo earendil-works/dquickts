@@ -99,6 +99,10 @@ Options are:
 @item --help
 List options.
 
+@item -v
+@item --version
+Print the version and exit.
+
 @item -e @code{EXPR}
 @item --eval @code{EXPR}
 Evaluate EXPR.
@@ -154,16 +158,27 @@ Include an additional file.
 
 @end table
 
+The value of a long option can also be given as
+@code{--option=value} (e.g. @code{--memory-limit=16M}).
+
 Advanced options are:
 
 @table @code
 @item --std
-Make the @code{std} and @code{os} modules available to the loaded
-script even if it is not a module.
+Make the @code{std}, @code{os} and @code{bjson} modules available to
+the loaded script even if it is not a module.
 
 @item -d
 @item --dump
 Dump the memory usage stats.
+
+@item -D @var{hexmask}
+@item --dump-flags @var{hexmask}
+Set the debug dump flags (@code{JS_DUMP_xxx} in @file{quickjs.h}, as
+an hexadecimal mask, e.g. @code{-D 1} dumps the final bytecode of the
+compiled functions). The default is taken from the
+@code{QJS_DUMP_FLAGS} environment variable. Ignored unless QuickJS is
+compiled with @code{CONFIG_DUMPS=y}.
 
 @item -q
 @item --quit

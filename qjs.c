@@ -51,6 +51,10 @@ extern const uint32_t qjsc_repl_size;
 static int enable_experimental = 0;
 #endif
 
+/* command line of the process, for execArgv and argv0 */
+static int qjs_argc;
+static char **qjs_argv;
+
 static int eval_buf(JSContext *ctx, const void *buf, int buf_len,
                     const char *filename, int eval_flags)
 {
@@ -160,6 +164,75 @@ static int eval_file(JSContext *ctx, const char *filename, int module, int stric
     return ret;
 }
 
+static JSValue js_gc(JSContext *ctx, JSValueConst this_val,
+                     int argc, JSValueConst *argv)
+{
+    JS_RunGC(JS_GetRuntime(ctx));
+    return JS_UNDEFINED;
+}
+
+static JSValue js_navigator_get_userAgent(JSContext *ctx, JSValueConst this_val)
+{
+    char buf[64];
+    snprintf(buf, sizeof(buf), "quickjs/%s", JS_GetVersion());
+    return JS_NewString(ctx, buf);
+}
+
+static const JSCFunctionListEntry js_navigator_proto_funcs[] = {
+    JS_CGETSET_DEF("userAgent", js_navigator_get_userAgent, NULL ),
+    JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Navigator", JS_PROP_CONFIGURABLE ),
+};
+
+static const JSCFunctionListEntry js_qjs_global_funcs[] = {
+    JS_CFUNC_DEF("gc", 0, js_gc ),
+};
+
+/* gc(), navigator, execArgv (the command line of the process) and
+   argv0 */
+static int add_qjs_globals(JSContext *ctx)
+{
+    JSValue global, args, proto, navigator;
+    int i;
+
+    global = JS_GetGlobalObject(ctx);
+    if (JS_SetPropertyFunctionList(ctx, global, js_qjs_global_funcs,
+                                   countof(js_qjs_global_funcs)))
+        goto fail;
+    args = JS_NewArray(ctx);
+    if (JS_IsException(args))
+        goto fail;
+    for(i = 0; i < qjs_argc; i++) {
+        if (JS_SetPropertyUint32(ctx, args, i,
+                                 JS_NewString(ctx, qjs_argv[i])) < 0) {
+            JS_FreeValue(ctx, args);
+            goto fail;
+        }
+    }
+    if (JS_SetPropertyStr(ctx, global, "execArgv", args) < 0)
+        goto fail;
+    if (JS_SetPropertyStr(ctx, global, "argv0",
+                          JS_NewString(ctx, qjs_argc > 0 ? qjs_argv[0] : "")) < 0)
+        goto fail;
+    proto = JS_NewObject(ctx);
+    if (JS_IsException(proto))
+        goto fail;
+    if (JS_SetPropertyFunctionList(ctx, proto, js_navigator_proto_funcs,
+                                   countof(js_navigator_proto_funcs))) {
+        JS_FreeValue(ctx, proto);
+        goto fail;
+    }
+    navigator = JS_NewObjectProto(ctx, proto);
+    JS_FreeValue(ctx, proto);
+    if (JS_DefinePropertyValueStr(ctx, global, "navigator", navigator,
+                                  JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE) < 0)
+        goto fail;
+    JS_FreeValue(ctx, global);
+    return 0;
+ fail:
+    JS_FreeValue(ctx, global);
+    return -1;
+}
+
 /* also used to initialize the worker context */
 static JSContext *JS_NewCustomContext(JSRuntime *rt)
 {
@@ -170,6 +243,11 @@ static JSContext *JS_NewCustomContext(JSRuntime *rt)
     /* system modules */
     js_init_module_std(ctx, "std");
     js_init_module_os(ctx, "os");
+    js_init_module_bjson(ctx, "bjson");
+    if (add_qjs_globals(ctx) < 0) {
+        JS_FreeContext(ctx);
+        return NULL;
+    }
 #ifdef CONFIG_TEMPORAL_INTL
     if (enable_experimental) {
         JS_AddIntrinsicTemporal(ctx);
@@ -870,11 +948,12 @@ static void set_runtime_limits(JSRuntime *rt, size_t memory_limit,
 
 #define PROG_NAME "qjs"
 
-void help(void)
+void help(int exit_status)
 {
     printf("QuickJS version " CONFIG_VERSION "\n"
            "usage: " PROG_NAME " [options] [file [args]]  (file = - reads stdin)\n"
            "-h  --help         list options\n"
+           "-v  --version      print the version and exit\n"
            "-e  --eval EXPR    evaluate EXPR\n"
            "-i  --interactive  go to interactive mode\n"
            "    --drepl file   durable interactive mode: the TypeScript commands\n"
@@ -888,9 +967,11 @@ void help(void)
            "    --experimental-decorators  TypeScript legacy decorators\n"
            "    --emit-decorator-metadata  TypeScript legacy decorator metadata\n"
            "-I  --include file include an additional file\n"
-           "    --std          make 'std' and 'os' available to the loaded script\n"
+           "    --std          make 'std', 'os' and 'bjson' available to the loaded script\n"
            "-T  --trace        trace memory allocation\n"
            "-d  --dump         dump the memory usage stats\n"
+           "-D  --dump-flags hexmask  set the debug dump flags (JS_DUMP_xxx, default:\n"
+           "                   $QJS_DUMP_FLAGS; needs CONFIG_DUMPS=y)\n"
            "    --memory-limit n  limit the memory usage to 'n' bytes (SI suffixes allowed)\n"
            "    --stack-size n    limit the stack size to 'n' bytes (SI suffixes allowed)\n"
            "    --no-unhandled-rejection  ignore unhandled promise rejections\n"
@@ -899,8 +980,9 @@ void help(void)
 #ifdef CONFIG_TEMPORAL_INTL
            "    --experimental    enable experimental Temporal and Intl support\n"
 #endif
-           "-q  --quit         just instantiate the interpreter and quit\n");
-    exit(1);
+           "-q  --quit         just instantiate the interpreter and quit\n"
+           "The values of the long options can also be given as --option=value.\n");
+    exit(exit_status);
 }
 
 int main(int argc, char **argv)
@@ -926,6 +1008,15 @@ int main(int argc, char **argv)
     int strip_flags = 0;
     size_t stack_size = 0;
     const char *drepl_path = NULL;
+    uint64_t dump_flags = 0;
+    const char *dump_flags_env;
+
+    dump_flags_env = getenv("QJS_DUMP_FLAGS");
+    if (dump_flags_env)
+        dump_flags = strtoull(dump_flags_env, NULL, 16);
+
+    qjs_argc = argc;
+    qjs_argv = argv;
 
     /* cannot use getopt because we want to pass the command line to
        the script */
@@ -933,12 +1024,23 @@ int main(int argc, char **argv)
     while (optind < argc && *argv[optind] == '-') {
         char *arg = argv[optind] + 1;
         const char *longopt = "";
+        char *optarg = NULL; /* value of --option=value */
+        char longbuf[32];
         /* a single - is not an option, it also stops argument scanning */
         if (!*arg)
             break;
         optind++;
         if (*arg == '-') {
-            longopt = arg + 1;
+            /* the command line stays unmodified for execArgv */
+            size_t len;
+            arg++;
+            optarg = strchr(arg, '=');
+            len = optarg ? optarg++ - arg : strlen(arg);
+            if (len >= sizeof(longbuf))
+                len = sizeof(longbuf) - 1;
+            memcpy(longbuf, arg, len);
+            longbuf[len] = '\0';
+            longopt = longbuf;
             arg += strlen(arg);
             /* -- stops argument scanning */
             if (!*longopt)
@@ -949,10 +1051,17 @@ int main(int argc, char **argv)
             if (opt)
                 arg++;
             if (opt == 'h' || opt == '?' || !strcmp(longopt, "help")) {
-                help();
-                continue;
+                help(0);
+            }
+            if (opt == 'v' || !strcmp(longopt, "version")) {
+                printf("%s\n", JS_GetVersion());
+                return 0;
             }
             if (opt == 'e' || !strcmp(longopt, "eval")) {
+                if (optarg) {
+                    expr = optarg;
+                    break;
+                }
                 if (*arg) {
                     expr = arg;
                     break;
@@ -965,6 +1074,14 @@ int main(int argc, char **argv)
                 exit(2);
             }
             if (opt == 'I' || !strcmp(longopt, "include")) {
+                if (optarg) {
+                    if (include_count >= countof(include_list)) {
+                        fprintf(stderr, "too many included files");
+                        exit(1);
+                    }
+                    include_list[include_count++] = optarg;
+                    continue;
+                }
                 if (optind >= argc) {
                     fprintf(stderr, "expecting filename");
                     exit(1);
@@ -981,11 +1098,14 @@ int main(int argc, char **argv)
                 continue;
             }
             if (!strcmp(longopt, "drepl")) {
-                if (optind >= argc) {
-                    fprintf(stderr, "qjs: missing file for --drepl\n");
-                    exit(2);
+                if (!optarg) {
+                    if (optind >= argc) {
+                        fprintf(stderr, "qjs: missing file for --drepl\n");
+                        exit(2);
+                    }
+                    optarg = argv[optind++];
                 }
-                drepl_path = argv[optind++];
+                drepl_path = optarg;
                 continue;
             }
             if (opt == 'm' || !strcmp(longopt, "module")) {
@@ -1017,6 +1137,14 @@ int main(int argc, char **argv)
                 dump_memory++;
                 continue;
             }
+            if (opt == 'D' || !strcmp(longopt, "dump-flags")) {
+                if (optind >= argc) {
+                    fprintf(stderr, "expecting dump flags");
+                    exit(1);
+                }
+                dump_flags = strtoull(argv[optind++], NULL, 16);
+                continue;
+            }
             if (opt == 'T' || !strcmp(longopt, "trace")) {
                 trace_memory++;
                 continue;
@@ -1040,19 +1168,25 @@ int main(int argc, char **argv)
                 continue;
             }
             if (!strcmp(longopt, "memory-limit")) {
-                if (optind >= argc) {
-                    fprintf(stderr, "expecting memory limit");
-                    exit(1);
+                if (!optarg) {
+                    if (optind >= argc) {
+                        fprintf(stderr, "expecting memory limit");
+                        exit(1);
+                    }
+                    optarg = argv[optind++];
                 }
-                memory_limit = get_suffixed_size(argv[optind++]);
+                memory_limit = get_suffixed_size(optarg);
                 continue;
             }
             if (!strcmp(longopt, "stack-size")) {
-                if (optind >= argc) {
-                    fprintf(stderr, "expecting stack size");
-                    exit(1);
+                if (!optarg) {
+                    if (optind >= argc) {
+                        fprintf(stderr, "expecting stack size");
+                        exit(1);
+                    }
+                    optarg = argv[optind++];
                 }
-                stack_size = get_suffixed_size(argv[optind++]);
+                stack_size = get_suffixed_size(optarg);
                 continue;
             }
             if (opt == 's') {
@@ -1068,7 +1202,7 @@ int main(int argc, char **argv)
             } else {
                 fprintf(stderr, "qjs: unknown option '--%s'\n", longopt);
             }
-            help();
+            help(1);
         }
     }
 
@@ -1082,6 +1216,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "qjs: cannot allocate JS runtime\n");
         exit(2);
     }
+    JS_SetDumpFlags(rt, dump_flags);
     set_runtime_limits(rt, memory_limit, stack_size, strip_flags);
     if (drepl_path) {
         JSRuntime *drt;
@@ -1098,6 +1233,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "qjs: cannot allocate JS runtime\n");
             exit(2);
         }
+        JS_SetDumpFlags(drt, dump_flags);
         set_runtime_limits(drt, memory_limit, stack_size, strip_flags);
         if (drepl_open(drt, drepl_path, ts_flags) < 0) {
             drepl_close();
@@ -1129,8 +1265,10 @@ int main(int argc, char **argv)
         if (load_std) {
             const char *str = "import * as std from 'std';\n"
                 "import * as os from 'os';\n"
+                "import * as bjson from 'bjson';\n"
                 "globalThis.std = std;\n"
-                "globalThis.os = os;\n";
+                "globalThis.os = os;\n"
+                "globalThis.bjson = bjson;\n";
             eval_buf(ctx, str, strlen(str), "<input>", JS_EVAL_TYPE_MODULE);
         }
 
