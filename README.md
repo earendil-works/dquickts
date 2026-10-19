@@ -295,12 +295,19 @@ of the heap. Incremental snapshots avoid writing those bytes over and over:
    *base*.
 2. Write later snapshots with `JS_SNAPSHOT_DELTA`. A delta holds only the cells (objects, closure
    variables, frames, and so on) that were created or modified since the base, plus their new
-   strings and atoms, plus the roots.
+   strings and atoms, plus the roots. A modified object is saved as a patch of its base version,
+   so adding or setting a property costs a few bytes.
 3. To restore, call `JS_ReadSnapshot(rt, base, base_len, delta, delta_len, ...)`.
 
 Deltas are not chained: each delta needs only the base. A runtime restored from a base has that
 base attached, so the deltas it writes are relative to the same base. Many runtimes can share
 one base.
+
+Bases are reproducible. Runtimes of the same engine build that are set up the same way (same host
+natives, same code run) write byte-identical bases, in any process. So a host doesn't have to
+store the base: it can rebuild it and keep only the deltas. `qjs --drepl` works this way. The
+`Math.random()` state is not part of a base. Full snapshots and deltas save it, and a base read
+without a delta starts with a fresh seed.
 
 ```mermaid
 sequenceDiagram
@@ -320,20 +327,20 @@ sequenceDiagram
 ```
 
 These sizes come from `tests/snapshot/cross_process.sh`. Each slice runs in a new process. The
-base (12,939 bytes) is taken *before* the script runs, so every delta also carries the script's
+base (12,931 bytes) is taken *before* the script runs, so every delta also carries the script's
 compiled code and all of its data:
 
 | Script | Processes | Largest delta (bytes) |
 | --- | ---: | ---: |
-| `hibernate-sync.js` | 365 | 20,618 |
-| `control-async.js` | 92 | 19,203 |
-| `control-generators.js` | 82 | 18,684 |
-| `data-map.js` | 5 | 15,912 |
-| `control-using.js` | 66 | 8,198 |
+| `hibernate-sync.js` | 365 | 19,915 |
+| `control-async.js` | 92 | 18,722 |
+| `control-generators.js` | 82 | 17,696 |
+| `data-map.js` | 5 | 14,715 |
+| `control-using.js` | 66 | 7,536 |
 
 If you take the base after setup instead, the deltas shrink to the size of the change. In the
-[Rust example](#rust-bindings), the base is 13,411 bytes and the delta after one function call is
-122 bytes.
+[Rust example](#rust-bindings), the base is 13,403 bytes and the delta after one function call is
+128 bytes.
 
 While a base is attached, the runtime keeps every cell, string and atom of the base alive, so
 that they keep their identity. They are not garbage collected, and weak references to them never
@@ -421,6 +428,15 @@ free the runtime.
 keeps the encoded body of every base cell. A delta write serializes every reachable cell and
 every base cell, then compares each base cell's bytes with the stored body. Only bodies that
 differ, and new cells, go into the delta.
+
+A changed body is written as a patch whenever that is shorter. The patch records how long a
+prefix and suffix the body shares with its base body, plus the bytes in between. An object body
+ends its property list with a terminator instead of starting it with a count. So adding,
+setting or deleting one property changes only a few bytes in the middle. A change to a global
+object with a hundred properties costs about twenty bytes.
+
+The `Math.random()` state lives in the roots of full snapshots and deltas, not in the context
+cell. That is why a base doesn't depend on the seed.
 
 Base cells are walked even when nothing reaches them anymore, because a reachable object can
 still change them, for example by detaching an `ArrayBuffer` they share. Base cells keep their
@@ -583,11 +599,11 @@ let base = ctx.with(|ctx| {
     ctx.globals().set("add", natives.function("add")?)?;
     ctx.eval::<(), _>("var total = 0; function step(n) { total = add(total, n); return total; }")?;
     ctx.write_snapshot(&host, SnapshotKind::Base, &[])
-})?;                                   // 13,411 bytes
+})?;                                   // 13,403 bytes
 let delta = ctx.with(|ctx| {
     ctx.eval::<i32, _>("step(2)")?;
     ctx.write_snapshot(&host, SnapshotKind::Delta, &[])
-})?;                                   // 122 bytes
+})?;                                   // 128 bytes
 
 // later, in another runtime or process
 let rt = Runtime::new()?;

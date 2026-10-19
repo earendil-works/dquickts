@@ -1249,6 +1249,13 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
    are relative to the same base. Deltas are not chained: each one only
    needs the base.
 
+   A base is reproducible: runtimes of the same engine build set up the
+   same way (same host natives, same code run) write the same base bytes,
+   in any process. A host can therefore rebuild a base instead of storing
+   it and only keep the deltas (qjs --drepl does). The state of
+   Math.random() is not part of a base: full snapshots and deltas save
+   it, and a base read without a delta gets a fresh seed.
+
    While a base is attached, the runtime references every cell, string
    and atom of the base so that they keep their identity: they are not
    garbage collected (weak references to them never become empty) until

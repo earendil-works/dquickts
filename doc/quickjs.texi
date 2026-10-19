@@ -1261,13 +1261,22 @@ installed and the application script has run) becomes the base of the
 runtime. A later snapshot written with @code{JS_SNAPSHOT_DELTA} only
 contains the objects (and closure variables, frames...) that were
 modified or created since the base, their new strings and atoms, and the
-roots: it is usually a few hundred bytes to a few kilobytes.
+roots: it is usually a few hundred bytes to a few kilobytes. A modified
+object is usually saved as a patch of its base version (adding or
+setting a property costs a few bytes).
 @code{JS_ReadSnapshot()} takes the base and, optionally, a delta to
 apply on top of it. A runtime restored from a base has that base
 attached, so its own deltas are relative to the same base, and many
 runtimes can share one base. While a base is attached, the runtime keeps
 every object of the base alive (they are needed to compare the heap with
 the base); @code{JS_DropSnapshotBase()} releases them.
+
+A base is reproducible: runtimes of the same engine build set up the
+same way (same host natives, same code run) write the same base bytes
+in any process, so a host can rebuild the base instead of storing it
+and only keep the deltas, as @code{qjs --drepl} does. The state of
+@code{Math.random()} is not part of a base: full snapshots and deltas
+save it, and a base read without a delta gets a fresh seed.
 
 Loaded modules are saved with their bindings and their evaluation
 state, so a module graph can be hibernated in the middle of a top-level

@@ -16,7 +16,9 @@
  *   strings  string values (deduplicated by identity)
  *   roots    contexts, jobs, host roots, suspended execution
  *   bodies   one length-prefixed body per cell (full) or per changed
- *            and new cell (delta)
+ *            and new cell (delta); a changed base cell can be a patch of
+ *            its base body: the lengths of the prefix and suffix kept
+ *            from the base body, then the bytes between them
  *
  * Cells (objects, contexts, closure variables, heap frames, modules,
  * function bytecode, shared promise resolution records) are encoded as
@@ -35,6 +37,12 @@
  * delta reads the base, skipping the base bodies replaced by the delta,
  * then the delta.
  *
+ * A base is reproducible: the same build with the same host setup
+ * writes the same base bytes in every process, so a host may rebuild a
+ * base instead of storing it. The state of Math.random() is therefore not
+ * part of the context cells: full snapshots and deltas carry it in their
+ * roots, and a base read without a delta gets a fresh seed.
+ *
  * Code pointers stored in the heap (C functions, job functions, lazily
  * instantiated function list entries...) are encoded as indexes in a
  * registry built from the engine function lists and the host natives of
@@ -47,7 +55,7 @@
  */
 
 static const uint8_t snap_magic[8] = { 'Q', 'J', 'S', 'S', 'N', 'A', 'P', '\n' };
-#define SNAP_FORMAT_VERSION 6
+#define SNAP_FORMAT_VERSION 7
 
 typedef enum {
     SNAP_KIND_FULL,
@@ -936,7 +944,6 @@ static int snap_write_context(SnapWriter *w, JSContext *ctx)
     if (snap_put_value(w, ctx->global_obj) ||
         snap_put_value(w, ctx->global_var_obj))
         return -1;
-    bc_put_u64(&w->bc, ctx->random_state);
     bc_put_leb128(&w->bc, ctx->binary_object_count);
     bc_put_leb128(&w->bc, ctx->binary_object_size);
     bc_put_u8(&w->bc, ctx->compile_regexp != NULL);
@@ -1204,7 +1211,7 @@ static int snap_write_object(SnapWriter *w, JSObject *p)
     JSShape *sh = p->shape;
     JSShapeProperty *prs;
     JSProperty *pr;
-    int i, n, flags;
+    int i, flags;
 
     if (snap_put_obj(w, sh->proto))
         return -1;
@@ -1223,12 +1230,9 @@ static int snap_write_object(SnapWriter *w, JSObject *p)
         flags |= SNAP_OBJ_FAST_ARRAY;
     bc_put_u8(&w->bc, flags);
 
-    n = 0;
-    for(i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
-        if (prs->atom != JS_ATOM_NULL)
-            n++;
-    }
-    bc_put_leb128(&w->bc, n);
+    /* the properties end with JS_ATOM_NULL rather than starting with
+       their count, so that adding one only changes the end of the
+       property list (see snap_put_changed_body()) */
     for(i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
         if (prs->atom == JS_ATOM_NULL)
             continue;
@@ -1274,6 +1278,8 @@ static int snap_write_object(SnapWriter *w, JSObject *p)
             break;
         }
     }
+    if (bc_put_atom(&w->bc, JS_ATOM_NULL))
+        return -1;
     return snap_write_payload(w, p);
 }
 
@@ -1297,6 +1303,47 @@ static int snap_write_cell(SnapWriter *w, SnapCell *c)
     default:
         abort();
     }
+}
+
+static int snap_leb128_size(uint32_t v)
+{
+    int n = 1;
+    while (v >= 0x80) {
+        v >>= 7;
+        n++;
+    }
+    return n;
+}
+
+/* Write the body of the changed base cell 'idx' in a delta. A changed
+   body usually differs from its base body in a few bytes (a property
+   added or set): only the bytes between their common prefix and suffix
+   are written when that is shorter. The length of a delta body is
+   shifted left by one, its low bit set for a patch. */
+static void snap_put_changed_body(SnapWriter *w, int idx, const DynBuf *body,
+                                  const uint8_t *base_body, uint32_t base_len)
+{
+    uint32_t len = body->size, max = min_uint32(len, base_len);
+    uint32_t prefix = 0, suffix = 0, patch_len;
+
+    while (prefix < max && body->buf[prefix] == base_body[prefix])
+        prefix++;
+    while (suffix < max - prefix &&
+           body->buf[len - 1 - suffix] == base_body[base_len - 1 - suffix])
+        suffix++;
+    patch_len = snap_leb128_size(prefix) + snap_leb128_size(suffix) +
+        len - prefix - suffix;
+    dbuf_put_leb128(&w->bodies, idx);
+    if (patch_len < len) {
+        dbuf_put_leb128(&w->bodies, (patch_len << 1) | 1);
+        dbuf_put_leb128(&w->bodies, prefix);
+        dbuf_put_leb128(&w->bodies, suffix);
+        dbuf_put(&w->bodies, body->buf + prefix, len - prefix - suffix);
+    } else {
+        dbuf_put_leb128(&w->bodies, len << 1);
+        dbuf_put(&w->bodies, body->buf, len);
+    }
+    w->body_count++;
 }
 
 /* Write the body of the cell 'idx' in the bodies section, unless it is a
@@ -1323,17 +1370,23 @@ static int snap_write_body(SnapWriter *w, int idx)
     if (idx < w->base_cell_count) {
         const JSSnapshotBase *base = w->base;
         uint32_t off = base->body_offsets[idx];
-        if (body->size == base->body_offsets[idx + 1] - off &&
+        uint32_t base_len = base->body_offsets[idx + 1] - off;
+        if (body->size == base_len &&
             !memcmp(body->buf, base->bodies + off, body->size))
             return 0; /* unchanged */
         if (snap_resize(w->rt, (void **)&w->changed, sizeof(w->changed[0]),
                         &w->changed_size, w->changed_count + 1))
             return snap_writer_oom(w);
         w->changed[w->changed_count++] = idx;
+        snap_put_changed_body(w, idx, body, base->bodies + off, base_len);
+        return 0;
     }
-    if (w->flags & JS_SNAPSHOT_DELTA)
+    if (w->flags & JS_SNAPSHOT_DELTA) {
         dbuf_put_leb128(&w->bodies, idx);
-    dbuf_put_leb128(&w->bodies, body->size);
+        dbuf_put_leb128(&w->bodies, body->size << 1);
+    } else {
+        dbuf_put_leb128(&w->bodies, body->size);
+    }
     dbuf_put(&w->bodies, body->buf, body->size);
     w->body_count++;
     if (w->flags & JS_SNAPSHOT_BASE) {
@@ -1654,6 +1707,9 @@ uint8_t *JS_WriteSnapshot(JSContext *ctx, size_t *psize,
         JSContext *ctx1 = list_entry(el, JSContext, link);
         if (snap_put_ref(w, SNAP_CELL_CONTEXT, ctx1))
             goto fail;
+        /* a base is the same for every seed */
+        if (!(flags & JS_SNAPSHOT_BASE))
+            bc_put_u64(&w->bc, ctx1->random_state);
     }
     n = 0;
     list_for_each(el, &rt->job_list)
@@ -1787,6 +1843,7 @@ struct SnapReader {
     int base_atom_count;
     int base_str_count;
     uint64_t base_id; /* id of the full snapshot, 0 if it is not a base */
+    BOOL roots_seeded; /* the roots hold the Math.random() states */
     SnapInput base_roots, delta_roots, base_bodies, delta_bodies;
     /* base body of each base cell (to attach the base to the runtime) */
     const uint8_t **base_body_ptrs;
@@ -2203,8 +2260,6 @@ static int snap_read_context(SnapReader *r, JSContext *ctx)
     }
     if (snap_get_value(r, &ctx->global_obj) ||
         snap_get_value(r, &ctx->global_var_obj))
-        return -1;
-    if (bc_get_u64(&r->bc, &ctx->random_state))
         return -1;
     if (snap_get_leb(r, &n))
         return -1;
@@ -2645,19 +2700,17 @@ static int snap_read_payload(SnapReader *r, JSObject *p, int flags)
     return 0;
 }
 
-/* read one property and add it to 'p'. The payload is read before the
-   property is created so that 'p' stays consistent on error. */
-static int snap_read_property(SnapReader *r, JSObject *p)
+/* Read the property 'atom' of 'p' (the reference to 'atom' is freed) and
+   add it. The payload is read before the property is created so that 'p'
+   stays consistent on error. */
+static int snap_read_property(SnapReader *r, JSObject *p, JSAtom atom)
 {
     JSContext *ctx = r->ctx;
-    JSAtom atom;
     uint8_t flags, id;
     JSProperty *pr, prop;
     JSContext *realm;
     void *opaque;
 
-    if (bc_get_atom(&r->bc, &atom))
-        return -1;
     if (bc_get_u8(&r->bc, &flags))
         goto fail;
     if (flags & ~(JS_PROP_C_W_E | JS_PROP_LENGTH | JS_PROP_TMASK)) {
@@ -2732,8 +2785,8 @@ static int snap_read_object(SnapReader *r, int idx)
     JSContext *ctx = r->ctx;
     JSObject *p = r->cells[idx].ptr, *proto;
     JSShape *sh;
+    JSAtom atom;
     uint8_t flags;
-    uint32_t i, n;
 
     if (snap_get_obj(r, &proto) || bc_get_u8(&r->bc, &flags))
         return -1;
@@ -2759,10 +2812,12 @@ static int snap_read_object(SnapReader *r, int idx)
     js_free_shape(r->rt, p->shape);
     p->shape = sh;
 
-    if (snap_get_leb(r, &n))
-        return -1;
-    for(i = 0; i < n; i++) {
-        if (snap_read_property(r, p))
+    for(;;) {
+        if (bc_get_atom(&r->bc, &atom))
+            return -1;
+        if (atom == JS_ATOM_NULL)
+            break;
+        if (snap_read_property(r, p, atom))
             return -1;
     }
     r->cur_obj = p;
@@ -3194,6 +3249,14 @@ static int snap_read_roots(SnapReader *r, JSSnapshotResult *res)
             return -1;
         if (!ctx)
             return snap_error(r, "invalid context list");
+        if (r->roots_seeded) {
+            if (bc_get_u64(&r->bc, &ctx->random_state))
+                return -1;
+            if (ctx->random_state == 0)
+                return snap_error(r, "invalid random state");
+        } else {
+            js_random_init(ctx);
+        }
         list_del(&ctx->link);
         list_add_tail(&ctx->link, &rt->context_list);
         res->contexts[res->context_count++] = JS_DupContext(ctx);
@@ -3335,6 +3398,43 @@ static int snap_read_base_bodies(SnapReader *r)
     return 0;
 }
 
+/* Read the body of the changed base cell 'idx' from its patch, the next
+   'len' bytes (see snap_put_changed_body()): the body is rebuilt from its
+   base body, then read. */
+static int snap_read_patched_body(SnapReader *r, int idx, uint32_t len)
+{
+    const uint8_t *base_body = r->base_body_ptrs[idx];
+    const uint8_t *start = r->bc.buf_start, *end = r->bc.buf_end, *patch_end;
+    uint32_t base_len = r->base_body_lens[idx], prefix, suffix, mid, size;
+    uint8_t *body;
+    int ret;
+
+    if (len > end - r->bc.ptr)
+        return snap_error(r, "truncated snapshot");
+    patch_end = r->bc.ptr + len;
+    r->bc.buf_end = patch_end;
+    if (snap_get_leb(r, &prefix) || snap_get_leb(r, &suffix))
+        return -1;
+    if (prefix > base_len || suffix > base_len - prefix)
+        return snap_error(r, "invalid delta body");
+    mid = patch_end - r->bc.ptr;
+    size = prefix + mid + suffix;
+    body = js_malloc_rt(r->rt, max_int(size, 1));
+    if (!body)
+        return snap_error(r, "out of memory");
+    memcpy(body, base_body, prefix);
+    memcpy(body + prefix, r->bc.ptr, mid);
+    memcpy(body + prefix + mid, base_body + base_len - suffix, suffix);
+    r->bc.buf_start = r->bc.ptr = body;
+    r->bc.buf_end = body + size;
+    ret = snap_read_body(r, idx, size);
+    js_free_rt(r->rt, body);
+    r->bc.buf_start = start;
+    r->bc.ptr = patch_end;
+    r->bc.buf_end = end;
+    return ret;
+}
+
 /* bodies of the changed base cells and of the new cells */
 static int snap_read_delta_bodies(SnapReader *r)
 {
@@ -3347,9 +3447,11 @@ static int snap_read_delta_bodies(SnapReader *r)
         if (snap_get_leb(r, &idx) || snap_get_leb(r, &len))
             return -1;
         if (idx >= r->cell_count ||
-            (idx < r->base_cell_count && !r->cells[idx].changed))
+            (idx < r->base_cell_count && !r->cells[idx].changed) ||
+            ((len & 1) && idx >= r->base_cell_count))
             return snap_error(r, "invalid delta body");
-        if (snap_read_body(r, idx, len))
+        if ((len & 1) ? snap_read_patched_body(r, idx, len >> 1) :
+            snap_read_body(r, idx, len >> 1))
             return -1;
     }
     if (r->bc.ptr != r->bc.buf_end)
@@ -3544,6 +3646,7 @@ int JS_ReadSnapshot(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
         goto fail;
     }
     snap_set_input(r, delta ? &r->delta_roots : &r->base_roots);
+    r->roots_seeded = delta || !r->base_id;
     if (snap_read_roots(r, res))
         goto fail;
     if (r->bc.ptr != r->bc.buf_end) {

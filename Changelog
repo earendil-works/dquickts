@@ -6,7 +6,11 @@ unreleased:
   runtime, including a suspended execution, can be saved and restored in
   another runtime or process
 - added incremental snapshots (JS_SNAPSHOT_BASE, JS_SNAPSHOT_DELTA): a
-  delta only contains the changes since a base snapshot
+  delta only contains the changes since a base snapshot; a modified
+  object is saved as a patch of its base version
+- a base snapshot is reproducible (the Math.random() state is saved in
+  full snapshots and deltas, not in bases): a host can rebuild it
+  instead of storing it
 - added JS_SuspendCall() and JS_ResumeWith(): a C function suspends its
   JS caller until the host gives the result of the call
 - added JS_IsSuspendException(), JS_IsUncatchableException(),
@@ -78,7 +82,7 @@ unreleased:
     memory; JS_NewCConstructor() leak; allocation size overflows;
     std: FILE leak, std.evalScript() interrupt handler, loading pipes
     and /proc files, std.open() 'x' mode, std.popen() modes
-- snapshot format version 6
+- snapshot format version 7
 - fixed an atom leak when reading truncated bytecode
 
 2026-06-04:

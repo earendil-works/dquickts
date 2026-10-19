@@ -341,6 +341,66 @@ static void test_suspend_call(void)
     free_context_and_runtime(ctx);
 }
 
+/* the string conversion of the value of 'src' (malloc'd) */
+static char *eval_string(JSContext *ctx, const char *src)
+{
+    JSValue val = eval(ctx, src);
+    const char *str = JS_ToCString(ctx, val);
+    char *copy = strdup(str ? str : "<exception>");
+    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, val);
+    return copy;
+}
+
+/* A base is reproducible: runtimes set up the same way write the same
+   base, so a host can rebuild the base of its deltas instead of storing
+   it. The state of Math.random() is not part of a base: full snapshots
+   and deltas carry it. */
+static void test_reproducible_base(void)
+{
+    JSContext *ctx1 = new_context(new_runtime());
+    JSContext *ctx2 = new_context(new_runtime());
+    JSContext *ctx3;
+    uint8_t *base1, *base2, *delta, *full;
+    size_t base1_size, base2_size, delta_size, full_size;
+    char *expected;
+
+    /* the same lazily instantiated builtins, but other Math.random()
+       states (even if both runtimes got the same seed) */
+    JS_FreeValue(ctx1, eval(ctx1, "Math.random()"));
+    JS_FreeValue(ctx2, eval(ctx2, "Math.random(); Math.random()"));
+    base1 = write_snapshot_flags(ctx1, &base1_size, NULL, 0, JS_SNAPSHOT_BASE);
+    base2 = write_snapshot_flags(ctx2, &base2_size, NULL, 0, JS_SNAPSHOT_BASE);
+    CHECK(base1 && base2 && base1_size == base2_size &&
+          !memcmp(base1, base2, base1_size));
+    free_context_and_runtime(ctx2);
+
+    /* a delta applies to the base written by the other runtime and
+       continues the Math.random() sequence */
+    JS_FreeValue(ctx1, eval(ctx1, "var twice = x => 2 * x; Math.random()"));
+    delta = write_snapshot_flags(ctx1, &delta_size, NULL, 0, JS_SNAPSHOT_DELTA);
+    expected = eval_string(ctx1, "twice(21) + ' ' + Math.random()");
+    if (base2 && delta && (ctx3 = read_snapshot(base2, base2_size, delta, delta_size))) {
+        CHECK_STRING(ctx3, eval(ctx3, "twice(21) + ' ' + Math.random()"), expected);
+        free_context_and_runtime(ctx3);
+    }
+    free(expected);
+
+    /* so does a full snapshot */
+    full = write_snapshot(ctx1, &full_size, NULL, 0);
+    expected = eval_string(ctx1, "Math.random()");
+    if (full && (ctx3 = read_snapshot(full, full_size, NULL, 0))) {
+        CHECK_STRING(ctx3, eval(ctx3, "Math.random()"), expected);
+        free_context_and_runtime(ctx3);
+    }
+    free(expected);
+    free_context_and_runtime(ctx1);
+    free(base1);
+    free(base2);
+    free(delta);
+    free(full);
+}
+
 /* Incremental snapshots: natives, global changes and an application
    script make the base; the following snapshots are small deltas of it,
    also when written by a runtime restored from the base and a delta. */
@@ -753,6 +813,7 @@ int main(void)
     test_gc_during_write();
     test_two_realms();
     test_incremental();
+    test_reproducible_base();
     test_suspend_call();
     test_errors();
     if (failures) {
