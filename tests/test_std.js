@@ -166,18 +166,20 @@ function test_load_file()
     assert(std.loadFile(fname), "");
     os.remove(fname);
 
-    /* pipes are not seekable */
+    /* pipes are not seekable (FreeBSD only has /dev/fd/N for N > 2 with
+       fdescfs mounted) */
     fds = os.pipe();
     f = std.fdopen(fds[1], "w");
     f.puts(str);
     f.close();
-    assert(std.loadFile("/dev/fd/" + fds[0]), str);
+    if (os.stat("/dev/fd/" + fds[0])[1] === 0)
+        assert(std.loadFile("/dev/fd/" + fds[0]), str);
     os.close(fds[0]);
 
-    if (os.platform === "linux") {
-        /* the files of /proc report a size of 0 */
+    /* the files of /proc report a size of 0 (os.platform is also "linux"
+       on FreeBSD, which has no /proc by default) */
+    if (os.stat("/proc/self/status")[1] === 0)
         assert(std.loadFile("/proc/self/status").startsWith("Name:"));
-    }
 }
 
 function test_ext_json()
