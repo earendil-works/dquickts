@@ -1104,12 +1104,39 @@ explicitly duplicate (@code{JS_DupValue()}, increment the reference
 count) or free (@code{JS_FreeValue()}, decrement the reference count)
 JSValues.
 
+@code{JS_FreeValues()} and @code{JS_FreeAtoms()} free up to 8 values
+or atoms in a single call.
+
+Strings can be exchanged as UTF-16 code units with
+@code{JS_NewStringUTF16()} and @code{JS_ToCStringLenUTF16()} (released
+with @code{JS_FreeCStringUTF16()}). Unlike the UTF-8 functions, they
+preserve unpaired surrogates.
+
+@code{JS_NewUint8Array()} and @code{JS_NewUint8ArrayCopy()} create a
+@code{Uint8Array} over a new @code{ArrayBuffer};
+@code{JS_GetUint8Array()} returns the bytes viewed by a
+@code{Uint8Array}, taking its offset into account.
+
+@code{JS_GetPropertyValue()} and @code{JS_SetPropertyValue()} access a
+property whose key is an arbitrary @code{JSValue} (freed by the
+call). @code{JS_SetLength()} assigns the @code{length} property, and
+@code{JS_SealObject()}/@code{JS_FreezeObject()} behave like
+@code{Object.seal()}/@code{Object.freeze()}.
+
 @subsection C functions
 
 C functions can be created with
 @code{JS_NewCFunction()}. @code{JS_SetPropertyFunctionList()} is a
 shortcut to easily add functions, setters and getters properties to a
-given object.
+given object. @code{JS_CFUNC_DEF2()}, @code{JS_CGETSET_DEF2()} and
+@code{JS_CGETSET_MAGIC_DEF2()} are variants of the list entry macros
+taking explicit property flags. @code{JS_NewCFunction3()} also takes the prototype of the
+function, @code{JS_NewCFunctionData2()} creates a named function with
+JavaScript values bound to it. @code{JS_NewCClosure()} binds a C
+pointer instead: the closure gets the @code{opaque} pointer on each
+call and its finalizer is called with it when the function is freed.
+@code{JS_WriteSnapshot()} fails with a @code{TypeError} if a C closure
+is reachable (its pointer is host state).
 
 Unlike other embedded Javascript engines, there is no implicit stack,
 so C functions get their parameters as normal C parameters. As a
@@ -1124,6 +1151,10 @@ must be explicitly tested and handled by the C code. The specific
 @code{JSValue} @code{JS_EXCEPTION} indicates that an exception
 occurred. The actual exception object is stored in the
 @code{JSContext} and can be retrieved with @code{JS_GetException()}.
+
+@code{JS_NewTypeError()}, @code{JS_NewRangeError()} and the other
+@code{JS_New*Error()} functions build the same error objects as their
+@code{JS_Throw*Error()} counterparts but return them without throwing.
 
 @subsection Script evaluation
 
@@ -1162,7 +1193,8 @@ The Class ID are globally allocated (i.e. for all runtimes). The
 JSClass are allocated per @code{JSRuntime}. @code{JS_SetClassProto()}
 is used to define a prototype for a given class in a given
 JSContext. @code{JS_NewObjectClass()} sets this prototype in the
-created object.
+created object. @code{JS_GetClassName()} returns the name of a
+registered class as an atom.
 
 Examples are available in @file{quickjs-libc.c}.
 
