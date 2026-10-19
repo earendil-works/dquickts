@@ -45,6 +45,7 @@
 #include <dlfcn.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <poll.h>
 
@@ -515,6 +516,64 @@ static JSValue js_std_loadFile(JSContext *ctx, JSValueConst this_val,
         return JS_NULL;
     ret = JS_NewStringLen(ctx, (char *)buf, buf_len);
     js_free(ctx, buf);
+    return ret;
+}
+
+/* write a file from the bytes of an ArrayBuffer or a typed array, or
+   from a string in UTF-8 (nothing if undefined) */
+static JSValue js_std_writeFile(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    JSValueConst data = argv[1];
+    const char *filename, *str, *mode;
+    const uint8_t *buf;
+    size_t len, offset, size, n;
+    JSValue buffer, ret;
+    FILE *f;
+    int err;
+
+    ret = JS_EXCEPTION;
+    buffer = JS_UNDEFINED;
+    str = NULL;
+    filename = JS_ToCString(ctx, argv[0]);
+    if (!filename)
+        return JS_EXCEPTION;
+    mode = "wb";
+    if (JS_GetTypedArrayType(data) >= 0) {
+        buffer = JS_GetTypedArrayBuffer(ctx, data, &offset, &len, NULL);
+        if (JS_IsException(buffer))
+            goto done;
+        buf = JS_GetArrayBuffer(ctx, &size, buffer);
+        if (buf)
+            buf += offset;
+    } else if (JS_IsArrayBuffer(data)) {
+        buf = JS_GetArrayBuffer(ctx, &len, data);
+    } else if (JS_IsUndefined(data)) {
+        buf = (const uint8_t *)"";
+        len = 0;
+    } else {
+        str = JS_ToCStringLen(ctx, &len, data);
+        buf = (const uint8_t *)str;
+        mode = "w";
+    }
+    if (!buf)
+        goto done;
+    f = fopen(filename, mode);
+    if (!f) {
+        JS_ThrowPlainError(ctx, "error opening %s for writing", filename);
+        goto done;
+    }
+    n = fwrite(buf, 1, len, f);
+    err = fclose(f);
+    if (n != len || err != 0) {
+        JS_ThrowPlainError(ctx, "error writing to %s", filename);
+        goto done;
+    }
+    ret = JS_UNDEFINED;
+ done:
+    JS_FreeCString(ctx, filename);
+    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, buffer);
     return ret;
 }
 
@@ -1182,12 +1241,20 @@ static JSClassID js_std_file_class_id;
 
 typedef struct {
     FILE *f;
-    BOOL close_in_finalizer;
     BOOL is_popen;
 } JSSTDFile;
 
+/* std.in, std.out and std.err are never closed: closing them would
+   leave the C stdio globals in an undefined state */
+static BOOL is_stdio(FILE *f)
+{
+    return f == stdin || f == stdout || f == stderr;
+}
+
 static void js_std_file_close_stream(FILE *f, BOOL is_popen)
 {
+    if (is_stdio(f))
+        return;
     if (is_popen)
         pclose(f);
     else
@@ -1198,7 +1265,7 @@ static void js_std_file_finalizer(JSRuntime *rt, JSValue val)
 {
     JSSTDFile *s = JS_GetOpaque(val, js_std_file_class_id);
     if (s) {
-        if (s->f && s->close_in_finalizer)
+        if (s->f)
             js_std_file_close_stream(s->f, s->is_popen);
         js_free_rt(rt, s);
     }
@@ -1235,9 +1302,7 @@ static JSValue js_std_parseExtJSON(JSContext *ctx, JSValueConst this_val,
     return obj;
 }
 
-static JSValue js_new_std_file(JSContext *ctx, FILE *f,
-                               BOOL close_in_finalizer,
-                               BOOL is_popen)
+static JSValue js_new_std_file(JSContext *ctx, FILE *f, BOOL is_popen)
 {
     JSSTDFile *s;
     JSValue obj;
@@ -1249,15 +1314,13 @@ static JSValue js_new_std_file(JSContext *ctx, FILE *f,
         JS_FreeValue(ctx, obj);
         goto fail;
     }
-    s->close_in_finalizer = close_in_finalizer;
     s->is_popen = is_popen;
     s->f = f;
     JS_SetOpaque(obj, s);
     return obj;
  fail:
     /* the file object owns the stream: do not leak it */
-    if (close_in_finalizer)
-        js_std_file_close_stream(f, is_popen);
+    js_std_file_close_stream(f, is_popen);
     return JS_EXCEPTION;
 }
 
@@ -1298,7 +1361,7 @@ static JSValue js_std_open(JSContext *ctx, JSValueConst this_val,
     JS_FreeCString(ctx, mode);
     if (!f)
         return JS_NULL;
-    return js_new_std_file(ctx, f, TRUE, FALSE);
+    return js_new_std_file(ctx, f, FALSE);
  fail:
     JS_FreeCString(ctx, filename);
     JS_FreeCString(ctx, mode);
@@ -1334,7 +1397,7 @@ static JSValue js_std_popen(JSContext *ctx, JSValueConst this_val,
     JS_FreeCString(ctx, mode);
     if (!f)
         return JS_NULL;
-    return js_new_std_file(ctx, f, TRUE, TRUE);
+    return js_new_std_file(ctx, f, TRUE);
  fail:
     JS_FreeCString(ctx, filename);
     JS_FreeCString(ctx, mode);
@@ -1368,7 +1431,7 @@ static JSValue js_std_fdopen(JSContext *ctx, JSValueConst this_val,
     JS_FreeCString(ctx, mode);
     if (!f)
         return JS_NULL;
-    return js_new_std_file(ctx, f, TRUE, FALSE);
+    return js_new_std_file(ctx, f, FALSE);
  fail:
     JS_FreeCString(ctx, mode);
     return JS_EXCEPTION;
@@ -1383,7 +1446,7 @@ static JSValue js_std_tmpfile(JSContext *ctx, JSValueConst this_val,
         js_set_error_object(ctx, argv[0], f ? 0 : errno);
     if (!f)
         return JS_NULL;
-    return js_new_std_file(ctx, f, TRUE, FALSE);
+    return js_new_std_file(ctx, f, FALSE);
 }
 
 static JSValue js_std_sprintf(JSContext *ctx, JSValueConst this_val,
@@ -1445,6 +1508,8 @@ static JSValue js_std_file_close(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (!s->f)
         return JS_ThrowTypeError(ctx, "invalid file handle");
+    if (is_stdio(s->f))
+        return JS_ThrowTypeError(ctx, "cannot close stdio");
     if (s->is_popen)
         err = js_get_errno(pclose(s->f));
     else
@@ -1568,15 +1633,25 @@ static JSValue js_std_file_read_write(JSContext *ctx, JSValueConst this_val,
     FILE *f = js_std_file_get(ctx, this_val);
     uint64_t pos, len;
     size_t size, ret;
+    const char *str;
     uint8_t *buf;
 
     if (!f)
         return JS_EXCEPTION;
-    if (JS_ToIndex(ctx, &pos, argv[1]))
+    pos = 0;
+    if (argc > 1 && JS_ToIndex(ctx, &pos, argv[1]))
         return JS_EXCEPTION;
-    if (JS_ToIndex(ctx, &len, argv[2]))
+    len = 0;
+    if (argc > 2 && JS_ToIndex(ctx, &len, argv[2]))
         return JS_EXCEPTION;
-    buf = JS_GetArrayBuffer(ctx, &size, argv[0]);
+    /* write() also accepts a string, written in UTF-8 */
+    if (magic && JS_IsString(argv[0])) {
+        str = JS_ToCStringLen(ctx, &size, argv[0]);
+        buf = (uint8_t *)str;
+    } else {
+        str = NULL;
+        buf = JS_GetArrayBuffer(ctx, &size, argv[0]);
+    }
     if (!buf)
         return JS_EXCEPTION;
     if (!magic && JS_IsImmutableArrayBuffer(argv[0]) > 0)
@@ -1590,6 +1665,7 @@ static JSValue js_std_file_read_write(JSContext *ctx, JSValueConst this_val,
         ret = fwrite(buf + pos, 1, len, f);
     else
         ret = fread(buf + pos, 1, len, f);
+    JS_FreeCString(ctx, str);
     return JS_NewInt64(ctx, ret);
 }
 
@@ -1629,9 +1705,10 @@ static JSValue js_std_file_getline(JSContext *ctx, JSValueConst this_val,
     return obj;
 }
 
+/* readAsString() if 'magic' is 1, readAsArrayBuffer() if 0 */
 /* XXX: could use less memory and go faster */
-static JSValue js_std_file_readAsString(JSContext *ctx, JSValueConst this_val,
-                                        int argc, JSValueConst *argv)
+static JSValue js_std_file_readAs(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv, int magic)
 {
     FILE *f = js_std_file_get(ctx, this_val);
     int c;
@@ -1667,7 +1744,10 @@ static JSValue js_std_file_readAsString(JSContext *ctx, JSValueConst this_val,
         }
         max_size--;
     }
-    obj = JS_NewStringLen(ctx, (const char *)dbuf.buf, dbuf.size);
+    if (magic)
+        obj = JS_NewStringLen(ctx, (const char *)dbuf.buf, dbuf.size);
+    else
+        obj = JS_NewArrayBufferCopy(ctx, dbuf.buf, dbuf.size);
     dbuf_free(&dbuf);
     return obj;
 }
@@ -1922,6 +2002,7 @@ static const JSCFunctionListEntry js_std_funcs[] = {
     JS_CFUNC_DEF("getenviron", 1, js_std_getenviron ),
     JS_CFUNC_DEF("urlGet", 1, js_std_urlGet ),
     JS_CFUNC_DEF("loadFile", 1, js_std_loadFile ),
+    JS_CFUNC_DEF("writeFile", 2, js_std_writeFile ),
     JS_CFUNC_DEF("strerror", 1, js_std_strerror ),
     JS_CFUNC_DEF("parseExtJSON", 1, js_std_parseExtJSON ),
 
@@ -1952,10 +2033,11 @@ static const JSCFunctionListEntry js_std_file_proto_funcs[] = {
     JS_CFUNC_DEF("fileno", 0, js_std_file_fileno ),
     JS_CFUNC_DEF("error", 0, js_std_file_error ),
     JS_CFUNC_DEF("clearerr", 0, js_std_file_clearerr ),
-    JS_CFUNC_MAGIC_DEF("read", 3, js_std_file_read_write, 0 ),
-    JS_CFUNC_MAGIC_DEF("write", 3, js_std_file_read_write, 1 ),
+    JS_CFUNC_MAGIC_DEF("read", 1, js_std_file_read_write, 0 ),
+    JS_CFUNC_MAGIC_DEF("write", 1, js_std_file_read_write, 1 ),
     JS_CFUNC_DEF("getline", 0, js_std_file_getline ),
-    JS_CFUNC_DEF("readAsString", 0, js_std_file_readAsString ),
+    JS_CFUNC_MAGIC_DEF("readAsArrayBuffer", 0, js_std_file_readAs, 0 ),
+    JS_CFUNC_MAGIC_DEF("readAsString", 0, js_std_file_readAs, 1 ),
     JS_CFUNC_DEF("getByte", 0, js_std_file_getByte ),
     JS_CFUNC_DEF("putByte", 1, js_std_file_putByte ),
     /* setvbuf, ...  */
@@ -1977,9 +2059,9 @@ static int js_std_init(JSContext *ctx, JSModuleDef *m)
 
     JS_SetModuleExportList(ctx, m, js_std_funcs,
                            countof(js_std_funcs));
-    JS_SetModuleExport(ctx, m, "in", js_new_std_file(ctx, stdin, FALSE, FALSE));
-    JS_SetModuleExport(ctx, m, "out", js_new_std_file(ctx, stdout, FALSE, FALSE));
-    JS_SetModuleExport(ctx, m, "err", js_new_std_file(ctx, stderr, FALSE, FALSE));
+    JS_SetModuleExport(ctx, m, "in", js_new_std_file(ctx, stdin, FALSE));
+    JS_SetModuleExport(ctx, m, "out", js_new_std_file(ctx, stdout, FALSE));
+    JS_SetModuleExport(ctx, m, "err", js_new_std_file(ctx, stderr, FALSE));
     return 0;
 }
 
@@ -2433,6 +2515,21 @@ static JSValue js_os_now(JSContext *ctx, JSValue this_val,
 {
     return JS_NewFloat64(ctx, (double)get_time_ns() / 1e6);
 }
+
+#if !defined(_WIN32)
+/* user CPU time of the process in microseconds */
+static JSValue js_os_cputime(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv)
+{
+    struct rusage ru;
+    int64_t cputime;
+
+    cputime = 0;
+    if (!getrusage(RUSAGE_SELF, &ru))
+        cputime = (int64_t)ru.ru_utime.tv_sec * 1000000 + ru.ru_utime.tv_usec;
+    return JS_NewInt64(ctx, cputime);
+}
+#endif
 
 static void free_timer(JSRuntime *rt, JSOSTimer *th)
 {
@@ -4376,6 +4473,7 @@ static const JSCFunctionListEntry js_os_funcs[] = {
     OS_FLAG(SIGTSTP),
     OS_FLAG(SIGTTIN),
     OS_FLAG(SIGTTOU),
+    JS_CFUNC_DEF("cputime", 0, js_os_cputime ),
 #endif
     JS_CFUNC_DEF("now", 0, js_os_now ),
     JS_CFUNC_MAGIC_DEF("setTimeout", 2, js_os_setTimeout, 0 ),

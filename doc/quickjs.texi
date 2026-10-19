@@ -616,6 +616,13 @@ Evaluate the file @code{filename} as a script (global eval).
 Load the file @code{filename} and return it as a string assuming UTF-8
 encoding. Return @code{null} in case of I/O error.
 
+@item writeFile(filename, data)
+Create or truncate the file @code{filename} and write @code{data} to
+it: the bytes of an ArrayBuffer or of a typed array (only the bytes of
+its view), otherwise @code{data} converted to a string in UTF-8
+(nothing if @code{data} is undefined). Throw an exception in case of
+I/O error.
+
 @item open(filename, flags, errorObj = undefined)
 Open a file (wrapper to the libc @code{fopen()}). @code{flags} is
 made of the characters @code{rwa+bx} (@code{x}: fail if the file
@@ -657,6 +664,7 @@ Equivalent to the libc sprintf().
 @item out
 @item err
 Wrappers to the libc file @code{stdin}, @code{stdout}, @code{stderr}.
+They cannot be closed: @code{close()} throws a @code{TypeError}.
 
 @item SEEK_SET
 @item SEEK_CUR
@@ -780,15 +788,18 @@ Return true if there was an error.
 @item clearerr()
 Clear the error indication.
 
-@item read(buffer, position, length)
+@item read(buffer, position = 0, length = buffer.byteLength - position)
 Read @code{length} bytes from the file to the ArrayBuffer @code{buffer} at byte
 position @code{position} (wrapper to the libc @code{fread}). The
 range is clamped to the buffer. @code{buffer} must not be immutable.
 Return the number of bytes read.
 
-@item write(buffer, position, length)
+@item write(buffer, position = 0, length = buffer.byteLength - position)
 Write @code{length} bytes to the file from the ArrayBuffer @code{buffer} at byte
-position @code{position} (wrapper to the libc @code{fwrite}).
+position @code{position} (wrapper to the libc @code{fwrite}). If
+@code{buffer} is a string, its UTF-8 bytes are written and
+@code{position} and @code{length} count bytes. The range is clamped to
+the buffer. Return the number of bytes written.
 
 @item getline()
 Return the next line from the file, assuming UTF-8 encoding, excluding
@@ -798,6 +809,9 @@ the trailing line feed.
 Read @code{max_size} bytes from the file and return them as a string
 assuming UTF-8 encoding. If @code{max_size} is not present, the file
 is read up its end.
+
+@item readAsArrayBuffer(max_size = undefined)
+Same as @code{readAsString()} but return the bytes as an ArrayBuffer.
 
 @item getByte()
 Return the next byte from the file. Return -1 if the end of file is reached.
@@ -1047,6 +1061,10 @@ await os.sleepAsync(500);
 Return a timestamp in milliseconds with more precision than
 @code{Date.now()}. The time origin is unspecified and is normally not
 impacted by system clock adjustments.
+
+@item cputime()
+Return the user CPU time of the process in microseconds (not
+available on Windows).
 
 @item setTimeout(func, delay)
 Call the function @code{func} after @code{delay} ms. Return a handle

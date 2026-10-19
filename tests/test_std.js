@@ -37,11 +37,25 @@ function test_printf()
 
 function test_file1()
 {
-    var f, len, str, size, buf, ret, i, str1;
+    var f, len, str, size, buf, ret, i, str1, ab;
 
     f = std.tmpfile();
     str = "hello world\n";
     f.puts(str);
+
+    f.seek(0, std.SEEK_SET);
+    ab = f.readAsArrayBuffer();
+    assert(ab instanceof ArrayBuffer);
+    assert([...new Uint8Array(ab)], str.split("").map(c => c.charCodeAt(0)));
+
+    /* max_size */
+    f.seek(0, std.SEEK_SET);
+    ab = f.readAsArrayBuffer(5);
+    assert(ab.byteLength, 5);
+    assert(String.fromCharCode(...new Uint8Array(ab)), "hello");
+    ab = f.readAsArrayBuffer();
+    assert(ab.byteLength, str.length - 5);
+    assert(f.readAsArrayBuffer().byteLength, 0);
 
     f.seek(0, std.SEEK_SET);
     str1 = f.readAsString();
@@ -60,6 +74,72 @@ function test_file1()
         assert(buf[i] === str.charCodeAt(i));
 
     f.close();
+}
+
+/* the position and length of read() and write() are optional and
+   clamped to the buffer; write() also accepts a string (in UTF-8) */
+function test_file_read_write()
+{
+    var f, buf;
+
+    f = std.tmpfile();
+    assert(f.write("héllo"), 6);
+    assert(f.write(new Uint8Array([0x21, 0x3f]).buffer, 1), 1);
+    assert(f.write("abc", 1, 1), 1);
+    assert(f.write("abc", 2, 10), 1);
+    assert(f.write("abc", 10), 0);
+    f.seek(0, std.SEEK_SET);
+    assert(f.readAsString(), "héllo?bc");
+
+    buf = new Uint8Array(4);
+    f.seek(0, std.SEEK_SET);
+    assert(f.read(buf.buffer), 4);
+    assert(buf.join(), "104,195,169,108");
+    assert(f.read(buf.buffer, 3), 1);
+    assert(buf[3], 108);
+    assert(f.read(buf.buffer, 4, 42), 0);
+    assert(f.read(buf.buffer, 1, 2), 2);
+    assert(buf.join(), "104,111,63,108");
+
+    /* read() needs a buffer to read into */
+    try {
+        f.read("abc");
+        assert(false, true, "read() into a string");
+    } catch(e) {
+        assert(e instanceof TypeError, true, e);
+    }
+    f.close();
+}
+
+function test_write_file()
+{
+    var fname = "tmp_write_file.txt", ta, f;
+
+    /* only the bytes of the typed array view are written */
+    ta = new Uint16Array([0x6968, 0x6a6b, 0x6c6d]);
+    std.writeFile(fname, ta.subarray(1, 2));
+    assert(std.loadFile(fname), "kj");
+    std.writeFile(fname, ta.buffer);
+    assert(std.loadFile(fname), "hikjml");
+    std.writeFile(fname, "héllo");
+    f = std.open(fname, "r");
+    assert(f.readAsArrayBuffer().byteLength, 6);
+    f.close();
+    std.writeFile(fname, 42);
+    assert(std.loadFile(fname), "42");
+    std.writeFile(fname, "");
+    assert(std.loadFile(fname), "");
+    std.writeFile(fname, "x");
+    std.writeFile(fname);
+    assert(std.loadFile(fname), "");
+    os.remove(fname);
+
+    try {
+        std.writeFile("test_none_dir/" + fname, "x");
+        assert(false, true, "writeFile() to a missing directory");
+    } catch(e) {
+        assert(/error opening .* for writing/.test(e.message), true, e);
+    }
 }
 
 function test_file2()
@@ -107,13 +187,14 @@ function test_getline()
 function test_popen()
 {
     var str, f, fname = "tmp_file.txt";
-    var content = "hello world";
+    var ta, content = "hello world";
 
-    f = std.open(fname, "w");
-    f.puts(content);
-    f.close();
-
-    /* test loadFile */
+    ta = new Uint8Array([...content].map(c => c.charCodeAt(0)));
+    std.writeFile(fname, ta);
+    assert(std.loadFile(fname), content);
+    std.writeFile(fname, ta.buffer);
+    assert(std.loadFile(fname), content);
+    std.writeFile(fname, content);
     assert(std.loadFile(fname), content);
 
     /* execute the 'cat' shell command */
@@ -292,6 +373,61 @@ function test_os()
     assert(fd < 0);
 
     assert(os.remove(fdir) === 0);
+
+    [fdir, err] = os.mkdtemp();
+    assert(err, 0);
+    [fpath, fd] = os.mkstemp(`${fdir}/XXXXXX`);
+    assert(fd >= 0);
+
+    const f = std.fdopen(fd, "w+");
+    f.write("xyzzy");
+    f.flush();
+    const b = new Uint8Array(5);
+    f.seek(0, std.SEEK_SET);
+    assert(5, f.read(b.buffer));
+    const s = [...b].map(c => String.fromCharCode(c)).join("");
+    assert(s, "xyzzy");
+    f.seek(0, std.SEEK_SET);
+    assert(0, f.read(b.buffer, 5, 42));
+    f.close();
+
+    assert(os.remove(fpath), 0);
+    assert(os.remove(fdir), 0);
+}
+
+function test_cputime()
+{
+    var t0, t1, x, i;
+
+    t0 = os.cputime();
+    assert(Number.isInteger(t0) && t0 >= 0, true, t0);
+    /* busy loop of a few ms of user CPU time */
+    x = 0;
+    for(i = 0; i < 1e6; i++)
+        x += i;
+    t1 = os.cputime();
+    assert(t1 > t0, true, `${t0} ${t1}`);
+}
+
+function test_stdio_close()
+{
+    for (const f of [std.in, std.out, std.err]) {
+        let caught = false;
+        try {
+            f.close();
+        } catch (e) {
+            assert(/cannot close stdio/.test(e.message));
+            caught = true;
+        }
+        assert(caught);
+    }
+    /* they are still open */
+    assert(std.in.fileno(), 0);
+    assert(std.out.fileno(), 1);
+    assert(std.err.fileno(), 2);
+    /* only the stdio streams themselves cannot be closed */
+    var f = std.fdopen(os.dup(1), "w");
+    assert(f.close(), 0);
 }
 
 function test_os_tmp()
@@ -533,6 +669,8 @@ function test_array_loop_interrupt()
 
 test_printf();
 test_file1();
+test_file_read_write();
+test_write_file();
 test_file2();
 test_getline();
 test_popen();
@@ -542,6 +680,8 @@ test_os();
 test_os_tmp();
 test_exe_path();
 test_os_exec();
+test_cputime();
+test_stdio_close();
 test_timer();
 test_ext_json();
 test_async_gc();
