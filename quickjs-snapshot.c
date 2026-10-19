@@ -1846,8 +1846,10 @@ static int snap_add_fixup(SnapReader *r, SnapFixupFunc *func, void *opaque)
 /* header readers: no context exists yet, errors go to 'errbuf' */
 static int snap_hdr_u8(SnapReader *r, uint8_t *pval)
 {
-    if (r->bc.ptr >= r->bc.buf_end)
+    if (r->bc.ptr >= r->bc.buf_end) {
+        *pval = 0; /* avoid warning */
         return snap_error(r, "truncated snapshot");
+    }
     *pval = *r->bc.ptr++;
     return 0;
 }
@@ -1899,8 +1901,10 @@ static int snap_get_ref(SnapReader *r, SnapCellType type, void **pptr)
         return 0;
     }
     v--;
-    if (v >= r->cell_count || r->cells[v].type != type)
+    if (v >= r->cell_count || r->cells[v].type != type) {
+        *pptr = NULL; /* avoid warning */
         return snap_error(r, "invalid %s reference", snap_cell_type_names[type]);
+    }
     *pptr = r->cells[v].ptr;
     return 0;
 }

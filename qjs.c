@@ -550,8 +550,11 @@ static JSValue drepl_copy_number(JSContext *ctx, JSValueConst val)
     JSValue global, ctor, str, ret;
     const char *s;
 
-    if (JS_IsNumber(val))
-        return val; /* not reference counted */
+    if (JS_IsNumber(val)) {
+        double d;
+        JS_ToFloat64(drepl.ctx, &d, val); /* cannot fail on a number */
+        return JS_NewFloat64(ctx, d);
+    }
     if (!JS_IsBigInt(drepl.ctx, val))
         return JS_UNDEFINED;
     s = JS_ToCString(drepl.ctx, val);

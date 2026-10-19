@@ -50,9 +50,9 @@ static int snap_get_present(SnapReader *r, BOOL *ppresent)
     uint8_t v;
     if (bc_get_u8(&r->bc, &v))
         return -1;
+    *ppresent = v;
     if (v > 1)
         return snap_error(r, "invalid object payload");
-    *ppresent = v;
     return 0;
 }
 

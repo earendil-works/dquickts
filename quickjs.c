@@ -4088,7 +4088,7 @@ JSClassID JS_NewClassID(JSClassID *pclass_id)
     return class_id;
 }
 
-JSClassID JS_GetClassID(JSValue v)
+JSClassID JS_GetClassID(JSValueConst v)
 {
     JSObject *p;
     if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
@@ -8122,7 +8122,7 @@ static JSValue build_stack_trace(JSContext *ctx, JSValueConst error_obj,
     JSRuntime *rt = ctx->rt;
     JSStackFrame *sf, *saved_caller;
     JSValue stack, prepare, saved_exception;
-    JSValueConst args[2];
+    JSValueConst prepare_func, args[2];
     BOOL saved_uncatchable;
     int limit;
 
@@ -8151,12 +8151,13 @@ static JSValue build_stack_trace(JSContext *ctx, JSValueConst error_obj,
        itself, for the uncatchable ones (interruption) and outside of
        JS code (host calls, heap snapshot reading where the functions
        may be incomplete, GC) */
-    prepare = JS_UNDEFINED;
+    prepare_func = JS_UNDEFINED;
     if (!rt->in_prepare_stack_trace && !saved_uncatchable &&
         rt->current_stack_frame && rt->gc_phase == JS_GC_PHASE_NONE)
-        prepare = js_get_error_ctor_data(ctx, JS_ATOM_prepareStackTrace);
-    if (JS_IsFunction(ctx, prepare)) {
-        prepare = JS_DupValue(ctx, prepare);
+        prepare_func = js_get_error_ctor_data(ctx, JS_ATOM_prepareStackTrace);
+    if (JS_IsFunction(ctx, prepare_func)) {
+        /* the call may replace Error.prepareStackTrace */
+        prepare = JS_DupValue(ctx, prepare_func);
         args[1] = get_backtrace(ctx, sf, filename, line_num, col_num,
                                 backtrace_flags, limit, TRUE);
         if (!JS_IsNull(args[1])) {
@@ -18945,7 +18946,7 @@ static no_inline int js_suspend_frame(JSContext *ctx, JSStackFrame *sf,
            its own references. The arguments beyond b->arg_count are
            only in argv. */
         i = 0;
-        if (sf->arg_buf != argv) {
+        if ((JSValueConst *)sf->arg_buf != argv) {
             /* b->arg_count arguments owned by the frame */
             for(; i < b->arg_count; i++)
                 heap_args[i] = sf->arg_buf[i];
