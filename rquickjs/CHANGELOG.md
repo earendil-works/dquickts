@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
-- Built on the bellard QuickJS tree this copy is vendored in instead of QuickJS-NG: `Runtime::set_dump_flags`, the `Performance` intrinsic, `ArrayBuffer::from_source_immutable`, `WriteOptions::strip_source`/`strip_debug`, `Value::is_uncatchable_error` (see `Ctx::has_uncatchable_exception`) and `Allocator::calloc` are removed; resolvers receive no import attributes; the `dump-*` features enable the engine `DUMP_*` options.
+- Built on the bellard QuickJS tree this copy is vendored in instead of QuickJS-NG: `Value::is_uncatchable_error` is removed (see `Ctx::has_uncatchable_exception`); `Runtime::set_dump_flags` takes the `JS_DUMP_*` flags of this engine, compiled in by any `dump-*` feature.
 - `Allocator` implementations are given the memory limit through QuickJS's allocation state: `Runtime::set_memory_limit` also applies with a custom allocator.
 
 ### Added
@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Runtime::suspender` / `Suspender`, `Error::Suspended`, `Ctx::resume`, `Ctx::resume_with` and `Runtime::is_suspended`: suspend a running execution and continue it later.
 - `rquickjs::snapshot`: `Ctx::write_snapshot` (full, base and delta snapshots), `Runtime::read_snapshot`, `Runtime::drop_snapshot_base`, `SnapshotHost` (natives and `Persist` classes) and the optional `snapshot()`/`restore()` builtins with `Error::Restore`.
 - `Ctx::has_uncatchable_exception`.
+- `ArrayBuffer::is_immutable`.
 - `StringNormalize` and `AToB` (`atob()`/`btoa()`) intrinsics.
 - TypeScript: `EvalOptions::typescript`; files and modules named `*.ts`, `*.mts`, `*.cts` are TypeScript (`Ctx::eval_file`, `Module::declare`/`evaluate`, `ScriptLoader`); `FileResolver` resolves `./x.js` to an existing `./x.ts` and tries `{}.ts`/`{}.mts`; `Runtime::set_decorators` (`Decorators`: standard, TypeScript legacy, legacy with `design:*` metadata).
 - `#[rquickjs::methods]` accepts `enumerable`, `configurable`, and `writable` on functions, and `= false` to disable default attributes

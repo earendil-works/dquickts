@@ -73,6 +73,8 @@ pub mod intrinsic {
         TypedArrays JS_AddIntrinsicTypedArrays,
         /// Add Promise object support
         Promise JS_AddIntrinsicPromise,
+        /// Add Performance support
+        Performance JS_AddPerformance,
         /// Add WeakRef support
         WeakRef JS_AddIntrinsicWeakRef,
         /// Add DOMException
@@ -96,6 +98,7 @@ pub mod intrinsic {
         MapSet,
         TypedArrays,
         Promise,
+        Performance,
         WeakRef,
         DOMException,
         AToB,
@@ -158,5 +161,28 @@ mod tests {
             .unwrap();
         let result: usize = ctx.with(|ctx| ctx.eval("1+1")).unwrap();
         assert_eq!(result, 2);
+    }
+
+    #[test]
+    fn performance() {
+        let rt = crate::Runtime::new().unwrap();
+        let ctx = Context::builder()
+            .with::<intrinsic::Eval>()
+            .build(&rt)
+            .unwrap();
+        let defined: bool = ctx
+            .with(|ctx| ctx.eval("typeof performance !== 'undefined'"))
+            .unwrap();
+        assert!(!defined);
+
+        let ctx = Context::builder()
+            .with::<intrinsic::Eval>()
+            .with::<intrinsic::Performance>()
+            .build(&rt)
+            .unwrap();
+        let valid: bool = ctx
+            .with(|ctx| ctx.eval("performance.now() >= 0 && performance.timeOrigin > 0"))
+            .unwrap();
+        assert!(valid);
     }
 }

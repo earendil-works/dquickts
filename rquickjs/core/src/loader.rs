@@ -134,26 +134,37 @@ impl LoaderHolder {
         unsafe {
             qjs::JS_SetModuleLoaderFunc2(
                 rt,
-                Some(Self::normalize_raw),
+                None,
                 Some(Self::load_raw),
                 None, // No attribute validation
                 self.0 as _,
             );
+            qjs::JS_SetModuleNormalizeFunc2(rt, Some(Self::normalize_raw));
         }
     }
 
-    /// QuickJS does not give the import attributes to the resolver.
     #[inline]
     fn normalize<'js>(
         opaque: &mut LoaderOpaque,
         ctx: &Ctx<'js>,
         base: &CStr,
         name: &CStr,
+        attributes: qjs::JSValue,
     ) -> Result<*mut qjs::c_char> {
         let base = base.to_str()?;
         let name = name.to_str()?;
 
-        let name = opaque.resolver.resolve(ctx, base, name, None)?;
+        // Convert JSValue to Option<ImportAttributes<'js>>
+        let attrs = {
+            let val = unsafe { Value::from_js_value_const(ctx.clone(), attributes) };
+            if val.is_undefined() || val.is_null() {
+                None
+            } else {
+                Some(ImportAttributes(Object(val)))
+            }
+        };
+
+        let name = opaque.resolver.resolve(ctx, base, name, attrs)?;
 
         // We should transfer ownership of this string to QuickJS
         Ok(unsafe { qjs::js_strndup(ctx.as_ptr(), name.as_ptr() as _, name.len() as _) })
@@ -163,6 +174,7 @@ impl LoaderHolder {
         ctx: *mut qjs::JSContext,
         base: *const qjs::c_char,
         name: *const qjs::c_char,
+        attributes: qjs::JSValue,
         opaque: *mut qjs::c_void,
     ) -> *mut qjs::c_char {
         let ctx = Ctx::from_ptr(ctx);
@@ -170,7 +182,7 @@ impl LoaderHolder {
         let name = CStr::from_ptr(name);
         let loader = &mut *(opaque as *mut LoaderOpaque);
 
-        Self::normalize(loader, &ctx, base, name).unwrap_or_else(|error| {
+        Self::normalize(loader, &ctx, base, name, attributes).unwrap_or_else(|error| {
             error.throw(&ctx);
             ptr::null_mut()
         })
@@ -639,5 +651,85 @@ mod test {
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&"type".to_string()));
         assert!(keys.contains(&"encoding".to_string()));
+    }
+
+    /// `(specifier, type attribute)` of every resolve call.
+    type ResolveCalls = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    /// Resolves `config` to a module name per `type` attribute.
+    struct TypeAwareResolver {
+        captured: ResolveCalls,
+    }
+
+    impl Resolver for TypeAwareResolver {
+        fn resolve<'js>(
+            &mut self,
+            _ctx: &Ctx<'js>,
+            _base: &str,
+            name: &str,
+            attributes: Option<ImportAttributes<'js>>,
+        ) -> Result<String> {
+            let module_type = match &attributes {
+                Some(attrs) => attrs.get_type()?,
+                None => None,
+            };
+            self.captured
+                .lock()
+                .unwrap()
+                .push((name.into(), module_type.clone()));
+            Ok(match module_type {
+                Some(module_type) => format!("{name}.{module_type}"),
+                None => name.into(),
+            })
+        }
+    }
+
+    struct NameLoader;
+
+    impl Loader for NameLoader {
+        fn load<'js>(
+            &mut self,
+            ctx: &Ctx<'js>,
+            name: &str,
+            _attributes: Option<ImportAttributes<'js>>,
+        ) -> Result<Module<'js>> {
+            Module::declare(ctx.clone(), name, format!("export default {name:?};"))
+        }
+    }
+
+    #[test]
+    fn import_attributes_passed_to_resolver() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let resolver = TypeAwareResolver {
+            captured: captured.clone(),
+        };
+
+        let rt = Runtime::new().unwrap();
+        let ctx = Context::full(&rt).unwrap();
+        rt.set_loader(resolver, NameLoader);
+
+        ctx.with(|ctx| {
+            let (module, promise) = Module::declare(
+                ctx.clone(),
+                "test",
+                r#"
+                    import json from "config" with { type: "json" };
+                    import text from "config" with { type: "text" };
+                    import plain from "config";
+                    export default [json, text, plain].join();
+                "#,
+            )
+            .and_then(|module| module.eval())
+            .catch(&ctx)
+            .unwrap();
+            promise.finish::<()>().catch(&ctx).unwrap();
+            let result: String = module.get("default").unwrap();
+            assert_eq!(result, "config.json,config.text,config");
+        });
+
+        let captured = captured.lock().unwrap();
+        assert!(captured.contains(&("config".into(), Some("json".into()))));
+        assert!(captured.contains(&("config".into(), Some("text".into()))));
+        assert!(captured.contains(&("config".into(), None)));
     }
 }

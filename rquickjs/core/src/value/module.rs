@@ -36,6 +36,10 @@ pub struct WriteOptions {
     pub allow_shared_array_buffer: bool,
     /// Allow object references to encode arbitrary object graph.
     pub object_reference: bool,
+    /// Do not write source code information.
+    pub strip_source: bool,
+    /// Do not write debug information.
+    pub strip_debug: bool,
 }
 
 impl WriteOptions {
@@ -58,6 +62,14 @@ impl WriteOptions {
 
         if self.object_reference {
             flag |= qjs::JS_WRITE_OBJ_REFERENCE;
+        }
+
+        if self.strip_source {
+            flag |= qjs::JS_WRITE_OBJ_STRIP_SOURCE;
+        }
+
+        if self.strip_debug {
+            flag |= qjs::JS_WRITE_OBJ_STRIP_DEBUG;
         }
 
         flag as i32
@@ -781,5 +793,62 @@ mod test {
 
             assert_eq!(ns.get::<_, u32>("a").unwrap(), 2u32);
         });
+    }
+
+    #[test]
+    fn write_strip_options() {
+        use crate::{Context, Runtime};
+
+        /// Writes the module with `options` and reloads it in a new context: returns the
+        /// source of its function and the stack of the error it creates.
+        fn reload(options: WriteOptions) -> (StdString, StdString) {
+            let rt = Runtime::new().unwrap();
+            let bytes = Context::full(&rt).unwrap().with(|ctx| {
+                Module::declare(
+                    ctx,
+                    "strip.js",
+                    "export function f() {\n    return new Error('x').stack; // 42\n}\n",
+                )
+                .unwrap()
+                .write(options)
+                .unwrap()
+            });
+            let context = Context::full(&rt).unwrap();
+            let result = context.with(|ctx| {
+                // the bytecode is read in place (`JS_READ_OBJ_ROM_DATA`): `bytes` outlives `context`
+                let (module, promise) = unsafe { Module::load(ctx.clone(), &bytes) }
+                    .unwrap()
+                    .eval()
+                    .unwrap();
+                promise.finish::<()>().unwrap();
+                let f: crate::Function = module.get("f").unwrap();
+                let source = f
+                    .get::<_, crate::Function>("toString")
+                    .unwrap()
+                    .call::<_, StdString>((crate::function::This(f.clone()),))
+                    .unwrap();
+                (source, f.call(()).unwrap())
+            });
+            drop(context);
+            result
+        }
+
+        let (source, stack) = reload(WriteOptions::default());
+        assert!(source.contains("// 42"), "{source}");
+        assert!(stack.contains("strip.js"), "{stack}");
+
+        let (source, stack) = reload(WriteOptions {
+            strip_source: true,
+            ..Default::default()
+        });
+        assert!(!source.contains("// 42"), "{source}");
+        assert!(stack.contains("strip.js"), "{stack}");
+
+        let (source, stack) = reload(WriteOptions {
+            strip_debug: true,
+            ..Default::default()
+        });
+        assert!(!source.contains("// 42"), "{source}");
+        assert!(!stack.contains("strip.js"), "{stack}");
     }
 }

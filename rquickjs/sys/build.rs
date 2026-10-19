@@ -95,8 +95,9 @@ fn main() {
     #[cfg(feature = "logging")]
     pretty_env_logger::init();
 
-    // Engine dump options (debug output of the C engine), see the DUMP_x
-    // defines at the top of quickjs.c.
+    // Engine dump options (debug output of the C engine): any of them
+    // compiles the dump code in (ENABLE_DUMPS), rquickjs then selects the
+    // dumps of each runtime with JS_SetDumpFlags().
     let dump_features = [
         "dump-bytecode",
         "dump-gc",
@@ -168,10 +169,11 @@ fn main() {
         ("CONFIG_VERSION".into(), Some(version.as_str())),
     ];
 
-    for feature in &dump_features {
-        if env::var(feature_to_cargo(feature)).is_ok() {
-            defines.push((feature_to_define(feature), Some("1")));
-        }
+    if dump_features
+        .iter()
+        .any(|feature| env::var(feature_to_cargo(feature)).is_ok())
+    {
+        defines.push(("ENABLE_DUMPS".into(), None));
     }
 
     #[cfg(feature = "disable-assertions")]

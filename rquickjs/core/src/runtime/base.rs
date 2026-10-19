@@ -215,6 +215,17 @@ impl Runtime {
         }
     }
 
+    /// Set debug flags for dumping memory
+    ///
+    /// The flags are the `JS_DUMP_*` constants of [`qjs`](crate::qjs). They are
+    /// ignored unless the engine is built with the dumps, which any of the `dump-*`
+    /// features does.
+    pub fn set_dump_flags(&self, flags: u64) {
+        unsafe {
+            self.inner.lock().set_dump_flags(flags);
+        }
+    }
+
     /// Manually run the garbage collection.
     ///
     /// Most of QuickJS values are reference counted and

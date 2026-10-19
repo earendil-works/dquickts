@@ -24,6 +24,11 @@ pub unsafe trait Allocator {
     ///
     fn alloc(&mut self, size: usize) -> *mut u8;
 
+    /// Allocates memory for an array of num objects of size and initializes all bytes in the allocated storage to zero.
+    ///
+    ///
+    fn calloc(&mut self, count: usize, size: usize) -> *mut u8;
+
     /// De-allocate previously allocated memory
     ///
     /// # Safety
@@ -70,6 +75,7 @@ impl AllocatorHolder {
         A: Allocator,
     {
         qjs::JSMallocFunctions {
+            js_calloc: Some(Self::calloc::<A>),
             js_malloc: Some(Self::malloc::<A>),
             js_free: Some(Self::free::<A>),
             js_realloc: Some(Self::realloc::<A>),
@@ -90,6 +96,33 @@ impl AllocatorHolder {
 
     /// The QuickJS allocation hooks enforce the memory limit and keep the
     /// counters of `state` up to date, like its default allocator.
+    unsafe extern "C" fn calloc<A>(
+        state: *mut qjs::JSMallocState,
+        count: qjs::size_t,
+        size: qjs::size_t,
+    ) -> *mut qjs::c_void
+    where
+        A: Allocator,
+    {
+        let state = &mut *state;
+        let count: usize = count.try_into().expect(qjs::SIZE_T_ERROR);
+        let size: usize = size.try_into().expect(qjs::SIZE_T_ERROR);
+        let Some(total) = count.checked_mul(size) else {
+            return ptr::null_mut();
+        };
+        if (state.malloc_size as usize).saturating_add(total) > state.malloc_limit as usize {
+            return ptr::null_mut();
+        }
+        let allocator = &mut *(state.opaque as *mut DynAllocator);
+        let ptr = allocator.calloc(count, size);
+        if ptr.is_null() {
+            return ptr::null_mut();
+        }
+        state.malloc_count += 1;
+        state.malloc_size += (A::usable_size(ptr) + MALLOC_OVERHEAD) as qjs::size_t;
+        ptr as *mut qjs::c_void
+    }
+
     unsafe extern "C" fn malloc<A>(
         state: *mut qjs::JSMallocState,
         size: qjs::size_t,

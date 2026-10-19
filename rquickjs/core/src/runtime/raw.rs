@@ -16,6 +16,76 @@ use rquickjs_sys::JSPromiseHookType;
 
 use super::{opaque::Opaque, InterruptHandler, PromiseHook, PromiseHookType, RejectionTracker};
 
+// Build the flags using `#[cfg]` at compile time
+const fn build_dump_flags() -> u64 {
+    #[allow(unused_mut)]
+    let mut flags: u64 = 0;
+
+    #[cfg(feature = "dump-bytecode")]
+    {
+        flags |= (qjs::JS_DUMP_BYTECODE_FINAL
+            | qjs::JS_DUMP_BYTECODE_PASS2
+            | qjs::JS_DUMP_BYTECODE_PASS1) as u64;
+    }
+
+    #[cfg(feature = "dump-gc")]
+    {
+        flags |= qjs::JS_DUMP_GC as u64;
+    }
+
+    #[cfg(feature = "dump-gc-free")]
+    {
+        flags |= qjs::JS_DUMP_GC_FREE as u64;
+    }
+
+    #[cfg(feature = "dump-free")]
+    {
+        flags |= qjs::JS_DUMP_FREE as u64;
+    }
+
+    #[cfg(feature = "dump-leaks")]
+    {
+        flags |= qjs::JS_DUMP_LEAKS as u64;
+    }
+
+    #[cfg(feature = "dump-mem")]
+    {
+        flags |= qjs::JS_DUMP_MEM as u64;
+    }
+
+    #[cfg(feature = "dump-objects")]
+    {
+        flags |= qjs::JS_DUMP_OBJECTS as u64;
+    }
+
+    #[cfg(feature = "dump-atoms")]
+    {
+        flags |= qjs::JS_DUMP_ATOMS as u64;
+    }
+
+    #[cfg(feature = "dump-shapes")]
+    {
+        flags |= qjs::JS_DUMP_SHAPES as u64;
+    }
+
+    #[cfg(feature = "dump-module-resolve")]
+    {
+        flags |= qjs::JS_DUMP_MODULE_RESOLVE as u64;
+    }
+
+    #[cfg(feature = "dump-promise")]
+    {
+        flags |= qjs::JS_DUMP_PROMISE as u64;
+    }
+
+    #[cfg(feature = "dump-read-object")]
+    {
+        flags |= qjs::JS_DUMP_READ_OBJECT as u64;
+    }
+
+    flags
+}
+
 #[derive(Debug)]
 pub(crate) struct RawRuntime {
     pub(crate) rt: NonNull<qjs::JSRuntime>,
@@ -95,6 +165,8 @@ impl RawRuntime {
 
         let rt = NonNull::new(rt).ok_or(Error::Allocation)?;
 
+        Self::add_dump_flags(rt.as_ptr());
+
         opaque.initialize(rt.as_ptr())?;
 
         let opaque = Box::into_raw(Box::new(opaque));
@@ -127,6 +199,8 @@ impl RawRuntime {
         let rt = qjs::JS_NewRuntime2(&functions, opaque_ptr as _);
 
         let rt = NonNull::new(rt).ok_or(Error::Allocation)?;
+
+        Self::add_dump_flags(rt.as_ptr());
 
         opaque.initialize(rt.as_ptr())?;
 
@@ -194,9 +268,6 @@ impl RawRuntime {
     /// Set a limit on the max amount of memory the runtime will use.
     ///
     /// Setting the limit to 0 is equivalent to unlimited memory.
-    ///
-    /// Note that is a Noop when a custom allocator is being used,
-    /// as is the case for the "rust-alloc" or "allocator" features.
     pub unsafe fn set_memory_limit(&mut self, limit: usize) {
         let limit: size_t = limit.try_into().unwrap_or(size_t::MAX);
         qjs::JS_SetMemoryLimit(self.rt.as_ptr(), limit)
@@ -220,6 +291,11 @@ impl RawRuntime {
     /// Set a memory threshold for garbage collection.
     pub unsafe fn set_gc_threshold(&self, threshold: usize) {
         qjs::JS_SetGCThreshold(self.rt.as_ptr(), threshold as _);
+    }
+
+    /// Set dump flags.
+    pub unsafe fn set_dump_flags(&self, flags: u64) {
+        qjs::JS_SetDumpFlags(self.rt.as_ptr(), flags);
     }
 
     /// Manually run the garbage collection.
@@ -384,13 +460,54 @@ impl RawRuntime {
             qjs::JS_GetRuntimeOpaque(rt.as_ptr()),
         );
     }
+
+    /// Selects the dumps of the enabled `dump-*` features.
+    fn add_dump_flags(rt: *mut qjs::JSRuntime) {
+        unsafe {
+            qjs::JS_SetDumpFlags(rt, build_dump_flags());
+        }
+    }
 }
 
 #[cfg(test)]
 mod test {
     use std::sync::{Arc, Mutex};
 
-    use crate::{Context, Runtime};
+    use crate::{qjs, Context, Runtime};
+
+    fn dump_flags(rt: &Runtime) -> u64 {
+        unsafe { qjs::JS_GetDumpFlags(rt.inner.lock().rt.as_ptr()) }
+    }
+
+    /// The `dump-*` features select the dumps of every new runtime (the engine
+    /// keeps no dump flags without them).
+    #[test]
+    fn dump_flags_of_features() {
+        let rt = Runtime::new().unwrap();
+        assert_eq!(dump_flags(&rt), super::build_dump_flags());
+        #[cfg(feature = "dump-gc")]
+        assert_ne!(dump_flags(&rt) & qjs::JS_DUMP_GC as u64, 0);
+        #[cfg(feature = "dump-bytecode")]
+        assert_ne!(dump_flags(&rt) & qjs::JS_DUMP_BYTECODE_FINAL as u64, 0);
+        // the dumps print while the code runs
+        let context = Context::full(&rt).unwrap();
+        context.with(|ctx| {
+            assert_eq!(ctx.eval::<i32, _>("1 + 2").unwrap(), 3);
+        });
+        rt.run_gc();
+    }
+
+    #[test]
+    fn set_dump_flags() {
+        let rt = Runtime::new().unwrap();
+        let flags = (qjs::JS_DUMP_GC | qjs::JS_DUMP_PROMISE) as u64;
+        rt.set_dump_flags(flags);
+        // the dumps are only compiled in with a `dump-*` feature
+        let dumps_enabled = super::build_dump_flags() != 0;
+        assert_eq!(dump_flags(&rt), if dumps_enabled { flags } else { 0 });
+        rt.set_dump_flags(0);
+        assert_eq!(dump_flags(&rt), 0);
+    }
 
     #[test]
     fn promise_rejection_handler() {

@@ -28,10 +28,9 @@ Added:
   bytecode, `const enum` members are folded; standard or legacy decorators
   (`Runtime::set_decorators`), `using` declarations.
 
-Removed (QuickJS-NG only): runtime dump flags (the `dump-*` features are compile-time `DUMP_*`
-defines of the engine), immutable `ArrayBuffer`s, the `strip_*` module write options and the
-import attributes given to resolvers. The bindings are generated from `quickjs.h` by
-`scripts/gen-bindings.sh`; `wasm32-unknown-unknown` is not supported.
+Removed (QuickJS-NG only): `Value::is_uncatchable_error` (see `Ctx::has_uncatchable_exception`).
+The bindings are generated from `quickjs.h` by `scripts/gen-bindings.sh`;
+`wasm32-unknown-unknown` is not supported.
 
 **QuickJS** is a small and embeddable JavaScript engine. It supports the _ES2020_ specification including modules, asynchronous generators, proxies and BigInt.
 It optionally supports mathematical extensions such as big decimal floating point numbers (BigDecimal), big binary floating point numbers (BigFloat) and operator overloading.
