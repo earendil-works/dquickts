@@ -123,6 +123,11 @@ pub unsafe fn JS_IsObject(v: JSValue) -> bool {
 }
 
 #[inline]
+pub unsafe fn JS_IsModule(v: JSValue) -> bool {
+    JS_VALUE_GET_TAG(v) == JS_TAG_MODULE
+}
+
+#[inline]
 unsafe fn __js_rc(v: JSValue) -> *mut JSRefCountHeader {
     (JS_VALUE_GET_PTR(v) as *mut u32).sub(1) as *mut JSRefCountHeader
 }
@@ -182,6 +187,11 @@ pub unsafe fn JS_ToCStringLen(
     val: JSValue,
 ) -> *const c_char {
     JS_ToCStringLen2(ctx, plen as _, val, 0)
+}
+
+#[inline]
+pub unsafe fn JS_ToCStringUTF16(ctx: *mut JSContext, val: JSValue) -> *const u16 {
+    JS_ToCStringLenUTF16(ctx, ptr::null_mut(), val)
 }
 
 #[inline]

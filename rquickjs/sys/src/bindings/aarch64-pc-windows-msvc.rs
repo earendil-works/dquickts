@@ -171,6 +171,29 @@ pub const JS_EVAL_FLAG_ASYNC: u32 = 128;
 pub const JS_EVAL_FLAG_TYPESCRIPT: u32 = 256;
 pub const JS_EVAL_FLAG_TS_LEGACY_DECORATORS: u32 = 512;
 pub const JS_EVAL_FLAG_TS_DECORATOR_METADATA: u32 = 1024;
+pub const JS_EVAL_OPTIONS_VERSION: u32 = 1;
+pub const JS_DUMP_BYTECODE_FINAL: u32 = 1;
+pub const JS_DUMP_BYTECODE_PASS2: u32 = 2;
+pub const JS_DUMP_BYTECODE_PASS1: u32 = 4;
+pub const JS_DUMP_BYTECODE_HEX: u32 = 16;
+pub const JS_DUMP_BYTECODE_PC2LINE: u32 = 32;
+pub const JS_DUMP_BYTECODE_STACK: u32 = 64;
+pub const JS_DUMP_READ_OBJECT: u32 = 256;
+pub const JS_DUMP_FREE: u32 = 512;
+pub const JS_DUMP_GC: u32 = 1024;
+pub const JS_DUMP_GC_FREE: u32 = 2048;
+pub const JS_DUMP_MODULE_RESOLVE: u32 = 4096;
+pub const JS_DUMP_PROMISE: u32 = 8192;
+pub const JS_DUMP_LEAKS: u32 = 16384;
+pub const JS_DUMP_ATOM_LEAKS: u32 = 32768;
+pub const JS_DUMP_MEM: u32 = 65536;
+pub const JS_DUMP_OBJECTS: u32 = 131072;
+pub const JS_DUMP_ATOMS: u32 = 262144;
+pub const JS_DUMP_SHAPES: u32 = 524288;
+pub const JS_ABORT_ON_LEAKS: u32 = 1097728;
+pub const JS_DUMP_MODULE_EXEC: u32 = 2097152;
+pub const JS_DUMP_CLOSURE: u32 = 4194304;
+pub const JS_DUMP_ROPE_REBALANCE: u32 = 8388608;
 pub const JS_ATOM_NULL: u32 = 0;
 pub const JS_CALL_FLAG_CONSTRUCTOR: u32 = 1;
 pub const JS_INVALID_CLASS_ID: u32 = 0;
@@ -189,6 +212,8 @@ pub const JS_WRITE_OBJ_BYTECODE: u32 = 1;
 pub const JS_WRITE_OBJ_BSWAP: u32 = 2;
 pub const JS_WRITE_OBJ_SAB: u32 = 4;
 pub const JS_WRITE_OBJ_REFERENCE: u32 = 8;
+pub const JS_WRITE_OBJ_STRIP_SOURCE: u32 = 16;
+pub const JS_WRITE_OBJ_STRIP_DEBUG: u32 = 32;
 pub const JS_READ_OBJ_BYTECODE: u32 = 1;
 pub const JS_READ_OBJ_ROM_DATA: u32 = 2;
 pub const JS_READ_OBJ_SAB: u32 = 4;
@@ -292,6 +317,27 @@ const _: () = {
     ["Offset of field: JSValue::u"][::core::mem::offset_of!(JSValue, u) - 0usize];
     ["Offset of field: JSValue::tag"][::core::mem::offset_of!(JSValue, tag) - 8usize];
 };
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct JSEvalOptions {
+    pub version: ::core::ffi::c_int,
+    pub eval_flags: ::core::ffi::c_int,
+    pub filename: *const ::core::ffi::c_char,
+    pub line_num: ::core::ffi::c_int,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of JSEvalOptions"][::core::mem::size_of::<JSEvalOptions>() - 24usize];
+    ["Alignment of JSEvalOptions"][::core::mem::align_of::<JSEvalOptions>() - 8usize];
+    ["Offset of field: JSEvalOptions::version"]
+        [::core::mem::offset_of!(JSEvalOptions, version) - 0usize];
+    ["Offset of field: JSEvalOptions::eval_flags"]
+        [::core::mem::offset_of!(JSEvalOptions, eval_flags) - 4usize];
+    ["Offset of field: JSEvalOptions::filename"]
+        [::core::mem::offset_of!(JSEvalOptions, filename) - 8usize];
+    ["Offset of field: JSEvalOptions::line_num"]
+        [::core::mem::offset_of!(JSEvalOptions, line_num) - 16usize];
+};
 pub type JSCFunction = ::core::option::Option<
     unsafe extern "C" fn(
         ctx: *mut JSContext,
@@ -319,6 +365,16 @@ pub type JSCFunctionData = ::core::option::Option<
         func_data: *mut JSValue,
     ) -> JSValue,
 >;
+pub type JSCClosure = ::core::option::Option<
+    unsafe extern "C" fn(
+        ctx: *mut JSContext,
+        this_val: JSValue,
+        argc: ::core::ffi::c_int,
+        argv: *mut JSValue,
+        magic: ::core::ffi::c_int,
+        opaque: *mut ::core::ffi::c_void,
+    ) -> JSValue,
+>;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct JSMallocState {
@@ -343,6 +399,13 @@ const _: () = {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct JSMallocFunctions {
+    pub js_calloc: ::core::option::Option<
+        unsafe extern "C" fn(
+            s: *mut JSMallocState,
+            count: size_t,
+            size: size_t,
+        ) -> *mut ::core::ffi::c_void,
+    >,
     pub js_malloc: ::core::option::Option<
         unsafe extern "C" fn(s: *mut JSMallocState, size: size_t) -> *mut ::core::ffi::c_void,
     >,
@@ -361,17 +424,21 @@ pub struct JSMallocFunctions {
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of JSMallocFunctions"][::core::mem::size_of::<JSMallocFunctions>() - 32usize];
+    ["Size of JSMallocFunctions"][::core::mem::size_of::<JSMallocFunctions>() - 40usize];
     ["Alignment of JSMallocFunctions"][::core::mem::align_of::<JSMallocFunctions>() - 8usize];
+    ["Offset of field: JSMallocFunctions::js_calloc"]
+        [::core::mem::offset_of!(JSMallocFunctions, js_calloc) - 0usize];
     ["Offset of field: JSMallocFunctions::js_malloc"]
-        [::core::mem::offset_of!(JSMallocFunctions, js_malloc) - 0usize];
+        [::core::mem::offset_of!(JSMallocFunctions, js_malloc) - 8usize];
     ["Offset of field: JSMallocFunctions::js_free"]
-        [::core::mem::offset_of!(JSMallocFunctions, js_free) - 8usize];
+        [::core::mem::offset_of!(JSMallocFunctions, js_free) - 16usize];
     ["Offset of field: JSMallocFunctions::js_realloc"]
-        [::core::mem::offset_of!(JSMallocFunctions, js_realloc) - 16usize];
+        [::core::mem::offset_of!(JSMallocFunctions, js_realloc) - 24usize];
     ["Offset of field: JSMallocFunctions::js_malloc_usable_size"]
-        [::core::mem::offset_of!(JSMallocFunctions, js_malloc_usable_size) - 24usize];
+        [::core::mem::offset_of!(JSMallocFunctions, js_malloc_usable_size) - 32usize];
 };
+pub type JSRuntimeFinalizer =
+    ::core::option::Option<unsafe extern "C" fn(rt: *mut JSRuntime, arg: *mut ::core::ffi::c_void)>;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct JSGCObjectHeader {
@@ -385,6 +452,15 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn JS_SetMemoryLimit(rt: *mut JSRuntime, limit: size_t);
+}
+unsafe extern "C" {
+    pub fn JS_SetDumpFlags(rt: *mut JSRuntime, flags: u64);
+}
+unsafe extern "C" {
+    pub fn JS_GetDumpFlags(rt: *mut JSRuntime) -> u64;
+}
+unsafe extern "C" {
+    pub fn JS_GetGCThreshold(rt: *mut JSRuntime) -> size_t;
 }
 unsafe extern "C" {
     pub fn JS_SetGCThreshold(rt: *mut JSRuntime, gc_threshold: size_t);
@@ -409,6 +485,13 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn JS_SetRuntimeOpaque(rt: *mut JSRuntime, opaque: *mut ::core::ffi::c_void);
+}
+unsafe extern "C" {
+    pub fn JS_AddRuntimeFinalizer(
+        rt: *mut JSRuntime,
+        finalizer: JSRuntimeFinalizer,
+        arg: *mut ::core::ffi::c_void,
+    ) -> ::core::ffi::c_int;
 }
 pub type JS_MarkFunc =
     ::core::option::Option<unsafe extern "C" fn(rt: *mut JSRuntime, gp: *mut JSGCObjectHeader)>;
@@ -518,12 +601,22 @@ unsafe extern "C" {
     pub fn JS_AddIntrinsicAToB(ctx: *mut JSContext) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    pub fn JS_AddPerformance(ctx: *mut JSContext) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn js_string_codePointRange(
         ctx: *mut JSContext,
         this_val: JSValue,
         argc: ::core::ffi::c_int,
         argv: *mut JSValue,
     ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn js_calloc_rt(
+        rt: *mut JSRuntime,
+        count: size_t,
+        size: size_t,
+    ) -> *mut ::core::ffi::c_void;
 }
 unsafe extern "C" {
     pub fn js_malloc_rt(rt: *mut JSRuntime, size: size_t) -> *mut ::core::ffi::c_void;
@@ -543,6 +636,9 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn js_mallocz_rt(rt: *mut JSRuntime, size: size_t) -> *mut ::core::ffi::c_void;
+}
+unsafe extern "C" {
+    pub fn js_calloc(ctx: *mut JSContext, count: size_t, size: size_t) -> *mut ::core::ffi::c_void;
 }
 unsafe extern "C" {
     pub fn js_malloc(ctx: *mut JSContext, size: size_t) -> *mut ::core::ffi::c_void;
@@ -902,6 +998,9 @@ unsafe extern "C" {
     pub fn JS_IsRegisteredClass(rt: *mut JSRuntime, class_id: JSClassID) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    pub fn JS_GetClassName(rt: *mut JSRuntime, class_id: JSClassID) -> JSAtom;
+}
+unsafe extern "C" {
     pub fn JS_NewBigInt64(ctx: *mut JSContext, v: i64) -> JSValue;
 }
 unsafe extern "C" {
@@ -927,6 +1026,32 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn JS_NewError(ctx: *mut JSContext) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_NewSyntaxError(ctx: *mut JSContext, fmt: *const ::core::ffi::c_char, ...) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_NewTypeError(ctx: *mut JSContext, fmt: *const ::core::ffi::c_char, ...) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_NewReferenceError(
+        ctx: *mut JSContext,
+        fmt: *const ::core::ffi::c_char,
+        ...
+    ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_NewRangeError(ctx: *mut JSContext, fmt: *const ::core::ffi::c_char, ...) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_NewInternalError(
+        ctx: *mut JSContext,
+        fmt: *const ::core::ffi::c_char,
+        ...
+    ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_NewPlainError(ctx: *mut JSContext, fmt: *const ::core::ffi::c_char, ...) -> JSValue;
 }
 unsafe extern "C" {
     pub fn JS_ThrowSyntaxError(
@@ -993,10 +1118,16 @@ unsafe extern "C" {
     pub fn JS_ToObject(ctx: *mut JSContext, val: JSValue) -> JSValue;
 }
 unsafe extern "C" {
+    pub fn JS_ToObjectString(ctx: *mut JSContext, val: JSValue) -> JSValue;
+}
+unsafe extern "C" {
     pub fn JS_ToPrimitive(ctx: *mut JSContext, val: JSValue, hint: ::core::ffi::c_int) -> JSValue;
 }
 unsafe extern "C" {
     pub fn JS_ToBool(ctx: *mut JSContext, val: JSValue) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn JS_ToNumber(ctx: *mut JSContext, val: JSValue) -> JSValue;
 }
 unsafe extern "C" {
     pub fn JS_ToInt32(ctx: *mut JSContext, pres: *mut i32, val: JSValue) -> ::core::ffi::c_int;
@@ -1053,6 +1184,9 @@ unsafe extern "C" {
     ) -> JSValue;
 }
 unsafe extern "C" {
+    pub fn JS_NewStringUTF16(ctx: *mut JSContext, buf: *const u16, len: size_t) -> JSValue;
+}
+unsafe extern "C" {
     pub fn JS_NewAtomString(ctx: *mut JSContext, str_: *const ::core::ffi::c_char) -> JSValue;
 }
 unsafe extern "C" {
@@ -1073,10 +1207,23 @@ unsafe extern "C" {
     pub fn JS_ToCStringNZ(ctx: *mut JSContext, val1: JSValue) -> *const ::core::ffi::c_char;
 }
 unsafe extern "C" {
+    pub fn JS_ToCStringLenUTF16(
+        ctx: *mut JSContext,
+        plen: *mut size_t,
+        val1: JSValue,
+    ) -> *const u16;
+}
+unsafe extern "C" {
     pub fn JS_FreeCString(ctx: *mut JSContext, ptr: *const ::core::ffi::c_char);
 }
 unsafe extern "C" {
     pub fn JS_FreeCStringRT(rt: *mut JSRuntime, ptr: *const ::core::ffi::c_char);
+}
+unsafe extern "C" {
+    pub fn JS_FreeCStringUTF16(ctx: *mut JSContext, ptr: *const u16);
+}
+unsafe extern "C" {
+    pub fn JS_FreeCStringRT_UTF16(rt: *mut JSRuntime, ptr: *const u16);
 }
 unsafe extern "C" {
     pub fn JS_ToUTF32String(
@@ -1090,6 +1237,12 @@ unsafe extern "C" {
         ctx: *mut JSContext,
         description: *const ::core::ffi::c_char,
         is_global: ::core::ffi::c_int,
+    ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_NewPrivateSymbol(
+        ctx: *mut JSContext,
+        description: *const ::core::ffi::c_char,
     ) -> JSValue;
 }
 unsafe extern "C" {
@@ -1164,6 +1317,9 @@ unsafe extern "C" {
     pub fn JS_GetLength(ctx: *mut JSContext, obj: JSValue, pres: *mut i64) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    pub fn JS_SetLength(ctx: *mut JSContext, obj: JSValue, len: i64) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn JS_IsRegExp(val: JSValue) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
@@ -1174,6 +1330,15 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn JS_IsWeakRef(val: JSValue) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn JS_IsWeakMap(val: JSValue) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn JS_IsWeakSet(val: JSValue) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn JS_IsDataView(val: JSValue) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
     pub fn JS_NewDate(ctx: *mut JSContext, epoch_ms: f64) -> JSValue;
@@ -1206,6 +1371,12 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn JS_GetPropertyUint32(ctx: *mut JSContext, this_obj: JSValue, idx: u32) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_GetPropertyInt64(ctx: *mut JSContext, this_obj: JSValue, idx: i64) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_GetPropertyValue(ctx: *mut JSContext, this_obj: JSValue, prop: JSValue) -> JSValue;
 }
 unsafe extern "C" {
     pub fn JS_SetPropertyInternal(
@@ -1242,6 +1413,15 @@ unsafe extern "C" {
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    pub fn JS_SetPropertyValue(
+        ctx: *mut JSContext,
+        this_obj: JSValue,
+        prop: JSValue,
+        val: JSValue,
+        flags: ::core::ffi::c_int,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn JS_HasProperty(
         ctx: *mut JSContext,
         this_obj: JSValue,
@@ -1253,6 +1433,12 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn JS_PreventExtensions(ctx: *mut JSContext, obj: JSValue) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn JS_SealObject(ctx: *mut JSContext, obj: JSValue) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn JS_FreezeObject(ctx: *mut JSContext, obj: JSValue) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
     pub fn JS_DeleteProperty(
@@ -1350,6 +1536,23 @@ unsafe extern "C" {
         input_len: size_t,
         filename: *const ::core::ffi::c_char,
         eval_flags: ::core::ffi::c_int,
+    ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_Eval2(
+        ctx: *mut JSContext,
+        input: *const ::core::ffi::c_char,
+        input_len: size_t,
+        options: *mut JSEvalOptions,
+    ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_EvalThis2(
+        ctx: *mut JSContext,
+        this_obj: JSValue,
+        input: *const ::core::ffi::c_char,
+        input_len: size_t,
+        options: *mut JSEvalOptions,
     ) -> JSValue;
 }
 unsafe extern "C" {
@@ -1486,6 +1689,15 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn JS_IsArrayBuffer(val: JSValue) -> ::core::ffi::c_int;
 }
+unsafe extern "C" {
+    pub fn JS_IsImmutableArrayBuffer(obj: JSValue) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn JS_SetImmutableArrayBuffer(
+        obj: JSValue,
+        immutable: ::core::ffi::c_int,
+    ) -> ::core::ffi::c_int;
+}
 pub const JSTypedArrayEnum_JS_TYPED_ARRAY_UINT8C: JSTypedArrayEnum = 0;
 pub const JSTypedArrayEnum_JS_TYPED_ARRAY_INT8: JSTypedArrayEnum = 1;
 pub const JSTypedArrayEnum_JS_TYPED_ARRAY_UINT8: JSTypedArrayEnum = 2;
@@ -1518,6 +1730,22 @@ unsafe extern "C" {
         pbyte_length: *mut size_t,
         pbytes_per_element: *mut size_t,
     ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_NewUint8Array(
+        ctx: *mut JSContext,
+        buf: *mut u8,
+        len: size_t,
+        free_func: JSFreeArrayBufferDataFunc,
+        opaque: *mut ::core::ffi::c_void,
+        is_shared: ::core::ffi::c_int,
+    ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_NewUint8ArrayCopy(ctx: *mut JSContext, buf: *const u8, len: size_t) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_GetUint8Array(ctx: *mut JSContext, psize: *mut size_t, obj: JSValue) -> *mut u8;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -1694,6 +1922,15 @@ pub type JSModuleNormalizeFunc = ::core::option::Option<
         opaque: *mut ::core::ffi::c_void,
     ) -> *mut ::core::ffi::c_char,
 >;
+pub type JSModuleNormalizeFunc2 = ::core::option::Option<
+    unsafe extern "C" fn(
+        ctx: *mut JSContext,
+        module_base_name: *const ::core::ffi::c_char,
+        module_name: *const ::core::ffi::c_char,
+        attributes: JSValue,
+        opaque: *mut ::core::ffi::c_void,
+    ) -> *mut ::core::ffi::c_char,
+>;
 pub type JSModuleLoaderFunc = ::core::option::Option<
     unsafe extern "C" fn(
         ctx: *mut JSContext,
@@ -1732,6 +1969,9 @@ unsafe extern "C" {
         module_check_attrs: JSModuleCheckSupportedImportAttributes,
         opaque: *mut ::core::ffi::c_void,
     );
+}
+unsafe extern "C" {
+    pub fn JS_SetModuleNormalizeFunc2(rt: *mut JSRuntime, module_normalize: JSModuleNormalizeFunc2);
 }
 unsafe extern "C" {
     pub fn JS_GetImportMeta(ctx: *mut JSContext, m: *mut JSModuleDef) -> JSValue;
@@ -1793,6 +2033,16 @@ unsafe extern "C" {
         buf: *const u8,
         buf_len: size_t,
         flags: ::core::ffi::c_int,
+    ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_ReadObject2(
+        ctx: *mut JSContext,
+        buf: *const u8,
+        buf_len: size_t,
+        flags: ::core::ffi::c_int,
+        psab_tab: *mut *mut *mut u8,
+        psab_tab_len: *mut size_t,
     ) -> JSValue;
 }
 unsafe extern "C" {
@@ -2035,6 +2285,18 @@ unsafe extern "C" {
     ) -> JSValue;
 }
 unsafe extern "C" {
+    pub fn JS_NewCFunction3(
+        ctx: *mut JSContext,
+        func: JSCFunction,
+        name: *const ::core::ffi::c_char,
+        length: ::core::ffi::c_int,
+        cproto: JSCFunctionEnum,
+        magic: ::core::ffi::c_int,
+        proto_val: JSValue,
+        n_fields: ::core::ffi::c_int,
+    ) -> JSValue;
+}
+unsafe extern "C" {
     pub fn JS_NewCFunctionData(
         ctx: *mut JSContext,
         func: JSCFunctionData,
@@ -2042,6 +2304,30 @@ unsafe extern "C" {
         magic: ::core::ffi::c_int,
         data_len: ::core::ffi::c_int,
         data: *mut JSValue,
+    ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_NewCFunctionData2(
+        ctx: *mut JSContext,
+        func: JSCFunctionData,
+        name: *const ::core::ffi::c_char,
+        length: ::core::ffi::c_int,
+        magic: ::core::ffi::c_int,
+        data_len: ::core::ffi::c_int,
+        data: *mut JSValue,
+    ) -> JSValue;
+}
+pub type JSCClosureFinalizerFunc =
+    ::core::option::Option<unsafe extern "C" fn(opaque: *mut ::core::ffi::c_void)>;
+unsafe extern "C" {
+    pub fn JS_NewCClosure(
+        ctx: *mut JSContext,
+        func: JSCClosure,
+        name: *const ::core::ffi::c_char,
+        opaque_finalize: JSCClosureFinalizerFunc,
+        length: ::core::ffi::c_int,
+        magic: ::core::ffi::c_int,
+        opaque: *mut ::core::ffi::c_void,
     ) -> JSValue;
 }
 unsafe extern "C" {
@@ -2070,6 +2356,7 @@ pub union JSCFunctionListEntry__bindgen_ty_1 {
     pub str_: *const ::core::ffi::c_char,
     pub i32_: i32,
     pub i64_: i64,
+    pub u64_: u64,
     pub f64_: f64,
 }
 #[repr(C)]
@@ -2167,6 +2454,8 @@ const _: () = {
         [::core::mem::offset_of!(JSCFunctionListEntry__bindgen_ty_1, i32_) - 0usize];
     ["Offset of field: JSCFunctionListEntry__bindgen_ty_1::i64_"]
         [::core::mem::offset_of!(JSCFunctionListEntry__bindgen_ty_1, i64_) - 0usize];
+    ["Offset of field: JSCFunctionListEntry__bindgen_ty_1::u64_"]
+        [::core::mem::offset_of!(JSCFunctionListEntry__bindgen_ty_1, u64_) - 0usize];
     ["Offset of field: JSCFunctionListEntry__bindgen_ty_1::f64_"]
         [::core::mem::offset_of!(JSCFunctionListEntry__bindgen_ty_1, f64_) - 0usize];
 };
