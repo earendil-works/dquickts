@@ -1,0 +1,154 @@
+# Builds and publishes @earendil-works/dquickts (js/):
+#
+# - every push to master: a preview build on pkg.earendil.com, moving its `master` ref. pkg.earendil.com only accepts
+#   uploads authenticated with the OIDC token of this workflow on master, for the packages listed for this repository
+#   in earendil-works/pkg (src/config.ts).
+# - every js-v<version> tag: a release on npm, through npm trusted publishing (OIDC, with provenance). The tag must
+#   match the version in js/package.json. npm only accepts it from this workflow file in the `npm` environment.
+#
+# The build job runs the code and has no id-token; the publish jobs only upload the packed tarball.
+
+name: package
+
+on:
+  push:
+    branches: [master]
+    tags: ['js-v*']
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Check the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(jq -r .version js/package.json)
+          if [ "$TAG" != "js-v$version" ]; then
+            echo "::error::Tag $TAG does not match js/package.json version $version (expected js-v$version)"
+            exit 1
+          fi
+
+      - name: Cache wasi-sdk
+        id: wasi-sdk
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/wasi-sdk
+          key: wasi-sdk-32-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install wasi-sdk
+        if: steps.wasi-sdk.outputs.cache-hit != 'true'
+        run: make -C js setup
+
+      - name: Build quickjs.wasm
+        run: make -C js -j"$(getconf _NPROCESSORS_ONLN)"
+
+      - name: Build and test the bindings
+        working-directory: js
+        run: |
+          npm ci --ignore-scripts
+          npm run build:ts
+          npm test
+
+      - name: Pack
+        working-directory: js
+        run: |
+          mkdir -p "$RUNNER_TEMP/package"
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/package"
+
+      - name: Upload the package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package
+          path: ${{ runner.temp }}/package
+          retention-days: 7
+          if-no-files-found: error
+
+  pkg:
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # authenticate to pkg.earendil.com
+    steps:
+      - name: Download the package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package
+          path: ${{ runner.temp }}/package
+
+      - name: Publish to pkg.earendil.com
+        env:
+          DIR: ${{ runner.temp }}/package
+          PACKAGE: "@earendil-works/dquickts"
+          BASE_URL: https://pkg.earendil.com
+        run: |
+          set -euo pipefail
+          file=$(ls "$DIR"/*.tgz)
+          token=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BASE_URL" | jq -r .value)
+          echo "::add-mask::$token"
+          name=$(jq -rn --arg name "$PACKAGE" '$name | @uri')
+          curl -sS --fail-with-body -X PUT -H "Authorization: Bearer $token" --data-binary "@$file" \
+            "$BASE_URL/_/upload/$GITHUB_SHA/$name?event=push"
+          echo
+          jq -n --arg sha "$GITHUB_SHA" --argjson run "$GITHUB_RUN_ID" '{ sha: $sha, refs: ["master"], run: $run }' |
+            curl -sS --fail-with-body -X POST -H "Authorization: Bearer $token" --data-binary @- "$BASE_URL/_/refs"
+          echo
+          {
+            echo "### Preview package"
+            echo
+            echo '```sh'
+            echo "npm i $BASE_URL/$PACKAGE@master   # latest build of master"
+            echo "npm i $BASE_URL/$PACKAGE@$GITHUB_SHA"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  npm:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/js-v')
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write # npm trusted publishing and provenance
+    steps:
+      - name: Download the package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package
+          path: ${{ runner.temp }}/package
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm for trusted publishing
+        run: |
+          npm install -g npm@11.16.0 --ignore-scripts
+          npm --version
+
+      - name: Publish to npm
+        env:
+          DIR: ${{ runner.temp }}/package
+        run: |
+          set -euo pipefail
+          file=$(ls "$DIR"/*.tgz)
+          npm publish "$file" --access public --provenance --ignore-scripts

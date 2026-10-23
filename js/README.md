@@ -13,6 +13,50 @@ npm run build:ts
 npm test
 ```
 
+## Install
+
+```sh
+npm i @earendil-works/dquickts
+```
+
+Every push to `master` of [earendil-works/dquickts](https://github.com/earendil-works/dquickts)
+also publishes a preview build to [pkg.earendil.com](https://github.com/earendil-works/pkg).
+After `npm login --registry=https://pkg.earendil.com`:
+
+```sh
+npm i https://pkg.earendil.com/@earendil-works/dquickts@master    # latest build of master
+npm i https://pkg.earendil.com/@earendil-works/dquickts@<sha>     # one commit; use this with lockfiles
+```
+
+Preview builds expire 30 days after upload.
+
+## Releasing
+
+`.github/workflows/package.yml` publishes to npm when a `js-v<version>` tag is pushed, with npm
+trusted publishing (no token) and provenance:
+
+1. Set the new version in `package.json` (and `package-lock.json`, e.g. with
+   `npm version 0.2.0 --no-git-tag-version`) and in `VERSION` in `src/index.ts`; the tests check
+   that they match.
+2. Commit, then tag and push: `git tag js-v0.2.0 && git push origin master js-v0.2.0`.
+
+The workflow fails if the tag does not match `package.json`.
+
+npm only lets trusted publishers publish packages that already exist, so the very first version
+is published by hand, by a member of the `earendil-works` npm organization with 2FA, after which
+trusted publishing is set up:
+
+```sh
+make -C js && (cd js && npm ci && npm run build:ts && npm test)
+cd js && npm publish --access public
+npm trust github @earendil-works/dquickts --repo earendil-works/dquickts \
+  --file package.yml --env npm --allow-publish
+```
+
+Then disallow token publishing in the package settings on npmjs.com.
+
+## Build variants
+
 `make CONFIG_TEMPORAL_INTL=y` includes the experimental Temporal and Intl objects (enable them
 with `Intrinsics.TEMPORAL | Intrinsics.INTL`). `make OPT=-O2` is a few percent faster and about
 40% larger.
@@ -21,9 +65,9 @@ with `Intrinsics.TEMPORAL | Intrinsics.INTL`). `make OPT=-O2` is a few percent f
 
 ```ts
 import { readFile } from "node:fs/promises";
-import { EvalFlags, QuickJS } from "dquickts";
+import { EvalFlags, QuickJS } from "@earendil-works/dquickts";
 
-const wasm = await WebAssembly.compile(await readFile(new URL(import.meta.resolve("dquickts/quickjs.wasm"))));
+const wasm = await WebAssembly.compile(await readFile(new URL(import.meta.resolve("@earendil-works/dquickts/quickjs.wasm"))));
 const vm = await QuickJS.create({
   wasm,
   memoryLimit: 64 * 1024 * 1024,
@@ -41,7 +85,7 @@ vm.dispose();
 ```
 
 Pass the compiled `WebAssembly.Module` to every `QuickJS.create()`: it compiles once and can be
-sent to workers. On Cloudflare, import `dquickts/quickjs.wasm` with Wrangler's `CompiledWasm`
+sent to workers. On Cloudflare, import `@earendil-works/dquickts/quickjs.wasm` with Wrangler's `CompiledWasm`
 rule.
 
 ## API

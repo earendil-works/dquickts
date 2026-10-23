@@ -1,5 +1,5 @@
 {
-	"name": "dquickts",
+	"name": "@earendil-works/dquickts",
 	"version": "0.1.0",
 	"description": "dquickts (QuickJS with TypeScript and durable execution) compiled to WebAssembly, with JavaScript bindings",
 	"type": "module",
@@ -28,7 +28,7 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/stencil-hq/dquickts.git",
+		"url": "git+https://github.com/earendil-works/dquickts.git",
 		"directory": "js"
 	},
 	"engines": {

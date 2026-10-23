@@ -41,6 +41,34 @@ jobs:
           make test2-bootstrap
           make test2
 
+  wasm:
+    name: WebAssembly and JavaScript bindings (js/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Cache wasi-sdk
+        id: wasi-sdk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/wasi-sdk
+          key: wasi-sdk-32-${{ runner.os }}-${{ runner.arch }}
+      - name: Install wasi-sdk
+        if: steps.wasi-sdk.outputs.cache-hit != 'true'
+        run: |
+          make -C js setup
+      - name: Build
+        run: |
+          make -C js -j$(getconf _NPROCESSORS_ONLN)
+      - name: Test
+        working-directory: js
+        run: |
+          npm ci --ignore-scripts
+          npm run build:ts
+          npm test
+
   linux-lto:
     name: Linux LTO
     runs-on: ubuntu-latest

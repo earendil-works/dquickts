@@ -35,6 +35,8 @@ describe("evaluation", () => {
 		const ts = "enum Color { Red = 1, Green }\nconst c: Color = Color.Green;\nc satisfies number";
 		assert.equal(vm.evalCode(ts, "a.ts", EvalFlags.TYPESCRIPT).toNumber(), 2);
 		assert.equal(vm.versions.quickjs, readFileSync(new URL("../../VERSION", import.meta.url), "utf8").trim());
+		const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+		assert.equal(vm.versions.dquickts, pkg.version, "VERSION in src/index.ts must match package.json");
 	});
 
 	it("converts values", async () => {
