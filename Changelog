@@ -19,6 +19,9 @@ unreleased:
   and JS_PromiseMarkAsHandled()
 - added rquickjs/: the rquickjs Rust bindings built on this engine, with
   suspension, snapshots and the optional snapshot()/restore() builtins
+- added js/: a WebAssembly build (wasi-sdk, WASI reactor) with
+  JavaScript bindings modeled on quickjs-wasi; the engine builds for
+  wasm32-wasip1 (no Atomics there, dtoa.c no longer includes setjmp.h)
 - added TypeScript (JS_EVAL_FLAG_TYPESCRIPT; .ts/.mts/.cts files in qjs,
   qjsc and the module loader, qjs --typescript): types are erased while
   parsing; enums, namespaces and parameter properties are compiled to

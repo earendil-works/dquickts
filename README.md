@@ -35,6 +35,7 @@ make test-snapshot   # builds and runs the suspension and snapshot test hosts
   - [Limitations](#limitations)
 - [TypeScript](#typescript)
 - [Rust bindings](#rust-bindings)
+- [JavaScript bindings](#javascript-bindings)
 - [Testing](#testing)
 - [Documentation](#documentation)
 - [Credits and license](#credits-and-license)
@@ -58,6 +59,7 @@ fork adds:
 | Embedder helpers | `JS_IsEqual()`, `JS_NewProxy()`, `JS_GetProxyTarget()`, `JS_PromiseMarkAsHandled()`, and others |
 | A REPL whose functions and variables survive restarts | `qjs --drepl FILE` |
 | Rust bindings built on this engine | [`rquickjs/`](rquickjs/README.md) |
+| A WebAssembly build with JavaScript bindings | [`js/`](js/README.md) |
 
 The full list is under `unreleased` in [`Changelog`](Changelog).
 
@@ -619,6 +621,23 @@ assert_eq!(total, 5);
 The crates are not published to crates.io. The rquickjs [README](rquickjs/README.md) lists what
 was removed (QuickJS-NG-only APIs) and the supported targets.
 
+## JavaScript bindings
+
+[`js/`](js/README.md) builds the engine with wasi-sdk into `quickjs.wasm`, a WASI reactor module
+that runs in Node, Bun, browsers and Cloudflare Workers, and wraps it in a TypeScript API that
+follows [quickjs-wasi](https://github.com/vercel-labs/quickjs-wasi): one VM per wasm instance,
+value handles, host functions, a memory limit, an interrupt handler, and TypeScript through
+`EvalFlags.TYPESCRIPT`.
+
+```ts
+const vm = await QuickJS.create({ wasm, memoryLimit: 64 << 20 });
+const result = vm.evalCode("const n: number = 2; n * 21", "main.ts", EvalFlags.TYPESCRIPT);
+result.toNumber(); // 42
+```
+
+The [README](js/README.md) lists how the bindings differ from quickjs-wasi. They do not expose
+snapshots yet.
+
 ## Testing
 
 ```sh
@@ -628,6 +647,7 @@ make -C tests/snapshot ASAN=1 check   # the same, under AddressSanitizer and UBS
 make -C tests/snapshot stress     # suspend every 97 branches across the upstream test suite
 make test2-bootstrap && make test2    # test262
 (cd rquickjs && cargo test)       # Rust bindings
+make -C js setup && make -C js test   # WebAssembly build and JavaScript bindings
 ```
 
 `tests/snapshot` contains these hosts:
@@ -649,6 +669,7 @@ make test2-bootstrap && make test2    # test262
   and PDF versions.
 - [`Changelog`](Changelog): everything added since upstream `2026-06-04`.
 - [`rquickjs/README.md`](rquickjs/README.md): the Rust bindings.
+- [`js/README.md`](js/README.md): the WebAssembly build and JavaScript bindings.
 
 ## Credits and license
 

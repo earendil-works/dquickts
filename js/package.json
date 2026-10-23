@@ -1,0 +1,41 @@
+{
+	"name": "dquickts",
+	"version": "0.1.0",
+	"description": "dquickts (QuickJS with TypeScript and durable execution) compiled to WebAssembly, with JavaScript bindings",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./quickjs.wasm": "./quickjs.wasm",
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"dist",
+		"quickjs.wasm",
+		"README.md"
+	],
+	"scripts": {
+		"build:wasm": "make",
+		"build:ts": "tsc -p tsconfig.json",
+		"build": "make && tsc -p tsconfig.json",
+		"test": "node --test test/*.test.ts",
+		"prepack": "npm run build"
+	},
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/stencil-hq/dquickts.git",
+		"directory": "js"
+	},
+	"engines": {
+		"node": ">=22.18.0"
+	},
+	"devDependencies": {
+		"@types/node": "^22.19.0",
+		"typescript": "^5.9.3"
+	}
+}
