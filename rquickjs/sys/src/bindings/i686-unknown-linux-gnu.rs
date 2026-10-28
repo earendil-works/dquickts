@@ -1843,6 +1843,9 @@ unsafe extern "C" {
     ) -> JSInterruptHandler;
 }
 unsafe extern "C" {
+    pub fn JS_TriggerInterruptHandler(ctx: *mut JSContext);
+}
+unsafe extern "C" {
     pub fn JS_RequestSuspend(rt: *mut JSRuntime);
 }
 unsafe extern "C" {
@@ -2017,6 +2020,17 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn JS_ResolveModule(ctx: *mut JSContext, obj: JSValue) -> ::core::ffi::c_int;
+}
+pub type JSCodeNameFunc = ::core::option::Option<
+    unsafe extern "C" fn(ctx: *mut JSContext, name: JSAtom, opaque: *mut ::core::ffi::c_void),
+>;
+unsafe extern "C" {
+    pub fn JS_EnumCodeNames(
+        ctx: *mut JSContext,
+        obj: JSValue,
+        func: JSCodeNameFunc,
+        opaque: *mut ::core::ffi::c_void,
+    ) -> ::core::ffi::c_int;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -2538,6 +2552,13 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn JS_GetModulePrivateValue(ctx: *mut JSContext, m: *mut JSModuleDef) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_SetModuleAttributes(
+        ctx: *mut JSContext,
+        m: *mut JSModuleDef,
+        attributes: JSValue,
+    ) -> ::core::ffi::c_int;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
