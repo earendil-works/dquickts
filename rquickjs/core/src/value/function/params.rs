@@ -64,23 +64,32 @@ impl<'a, 'js> Params<'a, 'js> {
     }
 
     /// Checks if the parameters fit the param num requirements.
+    #[inline]
     pub fn check_params(&self, num: ParamRequirement) -> Result<()> {
-        if self.args.len() < num.min {
-            return Err(crate::Error::MissingArgs {
-                expected: num.min,
-                given: self.args.len(),
-            });
-        }
-        if num.exhaustive && self.args.len() > num.max {
-            return Err(crate::Error::TooManyArgs {
-                expected: num.max,
-                given: self.args.len(),
-            });
+        let given = self.args.len();
+        if given < num.min || (num.exhaustive && given > num.max) {
+            return Err(Self::param_error(num, given));
         }
         Ok(())
     }
 
+    #[cold]
+    fn param_error(num: ParamRequirement, given: usize) -> crate::Error {
+        if given < num.min {
+            crate::Error::MissingArgs {
+                expected: num.min,
+                given,
+            }
+        } else {
+            crate::Error::TooManyArgs {
+                expected: num.max,
+                given,
+            }
+        }
+    }
+
     /// Returns the context associated with call.
+    #[inline]
     pub fn ctx(&self) -> &Ctx<'js> {
         &self.ctx
     }
@@ -103,6 +112,7 @@ impl<'a, 'js> Params<'a, 'js> {
     }
 
     /// Returns the number of arguments.
+    #[inline]
     pub fn len(&self) -> usize {
         self.args.len()
     }
@@ -120,6 +130,7 @@ impl<'a, 'js> Params<'a, 'js> {
     }
 
     /// Turns the params into an accessor object for extracting the arguments.
+    #[inline]
     pub fn access(self) -> ParamsAccessor<'a, 'js> {
         ParamsAccessor {
             params: self,
@@ -136,6 +147,7 @@ pub struct ParamsAccessor<'a, 'js> {
 
 impl<'a, 'js> ParamsAccessor<'a, 'js> {
     /// Returns the context associated with the params.
+    #[inline]
     pub fn ctx(&self) -> &Ctx<'js> {
         self.params.ctx()
     }
@@ -156,6 +168,7 @@ impl<'a, 'js> ParamsAccessor<'a, 'js> {
     ///
     /// # Panic
     /// This function panics if it is called more times then there are arguments.
+    #[inline]
     pub fn arg(&mut self) -> Value<'js> {
         assert!(
             self.offset < self.params.args.len(),
@@ -167,11 +180,26 @@ impl<'a, 'js> ParamsAccessor<'a, 'js> {
         unsafe { Value::from_js_value_const(self.params.ctx.clone(), res) }
     }
 
+    /// Returns the next argument together with the context of the call.
+    ///
+    /// Same as [`ParamsAccessor::arg`], but the context is borrowed alongside the argument so it
+    /// can be passed to [`FromJs::from_js`] without cloning it.
+    ///
+    /// # Panic
+    /// This function panics if it is called more times then there are arguments.
+    #[inline]
+    pub fn ctx_and_arg(&mut self) -> (&Ctx<'js>, Value<'js>) {
+        let arg = self.arg();
+        (&self.params.ctx, arg)
+    }
+
     /// returns the number of arguments remaining
+    #[inline]
     pub fn len(&self) -> usize {
         self.params.args.len() - self.offset
     }
     /// returns whether there are any arguments remaining.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -186,6 +214,7 @@ pub struct ParamRequirement {
 
 impl ParamRequirement {
     /// Returns the requirement of a single required parameter
+    #[inline]
     pub const fn single() -> Self {
         ParamRequirement {
             min: 1,
@@ -196,6 +225,7 @@ impl ParamRequirement {
 
     /// Makes the requirements exhaustive i.e. the parameter set requires that the function is
     /// called with no arguments than parameters
+    #[inline]
     pub const fn exhaustive() -> Self {
         ParamRequirement {
             min: 0,
@@ -205,6 +235,7 @@ impl ParamRequirement {
     }
 
     /// Returns the requirements for a single optional parameter
+    #[inline]
     pub const fn optional() -> Self {
         ParamRequirement {
             min: 0,
@@ -214,6 +245,7 @@ impl ParamRequirement {
     }
 
     /// Returns the requirements for a any number of parameters
+    #[inline]
     pub const fn any() -> Self {
         ParamRequirement {
             min: 0,
@@ -223,6 +255,7 @@ impl ParamRequirement {
     }
 
     /// Returns the requirements for no parameters
+    #[inline]
     pub const fn none() -> Self {
         ParamRequirement {
             min: 0,
@@ -232,6 +265,7 @@ impl ParamRequirement {
     }
 
     /// Combine to requirements into one which covers both.
+    #[inline]
     pub const fn combine(self, other: Self) -> ParamRequirement {
         Self {
             min: self.min.saturating_add(other.min),
@@ -241,19 +275,22 @@ impl ParamRequirement {
     }
 
     /// Returns the minimum number of arguments for this requirement
-    pub fn min(&self) -> usize {
+    #[inline]
+    pub const fn min(&self) -> usize {
         self.min
     }
 
     /// Returns the maximum number of arguments for this requirement
-    pub fn max(&self) -> usize {
+    #[inline]
+    pub const fn max(&self) -> usize {
         self.max
     }
 
     /// Returns whether this function is required to be exhaustive called
     ///
     /// i.e. there can be no more arguments then parameters.
-    pub fn is_exhaustive(&self) -> bool {
+    #[inline]
+    pub const fn is_exhaustive(&self) -> bool {
         self.exhaustive
     }
 }
@@ -273,8 +310,8 @@ impl<'js, T: FromJs<'js>> FromParam<'js> for T {
     }
 
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
-        let ctx = params.ctx().clone();
-        T::from_js(&ctx, params.arg())
+        let (ctx, arg) = params.ctx_and_arg();
+        T::from_js(ctx, arg)
     }
 }
 
@@ -295,8 +332,8 @@ impl<'js, T: FromJs<'js>> FromParam<'js> for Opt<T> {
 
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
         if !params.is_empty() {
-            let ctx = params.ctx().clone();
-            Ok(Opt(Some(T::from_js(&ctx, params.arg())?)))
+            let (ctx, arg) = params.ctx_and_arg();
+            Ok(Opt(Some(T::from_js(ctx, arg)?)))
         } else {
             Ok(Opt(None))
         }
@@ -331,8 +368,8 @@ impl<'js, T: FromJs<'js>> FromParam<'js> for Rest<T> {
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
         let mut res = Vec::with_capacity(params.len());
         for _ in 0..params.len() {
-            let p = params.arg();
-            res.push(T::from_js(params.ctx(), p)?);
+            let (ctx, arg) = params.ctx_and_arg();
+            res.push(T::from_js(ctx, arg)?);
         }
         Ok(Rest(res))
     }

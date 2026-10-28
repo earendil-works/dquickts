@@ -222,13 +222,13 @@ impl JsFunction {
                     #rust_function(#arg_apply).await
                 };
 
-                #lib_crate::IntoJs::into_js(#lib_crate::promise::Promised(fut), &ctx)
+                #lib_crate::IntoJs::into_js(#lib_crate::promise::Promised(fut), _params.ctx())
             }
         } else {
             quote! {
                 #arg_extract
                 let res = #rust_function(#arg_apply);
-                #lib_crate::IntoJs::into_js(res,&ctx)
+                #lib_crate::IntoJs::into_js(res, _params.ctx())
             }
         }
     }
@@ -252,9 +252,9 @@ impl JsFunction {
                     #(#arg_type_requirements)*
                 }
 
+                // the parameter requirements are checked by the function wrapper
+                // (`Function::new`, `Constructor::new_class`) before it calls this
                 fn call<'a>(&self, params: #lib_crate::function::Params<'a,'js>) -> #lib_crate::Result<#lib_crate::Value<'js>>{
-                    let ctx = params.ctx().clone();
-                    params.check_params(Self::param_requirements())?;
                     let mut _params = params.access();
                     #body
                 }

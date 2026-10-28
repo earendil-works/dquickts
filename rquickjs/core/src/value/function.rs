@@ -198,13 +198,12 @@ impl<'js> Constructor<'js> {
         let func = Box::new(move |params: Params<'_, 'js>| -> Result<Value<'js>> {
             params.check_params(F::param_requirements())?;
             let this = params.this();
-            let ctx = params.ctx().clone();
 
             // get the prototype of thie class from itself or the inate class prototype.
             let proto = this
                 .into_function()
                 .map(|func| func.get(PredefinedAtom::Prototype))
-                .unwrap_or_else(|| Class::<C>::prototype(&ctx))?;
+                .unwrap_or_else(|| Class::<C>::prototype(params.ctx()))?;
 
             let res = f.call(params)?;
             res.as_object()
