@@ -410,7 +410,10 @@ mod test {
                 check_same_as_cstring(s);
             }
             assert!(matches!(strings[0].to_str().unwrap(), Cow::Borrowed("")));
-            assert!(matches!(strings[2].to_str().unwrap(), Cow::Borrowed("hello world 1234")));
+            assert!(matches!(
+                strings[2].to_str().unwrap(),
+                Cow::Borrowed("hello world 1234")
+            ));
             assert!(matches!(strings[5].to_str().unwrap(), Cow::Owned(s) if s == "caf\u{e9}"));
             assert_eq!(strings[8].to_string().unwrap(), "\u{1f600} emoji \u{1f389}");
             assert!(matches!(strings[13].to_string(), Err(Error::Utf8(_))));
@@ -455,12 +458,30 @@ mod test {
         test_with(|ctx| {
             assert_eq!(ctx.eval::<char, _>("'\\xe9'").unwrap(), '\u{e9}');
             assert_eq!(ctx.eval::<char, _>("'\\u2713'").unwrap(), '\u{2713}');
-            assert_eq!(ctx.eval::<char, _>("'\\ud83d\\ude00'").unwrap(), '\u{1f600}');
-            assert!(matches!(ctx.eval::<char, _>("'\\ud83d'"), Err(Error::Utf8(_))));
-            assert!(matches!(ctx.eval::<char, _>("'a\\ud83d'"), Err(Error::Utf8(_))));
-            assert!(matches!(ctx.eval::<char, _>("'\\u2713a'"), Err(Error::FromJs { .. })));
-            assert!(matches!(ctx.eval::<char, _>("'\\xe9a'"), Err(Error::FromJs { .. })));
-            assert!(matches!(ctx.eval::<char, _>("''"), Err(Error::FromJs { .. })));
+            assert_eq!(
+                ctx.eval::<char, _>("'\\ud83d\\ude00'").unwrap(),
+                '\u{1f600}'
+            );
+            assert!(matches!(
+                ctx.eval::<char, _>("'\\ud83d'"),
+                Err(Error::Utf8(_))
+            ));
+            assert!(matches!(
+                ctx.eval::<char, _>("'a\\ud83d'"),
+                Err(Error::Utf8(_))
+            ));
+            assert!(matches!(
+                ctx.eval::<char, _>("'\\u2713a'"),
+                Err(Error::FromJs { .. })
+            ));
+            assert!(matches!(
+                ctx.eval::<char, _>("'\\xe9a'"),
+                Err(Error::FromJs { .. })
+            ));
+            assert!(matches!(
+                ctx.eval::<char, _>("''"),
+                Err(Error::FromJs { .. })
+            ));
             let c: Value = '\u{1f600}'.into_js(&ctx).unwrap();
             assert_eq!(c.get::<StdString>().unwrap(), "\u{1f600}");
         });

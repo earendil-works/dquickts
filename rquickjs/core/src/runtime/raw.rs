@@ -257,8 +257,9 @@ impl RawRuntime {
         &mut self,
         max_jobs: Option<usize>,
     ) -> StdResult<usize, *mut qjs::JSContext> {
-        let max_jobs: core::ffi::c_int =
-            max_jobs.map_or(-1, |n| n.min(core::ffi::c_int::MAX as usize) as core::ffi::c_int);
+        let max_jobs: core::ffi::c_int = max_jobs.map_or(-1, |n| {
+            n.min(core::ffi::c_int::MAX as usize) as core::ffi::c_int
+        });
         let mut ctx_ptr = core::ptr::null_mut();
         let result =
             unsafe { qjs::JS_ExecutePendingJobs(self.rt.as_ptr(), max_jobs, &mut ctx_ptr) };

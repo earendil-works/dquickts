@@ -361,7 +361,10 @@ mod test {
         assert_eq!(rt.execute_pending_jobs(None).unwrap(), 2);
         assert!(!rt.is_job_pending());
         ctx.with(|ctx| {
-            assert_eq!(ctx.eval::<crate::StdString, _>("log.join()").unwrap(), "1,2,3");
+            assert_eq!(
+                ctx.eval::<crate::StdString, _>("log.join()").unwrap(),
+                "1,2,3"
+            );
         });
     }
 
@@ -372,7 +375,8 @@ mod test {
         let rt = Runtime::new().unwrap();
         let ctx = crate::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
-            ctx.eval::<(), _>("globalThis.ran = 0; globalThis.f = () => { ran++ };").unwrap();
+            ctx.eval::<(), _>("globalThis.ran = 0; globalThis.f = () => { ran++ };")
+                .unwrap();
             let f: Function = ctx.globals().get("f").unwrap();
             let thrower: Function = ctx.eval("() => { throw new Error('boom') }").unwrap();
             f.defer(()).unwrap();

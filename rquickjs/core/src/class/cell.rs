@@ -317,11 +317,7 @@ pub struct OwnedBorrow<'js, T: JsClass<'js> + 'js> {
 }
 
 // SAFETY: `cell` only points to the data of `class`.
-unsafe impl<'js, T: JsClass<'js> + 'js> Send for OwnedBorrow<'js, T>
-where
-    Class<'js, T>: Send,
-{
-}
+unsafe impl<'js, T: JsClass<'js> + 'js> Send for OwnedBorrow<'js, T> where Class<'js, T>: Send {}
 
 impl<'js, T: JsClass<'js> + 'js> OwnedBorrow<'js, T> {
     /// Borrow a class owned.
@@ -402,11 +398,7 @@ pub struct OwnedBorrowMut<'js, T: JsClass<'js> + 'js> {
 }
 
 // SAFETY: `cell` only points to the data of `class`.
-unsafe impl<'js, T: JsClass<'js> + 'js> Send for OwnedBorrowMut<'js, T>
-where
-    Class<'js, T>: Send,
-{
-}
+unsafe impl<'js, T: JsClass<'js> + 'js> Send for OwnedBorrowMut<'js, T> where Class<'js, T>: Send {}
 
 impl<'js, T: JsClass<'js> + 'js> OwnedBorrowMut<'js, T> {
     /// Borrow a class mutably owned.

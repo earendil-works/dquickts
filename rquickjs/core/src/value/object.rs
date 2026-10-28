@@ -982,7 +982,9 @@ mod test {
             assert!(!ta.contains_key("1.5").unwrap());
             assert!(ta.contains_key("0").unwrap());
             assert_eq!(ta.len(), 2);
-            assert!(ctx.eval::<bool, _>("delete Object.prototype['1.5']").unwrap());
+            assert!(ctx
+                .eval::<bool, _>("delete Object.prototype['1.5']")
+                .unwrap());
         })
     }
 
@@ -1035,7 +1037,9 @@ mod test {
                 atom: Atom<'js>,
             ) -> Result<Option<PropertyDescriptor<'js>>> {
                 let value = atom.to_string()?.into_js(ctx)?;
-                Ok(Some(PropertyDescriptor::new_value(value, true, true, false)))
+                Ok(Some(PropertyDescriptor::new_value(
+                    value, true, true, false,
+                )))
             }
 
             fn exotic_get_own_property_names(
@@ -1056,13 +1060,19 @@ mod test {
 
         test_with(|ctx| {
             let obj = Class::instance(ctx.clone(), Exotic).unwrap().into_inner();
-            assert_eq!(obj.get::<_, StdString>("x never seen é").unwrap(), "get:x never seen é");
+            assert_eq!(
+                obj.get::<_, StdString>("x never seen é").unwrap(),
+                "get:x never seen é"
+            );
             assert!(obj.contains_key("y never seen").unwrap());
             assert!(!obj.contains_key("no").unwrap());
             assert_eq!(obj.len(), 3);
             assert!(!obj.is_empty());
             let child = Object::new_proto(ctx.clone(), Some(&obj)).unwrap();
-            assert_eq!(child.get::<_, StdString>("7 never seen").unwrap(), "get:7 never seen");
+            assert_eq!(
+                child.get::<_, StdString>("7 never seen").unwrap(),
+                "get:7 never seen"
+            );
             assert!(child.contains_key("z never seen").unwrap());
             assert!(child.is_empty());
         })
@@ -1125,7 +1135,11 @@ mod test {
             };
             let values = val.values::<Value>().collect::<Result<Vec<_>>>().unwrap();
             assert_eq!(ints(values), [Some(1), Some(2), Some(3)]);
-            let values = val.values::<Value>().rev().collect::<Result<Vec<_>>>().unwrap();
+            let values = val
+                .values::<Value>()
+                .rev()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
             assert_eq!(ints(values), [Some(3), Some(2), Some(1)]);
             let props = val
                 .props()

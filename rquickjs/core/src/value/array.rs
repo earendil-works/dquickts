@@ -405,7 +405,9 @@ mod test {
             assert!(ctx.eval::<Vec<i32>, _>("new Proxy([1, 2], {})").is_err());
             assert!(ctx.eval::<Vec<i32>, _>("new Int32Array([1, 2])").is_err());
             assert!(ctx.eval::<Vec<i32>, _>("({ length: 1, 0: 1 })").is_err());
-            assert!(ctx.eval::<List<(i32, i32)>, _>("new Proxy([1, 2], {})").is_err());
+            assert!(ctx
+                .eval::<List<(i32, i32)>, _>("new Proxy([1, 2], {})")
+                .is_err());
         })
     }
 
@@ -415,7 +417,9 @@ mod test {
             let globals = ctx.globals();
             globals.set("v", vec![1, 2, 3]).unwrap();
             globals.set("e", Vec::<i32>::new()).unwrap();
-            globals.set("r", &vec![StdString::from("a"), StdString::from("b")]).unwrap();
+            globals
+                .set("r", &vec![StdString::from("a"), StdString::from("b")])
+                .unwrap();
             globals.set("s", &[1.5f64, 2.5][..]).unwrap();
             globals.set("t", List((1, "x", true))).unwrap();
             globals.set("t1", List(((),))).unwrap();
