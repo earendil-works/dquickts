@@ -3,6 +3,7 @@
 use crate::{
     function::Params,
     qjs::{self},
+    runtime::opaque::Opaque,
     value::Constructor,
     Atom, Ctx, Error, FromJs, IntoJs, JsLifetime, Object, Result, Value,
 };
@@ -221,7 +222,7 @@ impl<'js, C: JsClass<'js>> Deref for Class<'js, C> {
 impl<'js, C: JsClass<'js>> Class<'js, C> {
     /// Create a class from a Rust object.
     pub fn instance(ctx: Ctx<'js>, value: C) -> Result<Class<'js, C>> {
-        let id = unsafe { class_id::<C>(&ctx)? };
+        let id = class_id::<C>();
 
         let prototype = Self::prototype(&ctx)?;
 
@@ -240,7 +241,7 @@ impl<'js, C: JsClass<'js>> Class<'js, C> {
 
     /// Create a class from a Rust object with a given prototype.
     pub fn instance_proto(value: C, proto: Object<'js>) -> Result<Class<'js, C>> {
-        let id = unsafe { class_id::<C>(proto.ctx())? };
+        let id = class_id::<C>();
 
         let val = unsafe {
             proto.ctx.handle_exception(qjs::JS_NewObjectProtoClass(
@@ -340,7 +341,7 @@ impl<'js, C: JsClass<'js>> Class<'js, C> {
     /// returns a pointer to the class object.
     #[inline]
     pub(crate) fn get_class_ptr(&self) -> NonNull<ClassCell<JsCell<'js, C>>> {
-        let id = unsafe { class_id::<C>(&self.ctx).expect("invalid class") };
+        let id = class_id::<C>();
 
         let ptr = unsafe { qjs::JS_GetOpaque2(self.0.ctx.as_ptr(), self.0 .0.as_js_value(), id) };
 
@@ -388,9 +389,7 @@ impl<'js, C: JsClass<'js>> Class<'js, C> {
 impl<'js> Object<'js> {
     /// Returns if the object is of a certain Rust class.
     pub fn instance_of<C: JsClass<'js>>(&self) -> bool {
-        let Ok(id) = (unsafe { class_id::<C>(&self.ctx) }) else {
-            return false;
-        };
+        let id = class_id::<C>();
 
         // This checks if the class is of the right class id.
         let Some(x) = NonNull::new(unsafe {
@@ -454,11 +453,12 @@ impl<'js, C: JsClass<'js>> IntoJs<'js> for Class<'js, C> {
     }
 }
 
-unsafe fn class_id<'js, C: JsClass<'js>>(ctx: &Ctx<'js>) -> Result<qjs::JSClassID> {
+#[inline]
+fn class_id<'js, C: JsClass<'js>>() -> qjs::JSClassID {
     match C::KIND {
-        ClassKind::Plain => Ok(ctx.get_opaque().get_class_id()),
-        ClassKind::Callable => Ok(ctx.get_opaque().get_callable_id()),
-        ClassKind::Exotic => Ok(ctx.get_opaque().get_exotic_id()),
+        ClassKind::Plain => Opaque::class_id(),
+        ClassKind::Callable => Opaque::callable_id(),
+        ClassKind::Exotic => Opaque::exotic_id(),
     }
 }
 

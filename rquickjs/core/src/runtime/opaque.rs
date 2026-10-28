@@ -11,7 +11,7 @@ use super::{
 use super::{Decorators, Suspender};
 use crate::snapshot::{BuiltinRequest, SnapshotHost};
 use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::{
     any::{Any, TypeId},
     cell::{Cell, UnsafeCell},
@@ -33,6 +33,16 @@ use core::{
     future::Future,
     task::{Context, Waker},
 };
+
+/// The class ids of the Rust classes.
+///
+/// Class ids are process wide in QuickJS: they are allocated once, by the first runtime, and every
+/// runtime registers its classes under the same ids. So they are read without looking up the
+/// runtime. `JS_NewClassID()` writes an id under a lock before any runtime registers it, which
+/// orders the write before every read.
+static CLASS_ID: AtomicU32 = AtomicU32::new(0);
+static CALLABLE_CLASS_ID: AtomicU32 = AtomicU32::new(0);
+static EXOTIC_CLASS_ID: AtomicU32 = AtomicU32::new(0);
 
 /// Opaque book keeping data for Rust.
 pub(crate) struct Opaque<'js> {
@@ -64,13 +74,6 @@ pub(crate) struct Opaque<'js> {
 
     /// How TypeScript sources compile decorators.
     decorators: Cell<Decorators>,
-
-    /// The class id for rust classes.
-    class_id: qjs::JSClassID,
-    /// The class id for rust classes which can be called.
-    callable_class_id: qjs::JSClassID,
-    /// The class id for exotic classes
-    exotic_class_id: qjs::JSClassID,
 
     prototypes: UnsafeCell<HashMap<TypeId, Option<Object<'js>>>>,
 
@@ -105,10 +108,6 @@ impl<'js> Opaque<'js> {
 
             decorators: Cell::new(Decorators::Standard),
 
-            class_id: qjs::JS_INVALID_CLASS_ID,
-            callable_class_id: qjs::JS_INVALID_CLASS_ID,
-            exotic_class_id: qjs::JS_INVALID_CLASS_ID,
-
             prototypes: UnsafeCell::new(HashMap::new()),
 
             userdata: UserDataMap::default(),
@@ -133,12 +132,9 @@ impl<'js> Opaque<'js> {
         // Class ids are process wide in QuickJS: allocate them once so that
         // every runtime uses the same ids (JS_NewClassID() is serialized and
         // keeps an already allocated id).
-        static mut CLASS_ID: qjs::JSClassID = 0;
-        static mut CALLABLE_CLASS_ID: qjs::JSClassID = 0;
-        static mut EXOTIC_CLASS_ID: qjs::JSClassID = 0;
-        self.class_id = qjs::JS_NewClassID(&raw mut CLASS_ID);
-        self.callable_class_id = qjs::JS_NewClassID(&raw mut CALLABLE_CLASS_ID);
-        self.exotic_class_id = qjs::JS_NewClassID(&raw mut EXOTIC_CLASS_ID);
+        let class_id = qjs::JS_NewClassID(CLASS_ID.as_ptr());
+        let callable_class_id = qjs::JS_NewClassID(CALLABLE_CLASS_ID.as_ptr());
+        let exotic_class_id = qjs::JS_NewClassID(EXOTIC_CLASS_ID.as_ptr());
 
         let class_def = qjs::JSClassDef {
             class_name: c"RustClass".as_ptr().cast(),
@@ -148,7 +144,7 @@ impl<'js> Opaque<'js> {
             exotic: ptr::null_mut(),
         };
 
-        if 0 != qjs::JS_NewClass(rt, self.class_id, &class_def) {
+        if 0 != qjs::JS_NewClass(rt, class_id, &class_def) {
             return Err(Error::Unknown);
         }
 
@@ -160,7 +156,7 @@ impl<'js> Opaque<'js> {
             exotic: ptr::null_mut(),
         };
 
-        if 0 != qjs::JS_NewClass(rt, self.callable_class_id, &class_def) {
+        if 0 != qjs::JS_NewClass(rt, callable_class_id, &class_def) {
             return Err(Error::Unknown);
         }
 
@@ -172,7 +168,7 @@ impl<'js> Opaque<'js> {
             exotic: self.exotic_methods.as_ptr(),
         };
 
-        if 0 != qjs::JS_NewClass(rt, self.exotic_class_id, &class_def) {
+        if 0 != qjs::JS_NewClass(rt, exotic_class_id, &class_def) {
             return Err(Error::Unknown);
         }
 
@@ -349,16 +345,22 @@ impl<'js> Opaque<'js> {
         self.panic.take()
     }
 
-    pub fn get_class_id(&self) -> qjs::JSClassID {
-        self.class_id
+    /// The class id of the Rust classes.
+    #[inline]
+    pub fn class_id() -> qjs::JSClassID {
+        CLASS_ID.load(Ordering::Relaxed)
     }
 
-    pub fn get_callable_id(&self) -> qjs::JSClassID {
-        self.callable_class_id
+    /// The class id of the Rust classes which can be called.
+    #[inline]
+    pub fn callable_id() -> qjs::JSClassID {
+        CALLABLE_CLASS_ID.load(Ordering::Relaxed)
     }
 
-    pub fn get_exotic_id(&self) -> qjs::JSClassID {
-        self.exotic_class_id
+    /// The class id of the exotic Rust classes.
+    #[inline]
+    pub fn exotic_id() -> qjs::JSClassID {
+        EXOTIC_CLASS_ID.load(Ordering::Relaxed)
     }
 
     pub fn get_or_insert_prototype<C: JsClass<'js>>(

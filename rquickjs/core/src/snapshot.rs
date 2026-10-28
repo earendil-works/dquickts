@@ -68,7 +68,9 @@ use crate::{
         JsCell, JsClass,
     },
     function::{defer_call_job, Opt, RustFunction},
-    qjs, Array, Class, Constructor, Context, Ctx, Error, Exception, Function, JsLifetime, Object,
+    qjs,
+    runtime::opaque::Opaque,
+    Array, Class, Constructor, Context, Ctx, Error, Exception, Function, JsLifetime, Object,
     Persistent, Result, Runtime, TypedArray, Value,
 };
 use alloc::{
@@ -473,9 +475,9 @@ where
     Ok(unsafe { NonNull::new_unchecked(cell) }.cast())
 }
 
-fn is_rust_function(ctx: &Ctx, value: &Value) -> bool {
+fn is_rust_function(value: &Value) -> bool {
     unsafe {
-        let id = ctx.get_opaque().get_callable_id();
+        let id = Opaque::callable_id();
         qjs::JS_GetClassID(value.as_js_value()) == id
             && class_cell(value.as_js_value(), id)
                 .is_some_and(|cell| cell.as_ref().v_table.is_of_class::<RustFunction>())
@@ -539,7 +541,7 @@ fn collect_rust_functions<'js>(
     if !seen.insert(object_ptr(&value)) {
         return Ok(());
     }
-    if is_rust_function(ctx, &value) {
+    if is_rust_function(&value) {
         table.push(value.clone());
     }
     if expand || value.is_function() {
@@ -935,7 +937,7 @@ fn attach<'js>(
         ));
     }
 
-    let callable_id = opaque.get_callable_id();
+    let callable_id = Opaque::callable_id();
     let mut instances = Vec::new();
     for (obj, saved) in records {
         let raw = obj.as_js_value();
