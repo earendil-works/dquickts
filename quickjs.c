@@ -3971,12 +3971,14 @@ static JSAtom JS_NewAtomStr(JSContext *ctx, JSString *p)
     return atom;
 }
 
-/* XXX: optimize */
 static size_t count_ascii(const uint8_t *buf, size_t len)
 {
     const uint8_t *p, *p_end;
     p = buf;
     p_end = buf + len;
+    /* 8 bytes at a time, then the bytes of the first non-ASCII word */
+    while (p_end - p >= 8 && !(get_u64(p) & UINT64_C(0x8080808080808080)))
+        p += 8;
     while (p < p_end && *p < 128)
         p++;
     return p - buf;
