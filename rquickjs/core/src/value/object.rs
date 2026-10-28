@@ -39,12 +39,35 @@ impl<'js> Object<'js> {
 
     /// Get a new value
     pub fn get<K: IntoAtom<'js>, V: FromJs<'js>>(&self, k: K) -> Result<V> {
+        if let Some(name) = k.as_key_str() {
+            // No atom is created for a name which is not an atom yet.
+            let val = unsafe {
+                qjs::JS_GetPropertyStrLen(
+                    self.0.ctx.as_ptr(),
+                    self.0.as_js_value(),
+                    name.as_ptr().cast(),
+                    name.len() as _,
+                )
+            };
+            return unsafe { self.from_get_result(val) };
+        }
         let atom = k.into_atom(self.ctx())?;
-        V::from_js(self.ctx(), unsafe {
+        self.get_atom(&atom)
+    }
+
+    /// Get a value by atom without taking ownership of the atom.
+    pub(crate) fn get_atom<V: FromJs<'js>>(&self, atom: &Atom<'js>) -> Result<V> {
+        unsafe {
             let val = qjs::JS_GetProperty(self.0.ctx.as_ptr(), self.0.as_js_value(), atom.atom);
-            let val = self.0.ctx.handle_exception(val)?;
-            Value::from_js_value(self.0.ctx.clone(), val)
-        })
+            self.from_get_result(val)
+        }
+    }
+
+    /// # Safety
+    /// `val` must be an owned value returned by a property get on this object's context.
+    unsafe fn from_get_result<V: FromJs<'js>>(&self, val: qjs::JSValue) -> Result<V> {
+        let val = self.0.ctx.handle_exception(val)?;
+        V::from_js(self.ctx(), Value::from_js_value(self.0.ctx.clone(), val))
     }
 
     /// check whether the object contains a certain key.
@@ -52,14 +75,23 @@ impl<'js> Object<'js> {
     where
         K: IntoAtom<'js>,
     {
-        let atom = k.into_atom(self.ctx())?;
-        unsafe {
-            let res = qjs::JS_HasProperty(self.0.ctx.as_ptr(), self.0.as_js_value(), atom.atom);
-            if res < 0 {
-                return Err(self.0.ctx.raise_exception());
+        let res = if let Some(name) = k.as_key_str() {
+            unsafe {
+                qjs::JS_HasPropertyStrLen(
+                    self.0.ctx.as_ptr(),
+                    self.0.as_js_value(),
+                    name.as_ptr().cast(),
+                    name.len() as _,
+                )
             }
-            Ok(res == 1)
+        } else {
+            let atom = k.into_atom(self.ctx())?;
+            unsafe { qjs::JS_HasProperty(self.0.ctx.as_ptr(), self.0.as_js_value(), atom.atom) }
+        };
+        if res < 0 {
+            return Err(self.0.ctx.raise_exception());
         }
+        Ok(res == 1)
     }
 
     /// Set a member of an object to a certain value
@@ -834,6 +866,163 @@ mod test {
                 .eval("Object.getOwnPropertyNames(Object.getPrototypeOf(console))")
                 .unwrap();
             assert_eq!(names.len(), 0);
+        })
+    }
+
+    #[test]
+    fn get_by_name() {
+        test_with(|ctx| {
+            let val: Object = ctx
+                .eval(
+                    r#"
+                    var proto = { get getter() { return this.own * 2 } };
+                    var obj = Object.create(proto);
+                    obj.own = 21;
+                    obj['h\u00e9llo'] = 1;
+                    obj['2fa'] = 2;
+                    obj['\u{1F600}'] = 3;
+                    obj['a\0b'] = 4;
+                    obj
+                "#,
+                )
+                .unwrap();
+            assert_eq!(val.get::<_, i32>("getter").unwrap(), 42);
+            assert_eq!(val.get::<_, i32>("héllo").unwrap(), 1);
+            assert_eq!(val.get::<_, i32>(StdString::from("2fa")).unwrap(), 2);
+            assert_eq!(val.get::<_, i32>(&StdString::from("😀")).unwrap(), 3);
+            assert_eq!(val.get::<_, i32>("a\0b").unwrap(), 4);
+            assert_eq!(val.get::<_, Option<i32>>("a").unwrap(), None);
+            assert_eq!(val.get::<_, Option<i32>>("hèllo").unwrap(), None);
+            assert_eq!(val.get::<_, Option<i32>>("never seen key").unwrap(), None);
+            assert_eq!(val.get::<_, Option<i32>>("7 never seen").unwrap(), None);
+            assert!(val.contains_key("héllo").unwrap());
+            assert!(val.contains_key("getter").unwrap());
+            assert!(val.contains_key("toString").unwrap());
+            assert!(!val.contains_key("never seen key either").unwrap());
+            assert!(!val.contains_key(StdString::from("a")).unwrap());
+        })
+    }
+
+    #[test]
+    fn get_by_name_exotic() {
+        test_with(|ctx| {
+            let val: Object = ctx
+                .eval(
+                    r#"
+                    var log = [];
+                    var px = new Proxy({}, {
+                        get(t, k) { log.push(k); return 'p:' + k },
+                        has(t, k) { log.push('has:' + k); return k !== 'no' },
+                    });
+                    px
+                "#,
+                )
+                .unwrap();
+            assert_eq!(val.get::<_, StdString>("trap 1 é").unwrap(), "p:trap 1 é");
+            assert!(val.contains_key("trap 2").unwrap());
+            assert!(!val.contains_key("no").unwrap());
+            let child = Object::new_proto(ctx.clone(), Some(&val)).unwrap();
+            assert_eq!(child.get::<_, StdString>("trap 3").unwrap(), "p:trap 3");
+            assert!(child.contains_key("trap 4").unwrap());
+            let log: Vec<StdString> = ctx.eval("log").unwrap();
+            assert_eq!(
+                log,
+                ["trap 1 é", "has:trap 2", "has:no", "trap 3", "has:trap 4"]
+            );
+
+            // typed arrays: numeric keys do not reach the prototype
+            let ta: Object = ctx
+                .eval("Object.prototype['1.5'] = 'proto'; new Uint8Array([5, 6])")
+                .unwrap();
+            assert_eq!(ta.get::<_, i32>("1").unwrap(), 6);
+            assert_eq!(ta.get::<_, Option<i32>>("1.5").unwrap(), None);
+            assert_eq!(ta.get::<_, Option<i32>>("-0").unwrap(), None);
+            assert!(!ta.contains_key("1.5").unwrap());
+            assert!(ta.contains_key("0").unwrap());
+            assert_eq!(ta.len(), 2);
+            assert!(ctx.eval::<bool, _>("delete Object.prototype['1.5']").unwrap());
+        })
+    }
+
+    #[test]
+    fn get_by_name_exotic_class() {
+        use crate::class::{
+            ClassKind, JsCell, JsClass, PropertyDescriptor, PropertyName, Readable, Trace, Tracer,
+        };
+        use crate::JsLifetime;
+
+        struct Exotic;
+
+        impl<'js> Trace<'js> for Exotic {
+            fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+        }
+
+        unsafe impl<'js> JsLifetime<'js> for Exotic {
+            type Changed<'to> = Exotic;
+        }
+
+        impl<'js> JsClass<'js> for Exotic {
+            const NAME: &'static str = "Exotic";
+            const KIND: ClassKind = ClassKind::Exotic;
+            type Mutable = Readable;
+
+            fn constructor(_ctx: &Ctx<'js>) -> Result<Option<crate::value::Constructor<'js>>> {
+                Ok(None)
+            }
+
+            fn exotic_get_property(
+                _this: &JsCell<'js, Self>,
+                ctx: &Ctx<'js>,
+                atom: Atom<'js>,
+                _receiver: Value<'js>,
+            ) -> Result<Value<'js>> {
+                format!("get:{}", atom.to_string()?).into_js(ctx)
+            }
+
+            fn exotic_has_property(
+                _this: &JsCell<'js, Self>,
+                _ctx: &Ctx<'js>,
+                atom: Atom<'js>,
+            ) -> Result<bool> {
+                Ok(atom.to_string()? != "no")
+            }
+
+            fn exotic_get_own_property(
+                _this: &JsCell<'js, Self>,
+                ctx: &Ctx<'js>,
+                atom: Atom<'js>,
+            ) -> Result<Option<PropertyDescriptor<'js>>> {
+                let value = atom.to_string()?.into_js(ctx)?;
+                Ok(Some(PropertyDescriptor::new_value(value, true, true, false)))
+            }
+
+            fn exotic_get_own_property_names(
+                _this: &JsCell<'js, Self>,
+                ctx: &Ctx<'js>,
+            ) -> Result<Vec<PropertyName<'js>>> {
+                ["a", "b", "c"]
+                    .into_iter()
+                    .map(|name| {
+                        Ok(PropertyName {
+                            atom: Atom::from_str(ctx.clone(), name)?,
+                            is_enumerable: true,
+                        })
+                    })
+                    .collect()
+            }
+        }
+
+        test_with(|ctx| {
+            let obj = Class::instance(ctx.clone(), Exotic).unwrap().into_inner();
+            assert_eq!(obj.get::<_, StdString>("x never seen é").unwrap(), "get:x never seen é");
+            assert!(obj.contains_key("y never seen").unwrap());
+            assert!(!obj.contains_key("no").unwrap());
+            assert_eq!(obj.len(), 3);
+            assert!(!obj.is_empty());
+            let child = Object::new_proto(ctx.clone(), Some(&obj)).unwrap();
+            assert_eq!(child.get::<_, StdString>("7 never seen").unwrap(), "get:7 never seen");
+            assert!(child.contains_key("z never seen").unwrap());
+            assert!(child.is_empty());
         })
     }
 

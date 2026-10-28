@@ -70,6 +70,17 @@ pub trait IntoJs<'js> {
 /// Trait for converting values to atoms.
 pub trait IntoAtom<'js> {
     fn into_atom(self, ctx: &Ctx<'js>) -> Result<Atom<'js>>;
+
+    /// The key as a UTF-8 string, when [`into_atom`](IntoAtom::into_atom) would create the atom
+    /// of exactly this string.
+    ///
+    /// Lets [`Object::get`](crate::Object::get) and
+    /// [`Object::contains_key`](crate::Object::contains_key) look a string key up without
+    /// interning it.
+    #[doc(hidden)]
+    fn as_key_str(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The Rust's [`Iterator`] trait extension which works with [`Ctx`]

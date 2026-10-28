@@ -48,17 +48,29 @@ impl<'js> IntoAtom<'js> for &str {
     fn into_atom(self, ctx: &Ctx<'js>) -> Result<Atom<'js>> {
         Atom::from_str(ctx.clone(), self)
     }
+
+    fn as_key_str(&self) -> Option<&str> {
+        Some(*self)
+    }
 }
 
 impl<'js> IntoAtom<'js> for StdString {
     fn into_atom(self, ctx: &Ctx<'js>) -> Result<Atom<'js>> {
         Atom::from_str(ctx.clone(), &self)
     }
+
+    fn as_key_str(&self) -> Option<&str> {
+        Some(self.as_str())
+    }
 }
 
 impl<'js> IntoAtom<'js> for &StdString {
     fn into_atom(self, ctx: &Ctx<'js>) -> Result<Atom<'js>> {
         Atom::from_str(ctx.clone(), self)
+    }
+
+    fn as_key_str(&self) -> Option<&str> {
+        Some(self.as_str())
     }
 }
 
