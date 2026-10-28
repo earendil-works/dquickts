@@ -3,10 +3,11 @@ use crate::{
     qjs, Ctx, FromJs, Function, IntoJs, Result, Value,
 };
 use alloc::vec::Vec;
+use core::{mem, ptr::NonNull};
 
 use super::{ffi::defer_call_job, Constructor};
 
-const ARGS_ON_STACK: usize = 4;
+const ARGS_ON_STACK: usize = 8;
 
 pub enum ArgsSlice {
     Stack {
@@ -16,39 +17,70 @@ pub enum ArgsSlice {
     Heap(Vec<qjs::JSValue>),
 }
 
+/// The values owned by [`Args`], freed on drop.
+struct ArgValues {
+    /// The context of the owning [`Args`], which holds a reference to it.
+    ctx: NonNull<qjs::JSContext>,
+    this: qjs::JSValue,
+    args: ArgsSlice,
+}
+
+impl ArgValues {
+    fn as_slice(&self) -> &[qjs::JSValue] {
+        match &self.args {
+            ArgsSlice::Stack { slice, offset } => &slice[..*offset as usize],
+            ArgsSlice::Heap(h) => h.as_slice(),
+        }
+    }
+}
+
+impl Drop for ArgValues {
+    fn drop(&mut self) {
+        let ctx = self.ctx.as_ptr();
+        for v in self.as_slice() {
+            unsafe { qjs::JS_FreeValue(ctx, *v) };
+        }
+        unsafe { qjs::JS_FreeValue(ctx, self.this) };
+    }
+}
+
 /// Argument input for a functions
 ///
 /// Arguments on the Rust side for calling into the JavaScript context.
 pub struct Args<'js> {
+    // declared first: the values are freed before the context reference is dropped
+    values: ArgValues,
     ctx: Ctx<'js>,
-    pub(crate) this: qjs::JSValue,
-    pub(crate) args: ArgsSlice,
 }
 
 impl<'js> Args<'js> {
+    fn with_slice(ctx: Ctx<'js>, args: ArgsSlice) -> Args<'js> {
+        Args {
+            values: ArgValues {
+                ctx: ctx.as_raw(),
+                this: qjs::JS_UNDEFINED,
+                args,
+            },
+            ctx,
+        }
+    }
+
     /// Returns a new args with space for a give number of arguments
     pub fn new(ctx: Ctx<'js>, args: usize) -> Args<'js> {
-        Args {
-            ctx,
-            this: qjs::JS_UNDEFINED,
-            args: if args <= ARGS_ON_STACK {
-                ArgsSlice::Stack {
-                    slice: [qjs::JS_UNDEFINED; ARGS_ON_STACK],
-                    offset: 0,
-                }
-            } else {
-                ArgsSlice::Heap(Vec::with_capacity(args))
-            },
-        }
+        let args = if args <= ARGS_ON_STACK {
+            ArgsSlice::Stack {
+                slice: [qjs::JS_UNDEFINED; ARGS_ON_STACK],
+                offset: 0,
+            }
+        } else {
+            ArgsSlice::Heap(Vec::with_capacity(args))
+        };
+        Self::with_slice(ctx, args)
     }
 
     /// Returns a new args with space for any number of arguments
     pub fn new_unsized(ctx: Ctx<'js>) -> Args<'js> {
-        Args {
-            ctx,
-            this: qjs::JS_UNDEFINED,
-            args: ArgsSlice::Heap(Vec::new()),
-        }
+        Self::with_slice(ctx, ArgsSlice::Heap(Vec::new()))
     }
 
     /// Returns the context associated with these arguments.
@@ -57,21 +89,25 @@ impl<'js> Args<'js> {
     }
 
     /// Add an argument to the list.
+    ///
+    /// Arguments beyond the number the args were created with are moved to the heap.
     pub fn push_arg<T: IntoJs<'js>>(&mut self, arg: T) -> Result<()> {
-        let v = arg.into_js(&self.ctx)?;
+        let v = arg.into_js(&self.ctx)?.into_js_value();
 
-        match self.args {
-            ArgsSlice::Stack {
-                ref mut slice,
-                ref mut offset,
-            } => {
-                if *offset >= 8 {
-                    panic!("pushed more arguments than num_args returned");
+        match &mut self.values.args {
+            ArgsSlice::Stack { slice, offset } => {
+                let index = *offset as usize;
+                if index < ARGS_ON_STACK {
+                    slice[index] = v;
+                    *offset += 1;
+                } else {
+                    let mut heap = Vec::with_capacity(ARGS_ON_STACK * 2);
+                    heap.extend_from_slice(&slice[..]);
+                    heap.push(v);
+                    self.values.args = ArgsSlice::Heap(heap);
                 }
-                slice[*offset as usize] = v.into_js_value();
-                *offset += 1;
             }
-            ArgsSlice::Heap(ref mut h) => h.push(v.into_js_value()),
+            ArgsSlice::Heap(h) => h.push(v),
         }
 
         Ok(())
@@ -95,14 +131,14 @@ impl<'js> Args<'js> {
         T: IntoJs<'js>,
     {
         let v = this.into_js(&self.ctx)?;
-        let v = core::mem::replace(&mut self.this, v.into_js_value());
+        let v = mem::replace(&mut self.values.this, v.into_js_value());
         unsafe { qjs::JS_FreeValue(self.ctx.as_ptr(), v) };
         Ok(())
     }
 
     /// Replace the this value with 'Undefined' and return the original value.
     pub fn take_this(&mut self) -> Value<'js> {
-        let value = core::mem::replace(&mut self.this, qjs::JS_UNDEFINED);
+        let value = mem::replace(&mut self.values.this, qjs::JS_UNDEFINED);
         Value {
             ctx: self.ctx().clone(),
             value,
@@ -111,17 +147,11 @@ impl<'js> Args<'js> {
 
     /// The number of arguments currently in the list.
     fn len(&self) -> usize {
-        match self.args {
-            ArgsSlice::Stack { offset, .. } => offset as usize,
-            ArgsSlice::Heap(ref h) => h.len(),
-        }
+        self.values.as_slice().len()
     }
 
     fn as_ptr(&self) -> *const qjs::JSValue {
-        match self.args {
-            ArgsSlice::Stack { ref slice, .. } => slice.as_ptr(),
-            ArgsSlice::Heap(ref h) => h.as_ptr(),
-        }
+        self.values.as_slice().as_ptr()
     }
 
     /// Call a function with the current set of arguments.
@@ -133,17 +163,41 @@ impl<'js> Args<'js> {
             #[cfg(feature = "parallel")]
             qjs::JS_UpdateStackTop(qjs::JS_GetRuntime(self.ctx.as_ptr()));
 
-            let val = qjs::JS_Call(
+            qjs::JS_Call(
                 self.ctx.as_ptr(),
                 func.as_js_value(),
-                self.this,
+                self.values.this,
                 self.len() as _,
                 self.as_ptr() as _,
-            );
-            let val = self.ctx.handle_exception(val)?;
-            Value::from_js_value(self.ctx.clone(), val)
+            )
         };
-        R::from_js(&self.ctx, val)
+        unsafe { self.into_result(func.ctx(), val) }
+    }
+
+    /// Converts the owned result `val` of calling a function with these arguments, the arguments
+    /// are freed after the conversion.
+    ///
+    /// `func_ctx` is the context of the called function. In the common case of it being the same
+    /// context as the one of the arguments, it keeps the context alive until the arguments are
+    /// freed, so the context reference of the arguments is moved to the result value instead of
+    /// being cloned.
+    unsafe fn into_result<R>(self, func_ctx: &Ctx<'js>, val: qjs::JSValue) -> Result<R>
+    where
+        R: FromJs<'js>,
+    {
+        // keeps the context of the arguments alive when it is not the one of the function
+        let other = (self.ctx.as_ptr() != func_ctx.as_ptr()).then(|| self.ctx.clone());
+        let Args { values, ctx } = self;
+        let conv_ctx = other.as_ref().unwrap_or(func_ctx);
+
+        let val = if qjs::JS_VALUE_GET_NORM_TAG(val) == qjs::JS_TAG_EXCEPTION {
+            ctx.handle_exception(val)?
+        } else {
+            val
+        };
+        let res = R::from_js(conv_ctx, Value::from_js_value(ctx, val));
+        drop(values);
+        res
     }
 
     pub fn defer(mut self, func: Function<'js>) -> Result<()> {
@@ -169,7 +223,7 @@ impl<'js> Args<'js> {
     where
         R: FromJs<'js>,
     {
-        let value = if unsafe { qjs::JS_VALUE_GET_TAG(self.this) != qjs::JS_TAG_UNDEFINED } {
+        let value = if unsafe { qjs::JS_VALUE_GET_TAG(self.values.this) != qjs::JS_TAG_UNDEFINED } {
             unsafe {
                 #[cfg(feature = "parallel")]
                 qjs::JS_UpdateStackTop(qjs::JS_GetRuntime(self.ctx.as_ptr()));
@@ -177,7 +231,7 @@ impl<'js> Args<'js> {
                 qjs::JS_CallConstructor2(
                     self.ctx.as_ptr(),
                     constructor.as_js_value(),
-                    self.this,
+                    self.values.this,
                     self.len() as _,
                     self.as_ptr() as _,
                 )
@@ -195,25 +249,7 @@ impl<'js> Args<'js> {
                 )
             }
         };
-        let value = unsafe { self.ctx.handle_exception(value)? };
-        let v = unsafe { Value::from_js_value(self.ctx.clone(), value) };
-        R::from_js(&self.ctx, v)
-    }
-}
-
-impl Drop for Args<'_> {
-    fn drop(&mut self) {
-        match self.args {
-            ArgsSlice::Heap(ref h) => h.iter().for_each(|v| {
-                unsafe { qjs::JS_FreeValue(self.ctx.as_ptr(), *v) };
-            }),
-            ArgsSlice::Stack { ref slice, offset } => {
-                slice[..(offset as usize)].iter().for_each(|v| {
-                    unsafe { qjs::JS_FreeValue(self.ctx.as_ptr(), *v) };
-                })
-            }
-        }
-        unsafe { qjs::JS_FreeValue(self.ctx.as_ptr(), self.this) };
+        unsafe { self.into_result(constructor.ctx(), value) }
     }
 }
 

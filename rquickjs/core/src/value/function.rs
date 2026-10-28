@@ -845,6 +845,61 @@ mod test {
     }
 
     #[test]
+    fn call_js_fn_with_more_args_than_reserved() {
+        use crate::function::Args;
+
+        test_with(|ctx| {
+            let f: Function = ctx.eval("(...x) => x.join()").unwrap();
+
+            // fewer slots than arguments used to index past the arguments kept on the stack
+            let mut args = Args::new(ctx.clone(), 0);
+            args.push_args(0..12).unwrap();
+            let res: StdString = f.call_arg(args).unwrap();
+            assert_eq!(res, "0,1,2,3,4,5,6,7,8,9,10,11");
+
+            let mut args = Args::new(ctx.clone(), 2);
+            args.this(1).unwrap();
+            args.push_args(0..9).unwrap();
+            let res: StdString = f.call_arg(args).unwrap();
+            assert_eq!(res, "0,1,2,3,4,5,6,7,8");
+
+            let res: StdString = f.call((1, 2, 3, 4, 5, 6, Rest(vec![7, 8]))).unwrap();
+            assert_eq!(res, "1,2,3,4,5,6,7,8");
+            let res: StdString = f.call((1, 2, 3, 4, 5, 6, Rest(vec![7, 8, 9]))).unwrap();
+            assert_eq!(res, "1,2,3,4,5,6,7,8,9");
+        })
+    }
+
+    #[test]
+    fn call_js_fn_of_other_context() {
+        use crate::function::Args;
+
+        let rt = Runtime::new().unwrap();
+        let ctx_a = Context::full(&rt).unwrap();
+        let ctx_b = Context::full(&rt).unwrap();
+        let raw_b = ctx_b.with(|ctx_b| ctx_b.as_raw());
+        ctx_a.with(|ctx_a| {
+            let f: Function = ctx_a.eval("(a, b) => [a, b]").unwrap();
+            let res: Vec<i32> = f.call((1, 2)).unwrap();
+            assert_eq!(res, [1, 2]);
+
+            // arguments of another context of the runtime than the one of the function
+            let ctx_b = unsafe { Ctx::from_raw(raw_b) };
+            let mut args = Args::new(ctx_b.clone(), 1);
+            args.push_arg(3).unwrap();
+            let res: Vec<Option<i32>> = f.call_arg(args).unwrap();
+            assert_eq!(res, [Some(3), None]);
+            let mut args = Args::new(ctx_b, 1);
+            args.push_arg(3).unwrap();
+            let err = f.call_arg::<StdString>(args).unwrap_err();
+            assert!(err.is_from_js(), "{err}");
+
+            let err = f.call::<_, StdString>((1, 2)).unwrap_err();
+            assert!(err.is_from_js(), "{err}");
+        });
+    }
+
+    #[test]
     fn call_rust_fn_with_primitive_args() {
         test_with(|ctx| {
             let global = ctx.globals();
