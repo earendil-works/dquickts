@@ -95,6 +95,7 @@ pub struct Ctx<'js> {
 }
 
 impl<'js> Clone for Ctx<'js> {
+    #[inline]
     fn clone(&self) -> Self {
         unsafe { qjs::JS_DupContext(self.ctx.as_ptr()) };
         Ctx {
@@ -105,6 +106,7 @@ impl<'js> Clone for Ctx<'js> {
 }
 
 impl<'js> Drop for Ctx<'js> {
+    #[inline]
     fn drop(&mut self) {
         unsafe { qjs::JS_FreeContext(self.ctx.as_ptr()) };
     }
@@ -113,10 +115,12 @@ impl<'js> Drop for Ctx<'js> {
 unsafe impl Send for Ctx<'_> {}
 
 impl<'js> Ctx<'js> {
+    #[inline]
     pub(crate) fn as_ptr(&self) -> *mut qjs::JSContext {
         self.ctx.as_ptr()
     }
 
+    #[inline]
     pub(crate) unsafe fn from_ptr(ctx: *mut qjs::JSContext) -> Self {
         unsafe { qjs::JS_DupContext(ctx) };
         let ctx = NonNull::new_unchecked(ctx);
@@ -516,6 +520,7 @@ impl<'js> Ctx<'js> {
     /// User must ensure that a lock was acquired over the runtime and that invariant is a unique
     /// lifetime which can't be coerced to a lifetime outside the scope of the lock of to the
     /// lifetime of another runtime.
+    #[inline]
     pub unsafe fn from_raw_invariant(ctx: NonNull<qjs::JSContext>, inv: Invariant<'js>) -> Self {
         unsafe { qjs::JS_DupContext(ctx.as_ptr()) };
         Ctx { ctx, _marker: inv }
@@ -527,6 +532,7 @@ impl<'js> Ctx<'js> {
     /// User must ensure that a lock was acquired over the runtime and that invariant is a unique
     /// lifetime which can't be coerced to a lifetime outside the scope of the lock of to the
     /// lifetime of another runtime.
+    #[inline]
     pub unsafe fn from_raw(ctx: NonNull<qjs::JSContext>) -> Self {
         unsafe { qjs::JS_DupContext(ctx.as_ptr()) };
         Ctx {

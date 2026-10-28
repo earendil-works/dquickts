@@ -132,6 +132,28 @@ unsafe fn __js_rc(v: JSValue) -> *mut JSRefCountHeader {
     (JS_VALUE_GET_PTR(v) as *mut u32).sub(1) as *mut JSRefCountHeader
 }
 
+/// The context reference count is stored in the memory block header right
+/// before the context, like the one of the reference counted values.
+#[inline]
+unsafe fn __js_ctx_rc(ctx: *mut JSContext) -> *mut JSRefCountHeader {
+    (ctx as *mut u32).sub(1) as *mut JSRefCountHeader
+}
+
+#[inline]
+pub unsafe fn JS_DupContext(ctx: *mut JSContext) -> *mut JSContext {
+    (*__js_ctx_rc(ctx)).ref_count += 1;
+    ctx
+}
+
+#[inline]
+pub unsafe fn JS_FreeContext(ctx: *mut JSContext) {
+    let p = __js_ctx_rc(ctx);
+    (*p).ref_count -= 1;
+    if (*p).ref_count <= 0 {
+        __JS_FreeContext(ctx);
+    }
+}
+
 #[inline]
 pub unsafe fn JS_FreeValue(ctx: *mut JSContext, v: JSValue) {
     if JS_VALUE_HAS_REF_COUNT(v) {
