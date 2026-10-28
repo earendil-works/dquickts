@@ -26,3 +26,12 @@ ns = await import("./fixture_import_attributes.json", { with: { type: "json" } }
 assert(ns.default === json, "dynamic import of a json module");
 ns = await import("./fixture_bytes_module.txt", { with: { type: "bytes" } });
 assert(ns.default === bytes, "dynamic import of a bytes module");
+
+/* upstream bellard/quickjs issue 423: a -M C module which is only
+   dynamically imported is initialized */
+ns = await import("../examples/fib.so");
+assert(ns.fib(10) === 55, "dynamic import of a C module");
+
+/* so are the system modules */
+ns = await import("bjson");
+assert(typeof ns.write === "function", "dynamic import of bjson");

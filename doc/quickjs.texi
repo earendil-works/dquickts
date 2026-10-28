@@ -216,7 +216,12 @@ find the name of the dynamically loaded modules.
 
 @item -M module_name[,cname]
 Add initialization code for an external C module. See the
-@code{c_module} example.
+@code{c_module} example. The external C modules and the @code{std},
+@code{os} and @code{bjson} modules are initialized when they are
+statically imported. They are all initialized if the code may import
+modules at run time (@code{import()}, @code{eval}, @code{Function},
+@code{std.evalScript}, @code{std.loadScript} or @code{os.Worker}) so
+that a dynamic import finds them.
 
 @item -x
 Byte swapped output (only used for cross compilation).

@@ -58,10 +58,10 @@ typedef struct {
 
 static namelist_t cname_list;
 /* flags: CMODULE_SYSTEM for std, os and bjson, whose needs are given in
-   feature_list */
+   feature_list, CMODULE_USED if statically imported */
 #define CMODULE_SYSTEM 1
+#define CMODULE_USED   2
 static namelist_t cmodule_list;
-static namelist_t init_module_list;
 static uint64_t feature_bitmap;
 static FILE *outfile;
 static BOOL byte_swap;
@@ -112,6 +112,9 @@ static const char experimental_names[] =
 static BOOL no_unused;
 static uint64_t used_feature_bitmap;
 static BOOL used_experimental;
+/* the code may import modules at run time (import(), eval, Worker...):
+   all the declared C modules are initialized */
+static BOOL may_import;
 
 /* return TRUE if 'name' is a word of the space separated list 'names' */
 static BOOL has_name(const char *names, const char *name)
@@ -144,6 +147,8 @@ static void mark_used_name(const char *name)
         if (has_name(feature_list[i].names, name))
             used_feature_bitmap |= (uint64_t)1 << i;
     }
+    if (has_name(feature_list[FE_EVAL].names, name))
+        may_import = TRUE;
 #ifdef CONFIG_TEMPORAL_INTL
     if (has_name(experimental_names, name))
         used_experimental = TRUE;
@@ -158,6 +163,7 @@ static void mark_used_atom(JSContext *ctx, JSAtom name, void *opaque)
     if (!str) {
         JS_FreeValue(ctx, JS_GetException(ctx));
         mark_all_used();
+        may_import = TRUE;
         return;
     }
     mark_used_name(str);
@@ -275,7 +281,9 @@ static void output_object_code(JSContext *ctx,
         flags = 0;
     } else {
         flags = JS_WRITE_OBJ_BYTECODE;
-        if (no_unused && JS_EnumCodeNames(ctx, obj, mark_used_atom, NULL)) {
+        /* also needed without -fno-unused to know if the code may
+           import modules at run time */
+        if (JS_EnumCodeNames(ctx, obj, mark_used_atom, NULL)) {
             js_std_dump_error(ctx);
             exit(1);
         }
@@ -342,8 +350,7 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
             mark_used_name(e->name);
         else
             mark_all_used(); /* unknown needs */
-        /* add in the static init module list */
-        namelist_add(&init_module_list, e->name, e->short_name, 0);
+        e->flags |= CMODULE_USED;
         /* create a dummy module */
         m = JS_NewCModule(ctx, module_name, js_module_dummy_init);
     } else if (has_suffix(module_name, ".so")) {
@@ -972,10 +979,12 @@ int main(int argc, char **argv)
 #endif
         /* add the precompiled modules (XXX: could modify the module
            loader instead) */
-        for(i = 0; i < init_module_list.count; i++) {
-            namelist_entry_t *e = &init_module_list.array[i];
-            /* initialize the static C modules */
-
+        for(i = 0; i < cmodule_list.count; i++) {
+            namelist_entry_t *e = &cmodule_list.array[i];
+            /* initialize the static C modules which are imported, or
+               all of them if a dynamic import may need them */
+            if (!(e->flags & CMODULE_USED) && !may_import)
+                continue;
             fprintf(fo,
                     "  {\n"
                     "    extern JSModuleDef *js_init_module_%s(JSContext *ctx, const char *name);\n"
@@ -1038,6 +1047,5 @@ int main(int argc, char **argv)
     }
     namelist_free(&cname_list);
     namelist_free(&cmodule_list);
-    namelist_free(&init_module_list);
     return 0;
 }
