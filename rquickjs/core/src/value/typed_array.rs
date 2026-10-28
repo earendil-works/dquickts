@@ -7,7 +7,7 @@ use crate::{
 use core::{
     assert, debug_assert_eq, fmt,
     marker::PhantomData,
-    mem::{self, MaybeUninit},
+    mem,
     ops::Deref,
     panic,
     ptr::{null_mut, NonNull},
@@ -200,9 +200,10 @@ impl<'js, T> TypedArray<'js, T> {
         Err(Error::new_from_js("object", T::CLASS_NAME.to_str()))
     }
 
-    /// Returns the underlying bytes of the buffer,
+    /// Returns the bytes viewed by the typed array.
     ///
-    /// Returns `None` if the array is detached.
+    /// Returns `None` if the buffer is detached or the array is out of bounds of a
+    /// resized buffer. A length-tracking array covers the current length of its buffer.
     ///
     /// # Safety
     ///
@@ -220,7 +221,7 @@ impl<'js, T> TypedArray<'js, T> {
     /// resizable buffer, reallocate the backing store and free this pointer.
     /// Treat the pointer as invalidated after any call back into the engine.
     ///
-    /// Returns None if the buffer was already detached.
+    /// Returns None if the buffer is detached or the array is out of bounds.
     pub fn as_raw(&self) -> Option<NonNull<[u8]>> {
         let (_, len, ptr) = Self::get_raw_bytes(self.as_value())?;
         Some(NonNull::slice_from_raw_parts(ptr, len))
@@ -261,38 +262,25 @@ impl<'js, T> TypedArray<'js, T> {
         Ok(Self(Object(val), PhantomData))
     }
 
+    /// Returns the element size, the byte length and the start of the view, or `None` if
+    /// `val` is not a typed array, is out of bounds or its buffer is detached.
     pub(crate) fn get_raw_bytes(val: &Value<'js>) -> Option<(usize, usize, NonNull<u8>)> {
-        let ctx = &val.ctx;
-        let val = val.as_js_value();
-        let mut off = MaybeUninit::<qjs::size_t>::uninit();
-        let mut len = MaybeUninit::<qjs::size_t>::uninit();
-        let mut stp = MaybeUninit::<qjs::size_t>::uninit();
-        let buf = unsafe {
-            let val = qjs::JS_GetTypedArrayBuffer(
-                ctx.as_ptr(),
-                val,
-                off.as_mut_ptr(),
-                len.as_mut_ptr(),
-                stp.as_mut_ptr(),
-            );
-            ctx.handle_exception(val).ok()?;
-            Value::from_js_value(ctx.clone(), val)
+        let mut len: qjs::size_t = 0;
+        let mut stp: qjs::size_t = 0;
+        // SAFETY: the call neither runs JS nor raises an exception; the buffer object is
+        // not referenced, the pointer is only valid until JS runs again.
+        let ptr = unsafe {
+            qjs::JS_GetTypedArrayData(
+                val.ctx.as_ptr(),
+                val.as_js_value(),
+                null_mut(),
+                &mut len,
+                &mut stp,
+            )
         };
-        let off: usize = unsafe { off.assume_init() }
-            .try_into()
-            .expect(qjs::SIZE_T_ERROR);
-        let len: usize = unsafe { len.assume_init() }
-            .try_into()
-            .expect(qjs::SIZE_T_ERROR);
-        let stp: usize = unsafe { stp.assume_init() }
-            .try_into()
-            .expect(qjs::SIZE_T_ERROR);
-        let raw = ArrayBuffer::get_raw(&buf)?;
-        if (off + len) > raw.len() {
-            return None;
-        }
-        // SAFETY: ptr was non-null and then we added an offset so it should still be non null
-        let ptr = unsafe { raw.cast::<u8>().add(off) };
+        let ptr = NonNull::new(ptr)?;
+        let len: usize = len.try_into().expect(qjs::SIZE_T_ERROR);
+        let stp: usize = stp.try_into().expect(qjs::SIZE_T_ERROR);
         Some((stp, len, ptr))
     }
 
@@ -502,6 +490,72 @@ mod test {
             res[4..].copy_from_slice(&bytes_1);
 
             assert_eq!(unsafe { val.as_bytes() }.unwrap(), &res)
+        });
+    }
+
+    #[test]
+    fn as_bytes_view_with_offset() {
+        test_with(|ctx| {
+            let val: TypedArray<f64> = ctx
+                .eval("var ab = new ArrayBuffer(32); var t = new Float64Array(ab, 8, 2); t[0] = 1.5; t[1] = -2; t")
+                .unwrap();
+            let bytes = unsafe { val.as_bytes() }.unwrap();
+            assert_eq!(bytes.len(), 16);
+            assert_eq!(&bytes[..8], &1.5f64.to_ne_bytes());
+            assert_eq!(unsafe { val.as_slice() }, &[1.5f64, -2.0]);
+            assert_eq!(val.len(), 2);
+            let i16s: TypedArray<i16> = ctx.eval("new Int16Array(ab, 30)").unwrap();
+            assert_eq!(unsafe { i16s.as_bytes() }.unwrap().len(), 2);
+            assert_eq!(i16s.len(), 1);
+            assert!(!ctx.has_exception());
+        });
+    }
+
+    #[test]
+    fn detached_and_out_of_bounds() {
+        test_with(|ctx| {
+            let det: TypedArray<i32> = ctx
+                .eval("var d = new Int32Array(4); d.buffer.transfer(); d")
+                .unwrap();
+            assert!(det.as_raw().is_none());
+            assert!(unsafe { det.as_bytes() }.is_none());
+            assert_eq!(det.len(), 0);
+            // fixed length view of a shrunk resizable buffer
+            let oob: TypedArray<u16> = ctx
+                .eval("var rab = new ArrayBuffer(8, { maxByteLength: 8 }); var o = new Uint16Array(rab, 2, 2); rab.resize(4); o")
+                .unwrap();
+            assert!(oob.as_raw().is_none());
+            assert_eq!(oob.len(), 0);
+            ctx.eval::<(), _>("rab.resize(6)").unwrap();
+            assert_eq!(unsafe { oob.as_bytes() }.unwrap().len(), 4);
+            assert_eq!(oob.len(), 2);
+            // probing does not leave a pending exception behind
+            assert!(!ctx.has_exception());
+        });
+    }
+
+    #[test]
+    fn length_tracking() {
+        test_with(|ctx| {
+            let val: TypedArray<i32> = ctx
+                .eval("var rab = new ArrayBuffer(8, { maxByteLength: 32 }); var t = new Int32Array(rab, 4); rab.resize(20); t[3] = 7; t")
+                .unwrap();
+            assert_eq!(unsafe { val.as_slice() }, &[0i32, 0, 0, 7]);
+            assert_eq!(val.len(), 4);
+            ctx.eval::<(), _>("rab.resize(9)").unwrap();
+            assert_eq!(unsafe { val.as_slice() }, &[0i32]);
+            ctx.eval::<(), _>("rab.resize(4)").unwrap();
+            assert_eq!(unsafe { val.as_bytes() }.unwrap().len(), 0);
+            ctx.eval::<(), _>("rab.resize(2)").unwrap();
+            assert!(val.as_raw().is_none());
+            assert_eq!(val.len(), 0);
+
+            let shared: TypedArray<u16> = ctx
+                .eval("var sab = new SharedArrayBuffer(4, { maxByteLength: 16 }); var s = new Uint16Array(sab, 2); sab.grow(12); s[4] = 9; s")
+                .unwrap();
+            assert_eq!(unsafe { shared.as_slice() }, &[0u16, 0, 0, 0, 9]);
+            assert_eq!(shared.len(), 5);
+            assert!(!ctx.has_exception());
         });
     }
 
