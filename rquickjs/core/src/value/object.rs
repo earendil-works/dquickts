@@ -1454,11 +1454,19 @@ mod test {
         .unwrap()
     }
 
-    /// `props` set one by one on a new object, and with the builders.
+    /// `props` set one by one on a new object, and with the builders, or the name of the
+    /// exception thrown (caught after each way).
     fn build_all_ways<'js>(
         ctx: &Ctx<'js>,
         props: &[(&str, Value<'js>)],
-    ) -> [Result<Object<'js>>; 3] {
+    ) -> [core::result::Result<Object<'js>, StdString>; 3] {
+        let caught = |res: Result<Object<'js>>| {
+            res.map_err(|error| {
+                assert!(matches!(error, Error::Exception));
+                let error = ctx.catch().get::<Object>().unwrap();
+                error.get::<_, StdString>("name").unwrap()
+            })
+        };
         let set = || -> Result<Object<'js>> {
             let obj = Object::new(ctx.clone())?;
             for (key, value) in props {
@@ -1474,7 +1482,7 @@ mod test {
             builder.build()
         };
         let collected = || props.iter().cloned().collect_js::<Object>(ctx);
-        [set(), built(), collected()]
+        [caught(set()), caught(built()), caught(collected())]
     }
 
     #[test]
@@ -1539,9 +1547,7 @@ mod test {
             // a read-only property of the prototype makes the set fail
             let props = [("a", int(1)), ("readOnly", int(2))];
             for obj in build_all_ways(&ctx, &props) {
-                assert!(matches!(obj, Err(Error::Exception)));
-                let error: StdString = ctx.catch().get::<Object>().unwrap().get("name").unwrap();
-                assert_eq!(error, "TypeError");
+                assert_eq!(obj.unwrap_err(), "TypeError");
             }
 
             // each key is checked when it is set, as Object::set would
