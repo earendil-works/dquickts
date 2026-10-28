@@ -339,6 +339,15 @@ function test_string()
     assert(eval('"\0"'), "\0");
 
     assert("abc".padStart(Infinity, ""), "abc");
+
+    /* filled with one character, widening 8 bit strings */
+    assert("x".repeat(0), "");
+    assert("x".repeat(3), "xxx");
+    assert("\u2713".repeat(3), "\u2713\u2713\u2713");
+    assert("ab".padStart(5, "\u2713"), "\u2713\u2713\u2713ab");
+    assert("ab".padEnd(5, "\xe9"), "ab\xe9\xe9\xe9");
+    assert("\u0100b".padEnd(4, "c"), "\u0100bcc");
+    assert("\u0100b".padStart(4, "\u2713"), "\u2713\u2713\u0100b");
 }
 
 function test_math()

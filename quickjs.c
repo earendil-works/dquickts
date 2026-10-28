@@ -5090,17 +5090,28 @@ static int string_buffer_concat_value_free(StringBuffer *s, JSValue v)
     return res;
 }
 
+/* 0 <= c <= 0xffff */
 static int string_buffer_fill(StringBuffer *s, int c, int count)
 {
-    /* XXX: optimize */
+    int i;
+
+    if (count <= 0)
+        return 0;
     if (s->len + count > s->size) {
         if (string_buffer_realloc(s, s->len + count, c))
             return -1;
     }
-    while (count-- > 0) {
-        if (string_buffer_putc16(s, c))
+    if (!s->is_wide_char && c >= 0x100) {
+        if (string_buffer_widen(s, s->size))
             return -1;
     }
+    if (s->is_wide_char) {
+        for (i = 0; i < count; i++)
+            s->str->u.str16[s->len + i] = c;
+    } else {
+        memset(s->str->u.str8 + s->len, c, count);
+    }
+    s->len += count;
     return 0;
 }
 
