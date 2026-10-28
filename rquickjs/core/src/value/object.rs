@@ -1444,7 +1444,7 @@ mod test {
     }
 
     /// The own keys, prototype and JSON of `obj` in JavaScript.
-    fn describe(ctx: &Ctx<'_>, obj: &Object<'_>) -> StdString {
+    fn describe<'js>(ctx: &Ctx<'js>, obj: &Object<'js>) -> StdString {
         ctx.globals().set("described", obj.clone()).unwrap();
         ctx.eval(
             "`${Reflect.ownKeys(described).map(String)} | \
@@ -1528,7 +1528,10 @@ mod test {
             .unwrap();
             let props = [("a", int(1)), ("intercepted", int(2)), ("b", int(3))];
             for obj in build_all_ways(&ctx, &props) {
-                assert_eq!(describe(&ctx, &obj.unwrap()), "a,b | true | {\"a\":1,\"b\":3}");
+                assert_eq!(
+                    describe(&ctx, &obj.unwrap()),
+                    "a,b | true | {\"a\":1,\"b\":3}"
+                );
             }
             let log: Vec<i32> = ctx.eval("log").unwrap();
             assert_eq!(log, [2, 2, 2]);
@@ -1546,15 +1549,13 @@ mod test {
             run("log = []");
             let mut builder = ObjectBuilder::new(ctx.clone());
             builder.set("first", 1).unwrap();
-            run(
-                r#"
+            run(r#"
                 for (const key of ['first', 'second']) {
                     Object.defineProperty(Object.prototype, key, {
                         set(v) { log.push(key) }, configurable: true,
                     });
                 }
-            "#,
-            );
+            "#);
             builder.set("second", 2).unwrap();
             run("delete Object.prototype.second");
             builder.set("third", 3).unwrap();
