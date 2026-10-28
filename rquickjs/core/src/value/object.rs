@@ -4,7 +4,8 @@ use crate::{
     convert::FromIteratorJs, qjs, Array, Atom, Ctx, FromAtom, FromJs, IntoAtom, IntoJs, Result,
     Value,
 };
-use core::{iter::FusedIterator, marker::PhantomData, mem};
+use alloc::vec::Vec;
+use core::{iter::FusedIterator, marker::PhantomData, mem, mem::MaybeUninit, slice};
 
 mod property;
 pub use property::{Accessor, AsProperty, Property, PropertyFlags};
@@ -684,18 +685,196 @@ where
     where
         T: IntoIterator<Item = (K, V)>,
     {
-        let object = Object::new(ctx.clone())?;
+        let mut builder = ObjectBuilder::new(ctx.clone());
         for (key, value) in iter {
-            let key = key.into_atom(ctx)?;
-            let value = value.into_js(ctx)?;
-            object.set(key, value)?;
+            builder.set(key, value)?;
         }
-        Ok(object)
+        builder.build()
+    }
+}
+
+/// Number of properties of an object being built which are stored without allocation.
+const INLINE_PROPS: usize = 16;
+
+/// `JS_NewObjectFrom()` takes at most `i32::MAX` properties.
+const MAX_PROPS: usize = i32::MAX as usize;
+
+/// Items of the properties of an object being built, inline up to [`INLINE_PROPS`] items.
+struct PropBuf<T: Copy> {
+    len: usize,
+    inline: [MaybeUninit<T>; INLINE_PROPS],
+    /// All the items once there are more than [`INLINE_PROPS`].
+    heap: Vec<T>,
+}
+
+impl<T: Copy> PropBuf<T> {
+    fn new() -> Self {
+        PropBuf {
+            len: 0,
+            inline: [const { MaybeUninit::uninit() }; INLINE_PROPS],
+            heap: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, item: T) {
+        if self.len < INLINE_PROPS {
+            self.inline[self.len].write(item);
+        } else {
+            if self.len == INLINE_PROPS {
+                self.heap.reserve(2 * INLINE_PROPS);
+                for inline in &self.inline {
+                    // SAFETY: the inline items are all initialized
+                    self.heap.push(unsafe { inline.assume_init_read() });
+                }
+            }
+            self.heap.push(item);
+        }
+        self.len += 1;
+    }
+
+    fn as_slice(&self) -> &[T] {
+        if self.len <= INLINE_PROPS {
+            // SAFETY: the first `len` inline items are initialized
+            unsafe { slice::from_raw_parts(self.inline.as_ptr().cast::<T>(), self.len) }
+        } else {
+            &self.heap
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.heap.clear();
+    }
+}
+
+/// Create an object with the properties `atoms[i] = values[i]` defined as by
+/// `JS_NewObjectFrom()`, which consumes the values even on failure.
+///
+/// # Safety
+/// The atoms and the owned values must belong to the runtime of `ctx`, at most [`MAX_PROPS`].
+unsafe fn new_object_from<'js>(
+    ctx: &Ctx<'js>,
+    atoms: &[qjs::JSAtom],
+    values: &[qjs::JSValue],
+) -> Result<Object<'js>> {
+    debug_assert!(atoms.len() == values.len() && values.len() <= MAX_PROPS);
+    let val = qjs::JS_NewObjectFrom(
+        ctx.as_ptr(),
+        values.len() as _,
+        atoms.as_ptr(),
+        values.as_ptr(),
+    );
+    let val = ctx.handle_exception(val)?;
+    Ok(Object::from_js_value(ctx.clone(), val))
+}
+
+/// Whether [`Object::set`] of `atom` on a new object of [`Object::new`] without this property
+/// only defines it, so that it can be created with the object.
+fn set_is_define(ctx: &Ctx<'_>, atom: qjs::JSAtom) -> bool {
+    unsafe { qjs::JS_NewObjectSetIsDefine(ctx.as_ptr(), atom) != 0 }
+}
+
+/// Builder of a new object: the same as [`Object::new`] followed by [`Object::set`] of each
+/// property, faster.
+///
+/// Setting a property of a new object creates it, unless the prototype chain intercepts it with
+/// a setter (like `__proto__`, which changes the prototype), a read-only property or an exotic
+/// object. While none does, checked for each property when it is set, the properties are kept to
+/// create the object with all of them at once and its final shape. From the first intercepted
+/// property on, the object is created and the properties are set on it one by one.
+///
+/// ```
+/// # use rquickjs::{Runtime, Context, object::ObjectBuilder};
+/// # let rt = Runtime::new().unwrap();
+/// # let ctx = Context::full(&rt).unwrap();
+/// # ctx.with(|ctx| {
+/// let mut builder = ObjectBuilder::new(ctx.clone());
+/// builder.set("x", 1)?;
+/// builder.set("y", "two")?;
+/// let obj = builder.build()?;
+/// assert_eq!(obj.get::<_, i32>("x")?, 1);
+/// # rquickjs::Result::Ok(())
+/// # }).unwrap();
+/// ```
+pub struct ObjectBuilder<'js> {
+    ctx: Ctx<'js>,
+    /// The owned atoms of the properties to create with the object.
+    atoms: PropBuf<qjs::JSAtom>,
+    /// The owned values of the properties to create with the object.
+    values: PropBuf<qjs::JSValue>,
+    /// The object, once a property must be set on it.
+    object: Option<Object<'js>>,
+}
+
+impl<'js> ObjectBuilder<'js> {
+    /// Start building a new object.
+    pub fn new(ctx: Ctx<'js>) -> Self {
+        ObjectBuilder {
+            ctx,
+            atoms: PropBuf::new(),
+            values: PropBuf::new(),
+            object: None,
+        }
+    }
+
+    /// Set a property of the object, as [`Object::set`] would.
+    pub fn set<K: IntoAtom<'js>, V: IntoJs<'js>>(&mut self, key: K, value: V) -> Result<()> {
+        let key = key.into_atom(&self.ctx)?;
+        let value = value.into_js(&self.ctx)?;
+        if self.object.is_none()
+            && self.values.len() < MAX_PROPS
+            && set_is_define(&self.ctx, key.atom)
+        {
+            self.atoms.push(key.into_atom_val());
+            self.values.push(value.into_js_value());
+            return Ok(());
+        }
+        self.object()?.set(key, value)
+    }
+
+    /// The object, created with the kept properties on first call.
+    fn object(&mut self) -> Result<&Object<'js>> {
+        if self.object.is_none() {
+            let res = unsafe {
+                new_object_from(&self.ctx, self.atoms.as_slice(), self.values.as_slice())
+            };
+            self.values.clear();
+            self.free_atoms();
+            self.object = Some(res?);
+        }
+        Ok(self.object.as_ref().unwrap())
+    }
+
+    fn free_atoms(&mut self) {
+        for &atom in self.atoms.as_slice() {
+            unsafe { qjs::JS_FreeAtom(self.ctx.as_ptr(), atom) };
+        }
+        self.atoms.clear();
+    }
+
+    /// Get the object with all its properties.
+    pub fn build(mut self) -> Result<Object<'js>> {
+        self.object()?;
+        Ok(self.object.take().unwrap())
+    }
+}
+
+impl Drop for ObjectBuilder<'_> {
+    fn drop(&mut self) {
+        for &value in self.values.as_slice() {
+            unsafe { qjs::JS_FreeValue(self.ctx.as_ptr(), value) };
+        }
+        self.free_atoms();
     }
 }
 
 #[cfg(test)]
 mod test {
+    use super::ObjectBuilder;
     use crate::*;
 
     #[test]
@@ -1153,6 +1332,131 @@ mod test {
             let expected: [(StdString, i32); 3] =
                 [("c\0d".into(), 3), ("b".into(), 2), ("a".into(), 1)];
             assert_eq!(props, expected);
+        })
+    }
+
+    /// The own keys, prototype and JSON of `obj` in JavaScript.
+    fn describe(ctx: &Ctx<'_>, obj: &Object<'_>) -> StdString {
+        ctx.globals().set("described", obj.clone()).unwrap();
+        ctx.eval(
+            "`${Reflect.ownKeys(described).map(String)} | \
+             ${Object.getPrototypeOf(described) === Object.prototype} | \
+             ${JSON.stringify(described)}`",
+        )
+        .unwrap()
+    }
+
+    /// `props` set one by one on a new object, and with the builders.
+    fn build_all_ways<'js>(
+        ctx: &Ctx<'js>,
+        props: &[(&str, Value<'js>)],
+    ) -> [Result<Object<'js>>; 3] {
+        let set = || -> Result<Object<'js>> {
+            let obj = Object::new(ctx.clone())?;
+            for (key, value) in props {
+                obj.set(*key, value.clone())?;
+            }
+            Ok(obj)
+        };
+        let built = || -> Result<Object<'js>> {
+            let mut builder = ObjectBuilder::new(ctx.clone());
+            for (key, value) in props {
+                builder.set(*key, value.clone())?;
+            }
+            builder.build()
+        };
+        let collected = || props.iter().cloned().collect_js::<Object>(ctx);
+        [set(), built(), collected()]
+    }
+
+    #[test]
+    fn builder_same_as_set() {
+        test_with(|ctx| {
+            let int = |i: i32| Value::new_int(ctx.clone(), i);
+            let proto: Value = ctx.eval("({ inherited: 1 })").unwrap();
+            let cases: [&[(&str, Value)]; 6] = [
+                &[],
+                &[("b", int(0)), ("1", int(1)), ("a", int(2)), ("0", int(3))],
+                // a repeated key keeps its position and gets the last value
+                &[("a", int(0)), ("b", int(1)), ("a", int(2))],
+                // '__proto__' sets the prototype, from the first or a later key
+                &[("__proto__", proto.clone()), ("x", int(1))],
+                &[("x", int(1)), ("__proto__", proto.clone()), ("y", int(2))],
+                // own data properties of Object.prototype are shadowed
+                &[("toString", int(1)), ("hasOwnProperty", int(2))],
+            ];
+            for props in cases {
+                let [set, built, collected] = build_all_ways(&ctx, props);
+                let expected = describe(&ctx, &set.unwrap());
+                assert_eq!(describe(&ctx, &built.unwrap()), expected);
+                assert_eq!(describe(&ctx, &collected.unwrap()), expected);
+            }
+            let [_, built, _] = build_all_ways(&ctx, cases[3]);
+            assert_eq!(built.unwrap().get::<_, i32>("inherited").unwrap(), 1);
+
+            // more properties than kept inline
+            let keys: Vec<StdString> = (0..40).map(|i| format!("k{i}")).collect();
+            let props: Vec<(&str, Value)> = keys.iter().map(|k| (k.as_str(), int(1))).collect();
+            let [set, built, collected] = build_all_ways(&ctx, &props);
+            let expected = describe(&ctx, &set.unwrap());
+            assert_eq!(describe(&ctx, &built.unwrap()), expected);
+            assert_eq!(describe(&ctx, &collected.unwrap()), expected);
+        })
+    }
+
+    #[test]
+    fn builder_prototype_setters() {
+        test_with(|ctx| {
+            let int = |i: i32| Value::new_int(ctx.clone(), i);
+            ctx.eval::<(), _>(
+                r#"
+                var log = [];
+                Object.defineProperty(Object.prototype, 'intercepted', {
+                    set(v) { log.push(v) }, configurable: true,
+                });
+                Object.defineProperty(Object.prototype, 'readOnly', { value: 0, configurable: true });
+            "#,
+            )
+            .unwrap();
+            let props = [("a", int(1)), ("intercepted", int(2)), ("b", int(3))];
+            for obj in build_all_ways(&ctx, &props) {
+                assert_eq!(describe(&ctx, &obj.unwrap()), "a,b | true | {\"a\":1,\"b\":3}");
+            }
+            let log: Vec<i32> = ctx.eval("log").unwrap();
+            assert_eq!(log, [2, 2, 2]);
+
+            // a read-only property of the prototype makes the set fail
+            let props = [("a", int(1)), ("readOnly", int(2))];
+            for obj in build_all_ways(&ctx, &props) {
+                assert!(matches!(obj, Err(Error::Exception)));
+                let error: StdString = ctx.catch().get::<Object>().unwrap().get("name").unwrap();
+                assert_eq!(error, "TypeError");
+            }
+
+            // each key is checked when it is set, as Object::set would
+            let run = |src: &str| ctx.eval::<(), _>(src).unwrap();
+            run("log = []");
+            let mut builder = ObjectBuilder::new(ctx.clone());
+            builder.set("first", 1).unwrap();
+            run(
+                r#"
+                for (const key of ['first', 'second']) {
+                    Object.defineProperty(Object.prototype, key, {
+                        set(v) { log.push(key) }, configurable: true,
+                    });
+                }
+            "#,
+            );
+            builder.set("second", 2).unwrap();
+            run("delete Object.prototype.second");
+            builder.set("third", 3).unwrap();
+            let obj = builder.build().unwrap();
+            assert_eq!(
+                describe(&ctx, &obj),
+                "first,third | true | {\"first\":1,\"third\":3}"
+            );
+            let log: Vec<StdString> = ctx.eval("log").unwrap();
+            assert_eq!(log, ["second"]);
         })
     }
 

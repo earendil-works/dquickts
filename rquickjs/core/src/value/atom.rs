@@ -6,7 +6,7 @@ use crate::{
     Ctx, Error, Result, String, Value,
 };
 use alloc::string::{String as StdString, ToString as _};
-use core::{hash::Hash, slice};
+use core::{hash::Hash, mem, slice};
 
 mod predefined;
 pub use predefined::PredefinedAtom;
@@ -185,6 +185,14 @@ impl<'js> Atom<'js> {
     pub(crate) unsafe fn from_atom_val_dup(ctx: Ctx<'js>, val: qjs::JSAtom) -> Self {
         qjs::JS_DupAtom(ctx.as_ptr(), val);
         Atom { atom: val, ctx }
+    }
+
+    /// Take the atom, whose reference the caller then owns.
+    pub(crate) fn into_atom_val(self) -> qjs::JSAtom {
+        let atom = self.atom;
+        unsafe { qjs::JS_FreeContext(self.ctx.as_ptr()) };
+        mem::forget(self);
+        atom
     }
 }
 
