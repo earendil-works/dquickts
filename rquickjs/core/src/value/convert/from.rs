@@ -84,7 +84,19 @@ impl<'js> FromJs<'js> for CString<'js> {
 
 /// Convert from JS as any
 impl<'js> FromJs<'js> for () {
+    #[inline]
     fn from_js(_: &Ctx<'js>, _: Value<'js>) -> Result<Self> {
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn from_js_raw(_: &Ctx<'js>, _: qjs::JSValueConst) -> Result<Self> {
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn from_js_raw_owned(ctx: &Ctx<'js>, value: qjs::JSValue) -> Result<Self> {
+        qjs::JS_FreeValue(ctx.as_ptr(), value);
         Ok(())
     }
 }
@@ -171,6 +183,33 @@ fn number_match_range<T: PartialOrd>(
     }
 }
 
+/// The payload getters and the error of the primitive conversions from raw values.
+mod raw {
+    use crate::{qjs, Ctx, Error, Value};
+
+    #[inline]
+    pub unsafe fn get_bool(value: qjs::JSValueConst) -> bool {
+        qjs::JS_VALUE_GET_BOOL(value)
+    }
+
+    #[inline]
+    pub unsafe fn get_int(value: qjs::JSValueConst) -> i32 {
+        qjs::JS_VALUE_GET_INT(value)
+    }
+
+    #[inline]
+    pub unsafe fn get_float(value: qjs::JSValueConst) -> f64 {
+        qjs::JS_VALUE_GET_FLOAT64(value)
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub unsafe fn type_error(ctx: &Ctx<'_>, value: qjs::JSValueConst, to: &'static str) -> Error {
+        let value = Value::from_js_value_const(ctx.clone(), value);
+        Error::new_from_js(value.type_of().as_str(), to)
+    }
+}
+
 macro_rules! from_js_impls {
     // for reference types
     (ref: $($(#[$meta:meta])* $type:ident,)*) => {
@@ -253,11 +292,23 @@ macro_rules! from_js_impls {
         $(
             impl<'js> FromJs<'js> for $type {
                 #[inline]
-                fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-                    match unsafe { qjs::JS_VALUE_GET_NORM_TAG(value.value) } {
-                        $(qjs::$jstag => Ok(unsafe { value.$getfn() } as _),)*
-                        _ => Err(Error::new_from_js(value.type_of().as_str(), stringify!($type))),
+                fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+                    unsafe { Self::from_js_raw(ctx, value.as_js_value()) }
+                }
+
+                #[inline]
+                unsafe fn from_js_raw(ctx: &Ctx<'js>, value: qjs::JSValueConst) -> Result<Self> {
+                    match qjs::JS_VALUE_GET_NORM_TAG(value) {
+                        $(qjs::$jstag => Ok(raw::$getfn(value) as _),)*
+                        _ => Err(raw::type_error(ctx, value, stringify!($type))),
                     }
+                }
+
+                #[inline]
+                unsafe fn from_js_raw_owned(ctx: &Ctx<'js>, value: qjs::JSValue) -> Result<Self> {
+                    let res = Self::from_js_raw(ctx, value);
+                    qjs::JS_FreeValue(ctx.as_ptr(), value);
+                    res
                 }
             }
         )*
@@ -268,10 +319,23 @@ macro_rules! from_js_impls {
         $(
             $(
                 impl<'js> FromJs<'js> for $type {
+                    #[inline]
                     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-                        let num = <$base>::from_js(ctx, value)?;
+                        unsafe { Self::from_js_raw(ctx, value.as_js_value()) }
+                    }
+
+                    #[inline]
+                    unsafe fn from_js_raw(ctx: &Ctx<'js>, value: qjs::JSValueConst) -> Result<Self> {
+                        let num = <$base>::from_js_raw(ctx, value)?;
                         number_match_range(num, $type::MIN as $base, $type::MAX as $base, stringify!($base), stringify!($type))?;
                         Ok(num as $type)
+                    }
+
+                    #[inline]
+                    unsafe fn from_js_raw_owned(ctx: &Ctx<'js>, value: qjs::JSValue) -> Result<Self> {
+                        let res = Self::from_js_raw(ctx, value);
+                        qjs::JS_FreeValue(ctx.as_ptr(), value);
+                        res
                     }
                 }
             )*

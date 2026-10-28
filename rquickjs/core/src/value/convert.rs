@@ -1,6 +1,6 @@
 //! Utilities for converting to and from JavaScript values.
 
-use crate::{Atom, Ctx, Result, Value};
+use crate::{qjs, Atom, Ctx, Result, Value};
 
 mod atom;
 mod coerce;
@@ -46,6 +46,33 @@ pub struct Coerced<T>(pub T);
 /// to one if it is required.
 pub trait FromJs<'js>: Sized {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self>;
+
+    /// Converts a borrowed raw value of `ctx`; the caller keeps its reference.
+    ///
+    /// Same as [`FromJs::from_js`], which it calls by default. The primitive types override
+    /// it to convert from the value tag without wrapping the value in a [`Value`] (and cloning
+    /// the context for it).
+    ///
+    /// # Safety
+    /// `value` must be a live value of the context of `ctx`.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn from_js_raw(ctx: &Ctx<'js>, value: qjs::JSValueConst) -> Result<Self> {
+        Self::from_js(ctx, Value::from_js_value_const(ctx.clone(), value))
+    }
+
+    /// Converts an owned raw value of `ctx`, taking its reference.
+    ///
+    /// Same as [`FromJs::from_js`], which it calls by default. The primitive types override
+    /// it like [`FromJs::from_js_raw`].
+    ///
+    /// # Safety
+    /// `value` must be a live value of the context of `ctx`, owned by the caller.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn from_js_raw_owned(ctx: &Ctx<'js>, value: qjs::JSValue) -> Result<Self> {
+        Self::from_js(ctx, Value::from_js_value(ctx.clone(), value))
+    }
 }
 
 /// Trait for converting values from atoms.
@@ -65,6 +92,19 @@ pub trait FromIteratorJs<'js, A>: Sized {
 /// For converting Rust values to JavaScript values
 pub trait IntoJs<'js> {
     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>>;
+
+    /// Converts into an owned raw value of `ctx`.
+    ///
+    /// Same as [`IntoJs::into_js`], which it calls by default. The primitive types override it
+    /// to create the value without a [`Value`] (and the context clone it needs).
+    #[doc(hidden)]
+    #[inline]
+    fn into_js_raw(self, ctx: &Ctx<'js>) -> Result<qjs::JSValue>
+    where
+        Self: Sized,
+    {
+        self.into_js(ctx).map(Value::into_js_value)
+    }
 }
 
 /// Trait for converting values to atoms.

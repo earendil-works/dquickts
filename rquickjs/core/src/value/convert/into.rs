@@ -1,5 +1,6 @@
 use crate::{
     convert::{IteratorJs, List},
+    qjs,
     value::Constructor,
     Array, CString, Ctx, Error, IntoAtom, IntoJs, Object, Result, StdResult, StdString, String,
     Value,
@@ -86,14 +87,26 @@ where
 }
 
 impl<'js> IntoJs<'js> for () {
+    #[inline]
     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         Ok(Value::new_undefined(ctx.clone()))
+    }
+
+    #[inline]
+    fn into_js_raw(self, _ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+        Ok(qjs::JS_UNDEFINED)
     }
 }
 
 impl<'js> IntoJs<'js> for &() {
+    #[inline]
     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         Ok(Value::new_undefined(ctx.clone()))
+    }
+
+    #[inline]
+    fn into_js_raw(self, _ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+        Ok(qjs::JS_UNDEFINED)
     }
 }
 
@@ -126,9 +139,16 @@ where
     T: IntoJs<'js>,
     Error: From<E>,
 {
+    #[inline]
     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.map_err(Error::from)
             .and_then(|value| value.into_js(ctx))
+    }
+
+    #[inline]
+    fn into_js_raw(self, ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+        self.map_err(Error::from)
+            .and_then(|value| value.into_js_raw(ctx))
     }
 }
 
@@ -355,14 +375,26 @@ macro_rules! into_js_impls {
         $(
             $(
                 impl<'js> IntoJs<'js> for $type {
+                    #[inline]
                     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
                         Ok(Value::$new(ctx.clone(), self as _))
+                    }
+
+                    #[inline]
+                    fn into_js_raw(self, _ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+                        Ok(raw::$new(self as _))
                     }
                 }
 
                 impl<'js> IntoJs<'js> for &$type {
+                    #[inline]
                     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
                         (*self).into_js(ctx)
+                    }
+
+                    #[inline]
+                    fn into_js_raw(self, ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+                        (*self).into_js_raw(ctx)
                     }
                 }
             )*
@@ -375,6 +407,7 @@ macro_rules! into_js_impls {
         $(
             $(
                 impl<'js> IntoJs<'js> for $type {
+                    #[inline]
                     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
                         let val = self as $alt1;
                         if val as $type == self {
@@ -383,11 +416,27 @@ macro_rules! into_js_impls {
                             (self as $alt2).into_js(ctx)
                         }
                     }
+
+                    #[inline]
+                    fn into_js_raw(self, ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+                        let val = self as $alt1;
+                        if val as $type == self {
+                            val.into_js_raw(ctx)
+                        } else {
+                            (self as $alt2).into_js_raw(ctx)
+                        }
+                    }
                 }
 
                 impl<'js> IntoJs<'js> for &$type {
+                    #[inline]
                     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
                         (*self).into_js(ctx)
+                    }
+
+                    #[inline]
+                    fn into_js_raw(self, ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+                        (*self).into_js_raw(ctx)
                     }
                 }
             )*
@@ -467,6 +516,30 @@ into_js_impls! {
 into_js_impls! {
     val:
     i32 f64 => i64 u32 u64 usize isize,
+}
+
+/// The raw constructors of the primitive values, named after the `Value` constructors.
+mod raw {
+    use crate::qjs;
+
+    #[inline]
+    pub fn new_bool(value: bool) -> qjs::JSValue {
+        if value {
+            qjs::JS_TRUE
+        } else {
+            qjs::JS_FALSE
+        }
+    }
+
+    #[inline]
+    pub fn new_int(value: i32) -> qjs::JSValue {
+        qjs::JS_MKVAL(qjs::JS_TAG_INT, value)
+    }
+
+    #[inline]
+    pub fn new_float(value: f64) -> qjs::JSValue {
+        qjs::JS_NewFloat64(value)
+    }
 }
 
 #[allow(dead_code)]
