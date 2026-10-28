@@ -878,6 +878,43 @@ mod test {
     }
 
     #[test]
+    fn call_js_fn_with_owned_results() {
+        test_with(|ctx| {
+            let f: Function = ctx
+                .eval("(function(a, b) { 'use strict'; return { a, b, t: this } })")
+                .unwrap();
+            // the results outlive the arguments of the calls
+            let obj: Object = f.call((1, "x")).unwrap();
+            let val: Value = f.call((This(2), 3, Opt(Some(4)))).unwrap();
+            assert_eq!(obj.get::<_, StdString>("b").unwrap(), "x");
+            let obj2 = val.into_object().unwrap();
+            assert_eq!(obj2.get::<_, i32>("b").unwrap(), 4);
+            assert_eq!(obj2.get::<_, Value>("t").unwrap().as_number(), Some(2.0));
+            assert_eq!(obj2.get::<_, Option<i32>>("missing").unwrap(), None);
+            // a failed conversion of the result
+            let err = f.call::<_, StdString>((This(obj2.clone()), 5)).unwrap_err();
+            assert!(err.is_from_js(), "{err}");
+
+            let ctor: Constructor = ctx
+                .eval("(class { constructor(a, b) { this.v = a * b } })")
+                .unwrap();
+            let inst: Object = ctor.construct((6, 7)).unwrap();
+            assert_eq!(inst.get::<_, i32>("v").unwrap(), 42);
+
+            let thrower: Function = ctx.eval("(x) => { throw x + 1 }").unwrap();
+            let err = thrower.call::<_, i32>((1,)).unwrap_err();
+            assert!(err.is_exception(), "{err}");
+            assert_eq!(ctx.catch().as_int(), Some(2));
+
+            let getter: Object = ctx.eval("({ get x() { throw 'g' } })").unwrap();
+            let err = getter.get::<_, i32>("x").unwrap_err();
+            assert!(err.is_exception(), "{err}");
+            let caught: StdString = ctx.catch().get().unwrap();
+            assert_eq!(caught, "g");
+        })
+    }
+
+    #[test]
     fn call_js_fn_of_other_context() {
         use crate::function::Args;
 
