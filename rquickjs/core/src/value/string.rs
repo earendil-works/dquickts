@@ -16,10 +16,10 @@ pub(crate) enum StringData<'a> {
 }
 
 // UTF-8 encoders of the engine's string representations. They count the
-// exact output length in a vectorizable pass first, then encode runs of
-// words (8 Latin-1 bytes, 4 UTF-16 code units) that need the same number of
-// bytes per character with loops that the compiler vectorizes, and mixed
-// words character by character.
+// exact output length in a vectorizable pass first. A string of characters
+// of one UTF-8 length is encoded with a loop that the compiler vectorizes;
+// Latin-1 also in runs of 8 byte words of one length, mixed words and
+// mixed UTF-16 strings character by character.
 
 /// Elements per block of the counting passes: the per block counters are
 /// `u16` lanes, which vectorize well, and grow by at most 2 per element.
@@ -28,47 +28,11 @@ const COUNT_BLOCK: usize = 1 << 14;
 /// The high bit of each byte of a word of 8 Latin-1 bytes.
 const HIGH_BYTES: u64 = 0x8080_8080_8080_8080;
 
-/// 1 in each 16-bit lane of a word of 4 UTF-16 code units.
-const LANES: u64 = 0x0001_0001_0001_0001;
-
 /// Load 8 bytes as a word (the byte order does not matter to the tests of
 /// the high bits).
 #[inline(always)]
 fn word8(bytes: &[u8], i: usize) -> u64 {
     u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap())
-}
-
-/// Load 4 code units as a word of 16-bit lanes.
-#[inline(always)]
-fn word16(units: &[u16], i: usize) -> u64 {
-    let u: &[u16; 4] = units[i..i + 4].try_into().unwrap();
-    u64::from(u[0]) | (u64::from(u[1]) << 16) | (u64::from(u[2]) << 32) | (u64::from(u[3]) << 48)
-}
-
-/// Whether a 16-bit lane of `w` is zero.
-#[inline(always)]
-fn has_zero_lane(w: u64) -> bool {
-    (w.wrapping_sub(LANES) & !w & (LANES << 15)) != 0
-}
-
-/// The 4 code units of `w` are ASCII.
-#[inline(always)]
-fn is_ascii_word(w: u64) -> bool {
-    (w & (LANES * 0xff80)) == 0
-}
-
-/// The 4 code units of `w` take 2 bytes in UTF-8 (U+0080 to U+07FF).
-#[inline(always)]
-fn is_two_byte_word(w: u64) -> bool {
-    (w & (LANES * 0xf800)) == 0 && !has_zero_lane(w & (LANES * 0x0780))
-}
-
-/// The 4 code units of `w` take 3 bytes in UTF-8 (U+0800 to U+FFFF but not
-/// surrogates).
-#[inline(always)]
-fn is_three_byte_word(w: u64) -> bool {
-    let t = w & (LANES * 0xf800);
-    !has_zero_lane(t) && !has_zero_lane(t ^ (LANES * 0xd800))
 }
 
 /// Number of bytes >= 0x80.
@@ -229,112 +193,87 @@ fn encode_three_bytes(src: &[u16], dst: &mut [MaybeUninit<u8>]) -> usize {
     len
 }
 
-/// Encode the code units `units[i..end]` one by one at `dst[pos..]` (a
-/// surrogate pair starting at `end - 1` is completed), returning the end
-/// positions in `units` and `dst`, or `None` if there is an unpaired surrogate.
-#[inline(always)]
-fn encode_utf16_units(
-    units: &[u16],
-    mut i: usize,
-    end: usize,
-    dst: &mut [MaybeUninit<u8>],
-    mut pos: usize,
-) -> Option<(usize, usize)> {
-    while i < end {
+/// Encode UTF-16 code units one by one to `dst`, returning the number of
+/// bytes written, or `None` at an unpaired surrogate.
+///
+/// # Safety
+/// `dst` must be valid for writes of `units.len() * 3` bytes, or of the
+/// length computed from [`count_utf16`]: the bytes written for a code unit
+/// never exceed what it is counted for (2 for each unit of a surrogate
+/// pair), and an unpaired surrogate stops the encoding before any write.
+unsafe fn encode_utf16_units(units: &[u16], dst: *mut u8) -> Option<usize> {
+    let mut pos = 0;
+    let mut i = 0;
+    while i < units.len() {
         let c = u32::from(units[i]);
         i += 1;
-        if c < 0x80 {
-            dst[pos] = MaybeUninit::new(c as u8);
-            pos += 1;
-        } else if c < 0x800 {
-            dst[pos] = MaybeUninit::new(0xc0 | (c >> 6) as u8);
-            dst[pos + 1] = MaybeUninit::new(0x80 | (c & 0x3f) as u8);
-            pos += 2;
-        } else if (c & 0xf800) != 0xd800 {
-            dst[pos] = MaybeUninit::new(0xe0 | (c >> 12) as u8);
-            dst[pos + 1] = MaybeUninit::new(0x80 | ((c >> 6) & 0x3f) as u8);
-            dst[pos + 2] = MaybeUninit::new(0x80 | (c & 0x3f) as u8);
-            pos += 3;
-        } else {
-            // a high surrogate followed by a low surrogate
-            let c1 = match units.get(i) {
-                Some(&c1) if c < 0xdc00 && (c1 & 0xfc00) == 0xdc00 => u32::from(c1),
-                _ => return None,
-            };
-            i += 1;
-            let c = 0x10000 + ((c - 0xd800) << 10) + (c1 - 0xdc00);
-            dst[pos] = MaybeUninit::new(0xf0 | (c >> 18) as u8);
-            dst[pos + 1] = MaybeUninit::new(0x80 | ((c >> 12) & 0x3f) as u8);
-            dst[pos + 2] = MaybeUninit::new(0x80 | ((c >> 6) & 0x3f) as u8);
-            dst[pos + 3] = MaybeUninit::new(0x80 | (c & 0x3f) as u8);
-            pos += 4;
-        }
-    }
-    Some((i, pos))
-}
-
-/// End of the run of words of 4 code units from `i` of the class `is_class`.
-#[inline(always)]
-fn utf16_run_end(units: &[u16], mut i: usize, is_class: impl Fn(u64) -> bool) -> usize {
-    while i + 4 <= units.len() && is_class(word16(units, i)) {
-        i += 4;
-    }
-    i
-}
-
-/// Encode UTF-16 code units to the start of `dst`, returning the number of
-/// bytes written, or `None` if there is an unpaired surrogate.
-fn encode_utf16(units: &[u16], dst: &mut [MaybeUninit<u8>]) -> Option<usize> {
-    let mut i = 0;
-    let mut pos = 0;
-    while i < units.len() {
-        if i + 4 <= units.len() {
-            let start = i;
-            let w = word16(units, i);
-            if is_ascii_word(w) {
-                i = utf16_run_end(units, i + 4, is_ascii_word);
-                pos += narrow_ascii(&units[start..i], &mut dst[pos..]);
-                continue;
-            }
-            if is_three_byte_word(w) {
-                i = utf16_run_end(units, i + 4, is_three_byte_word);
-                pos += encode_three_bytes(&units[start..i], &mut dst[pos..]);
-                continue;
-            }
-            if is_two_byte_word(w) {
-                i = utf16_run_end(units, i + 4, is_two_byte_word);
-                pos += encode_two_bytes(&units[start..i], &mut dst[pos..]);
-                continue;
+        // SAFETY: in bounds of dst as required by the caller
+        unsafe {
+            if c < 0x80 {
+                dst.add(pos).write(c as u8);
+                pos += 1;
+            } else if c < 0x800 {
+                dst.add(pos).write(0xc0 | (c >> 6) as u8);
+                dst.add(pos + 1).write(0x80 | (c & 0x3f) as u8);
+                pos += 2;
+            } else if (c & 0xf800) != 0xd800 {
+                dst.add(pos).write(0xe0 | (c >> 12) as u8);
+                dst.add(pos + 1).write(0x80 | ((c >> 6) & 0x3f) as u8);
+                dst.add(pos + 2).write(0x80 | (c & 0x3f) as u8);
+                pos += 3;
+            } else {
+                // a high surrogate followed by a low surrogate
+                let c1 = match units.get(i) {
+                    Some(&c1) if c < 0xdc00 && (c1 & 0xfc00) == 0xdc00 => u32::from(c1),
+                    _ => return None,
+                };
+                i += 1;
+                let c = 0x10000 + ((c - 0xd800) << 10) + (c1 - 0xdc00);
+                dst.add(pos).write(0xf0 | (c >> 18) as u8);
+                dst.add(pos + 1).write(0x80 | ((c >> 12) & 0x3f) as u8);
+                dst.add(pos + 2).write(0x80 | ((c >> 6) & 0x3f) as u8);
+                dst.add(pos + 3).write(0x80 | (c & 0x3f) as u8);
+                pos += 4;
             }
         }
-        // a mixed word or the last code units
-        let end = units.len().min(i + 4);
-        (i, pos) = encode_utf16_units(units, i, end, dst, pos)?;
     }
     Some(pos)
 }
 
+/// Strings shorter than this are encoded in one pass into a buffer of the
+/// maximum length, without counting their exact length first.
+const SHORT_UTF16: usize = 32;
+
 /// Encode UTF-16 code units as UTF-8, or `None` if there is an unpaired surrogate.
 pub(crate) fn utf16_to_string(units: &[u16]) -> Option<StdString> {
     let n = units.len();
+    if n < SHORT_UTF16 {
+        let mut out = Vec::<u8>::with_capacity(n * 3);
+        // SAFETY: a code unit takes at most 3 bytes; the written bytes are
+        // initialized with the UTF-8 encoding of each code point (surrogates
+        // are paired)
+        unsafe {
+            let len = encode_utf16_units(units, out.as_mut_ptr())?;
+            out.set_len(len);
+            return Some(StdString::from_utf8_unchecked(out));
+        }
+    }
     let (n80, n800, surrogates) = count_utf16(units);
     // a surrogate pair takes 4 bytes, the counts give it 3 per code unit
     let len = n + n80 + n800 - surrogates;
     let mut out = Vec::<u8>::with_capacity(len);
-    let dst = &mut out.spare_capacity_mut()[..len];
     // the whole string at once when all the code units have the same length
-    let written = if surrogates != 0 {
-        encode_utf16(units, dst)?
-    } else if n80 == 0 {
-        narrow_ascii(units, dst)
-    } else if n800 == n {
-        encode_three_bytes(units, dst)
-    } else if n80 == n && n800 == 0 {
-        encode_two_bytes(units, dst)
+    let written = if surrogates == 0 && n80 == 0 {
+        narrow_ascii(units, &mut out.spare_capacity_mut()[..len])
+    } else if surrogates == 0 && n800 == n {
+        encode_three_bytes(units, &mut out.spare_capacity_mut()[..len])
+    } else if surrogates == 0 && n80 == n && n800 == 0 {
+        encode_two_bytes(units, &mut out.spare_capacity_mut()[..len])
     } else {
-        encode_utf16(units, dst)?
+        // SAFETY: the capacity is the length counted by count_utf16
+        unsafe { encode_utf16_units(units, out.as_mut_ptr())? }
     };
-    // the encoders write their output in order from the start of dst
+    // the encoders write their output in order from the start of the buffer
     assert_eq!(written, len);
     // SAFETY: the len bytes are initialized with the UTF-8 encoding of each
     // code point (surrogates are paired)
