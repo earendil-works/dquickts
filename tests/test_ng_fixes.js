@@ -567,6 +567,32 @@ async function test_modules()
     assert(typeof import.meta.url, "string");
 }
 
+/* bellard/quickjs#546 (F-003): the Math.sumPrecise int64 limbs overflowed
+   when more than 127 values were added between two renormalizations */
+function test_issue_546()
+{
+    /* all values are multiples of 2^-64: the exact sum is computed with
+       BigInt and Number() rounds it correctly */
+    function exact(tab) {
+        var s = 0n;
+        for(var v of tab)
+            s += BigInt(v * 2 ** 64);
+        return Number(s) * 2 ** -64;
+    }
+    function check(tab) {
+        assert(Math.sumPrecise(tab), exact(tab));
+    }
+    var x = (2 - 2 ** -52) * 2 ** -11, y = x / 2, n, tab;
+    for(n of [127, 128, 129, 200, 1000]) {
+        check(Array(n).fill(x));
+        check(Array(n).fill(-x));
+    }
+    tab = [];
+    for(n = 0; n < 1000; n++)
+        tab.push(n % 4 == 3 ? -y : x);
+    check(tab);
+}
+
 test_iterator_proto_constructor();
 test_iterator_proto_tostringtag();
 test_regexp();
@@ -583,6 +609,7 @@ test_template_tostring_order();
 test_syntax_error_column();
 test_date_parse_spaces();
 test_proxy_is_array();
+test_issue_546();
 await test_issue_563();
 await test_for_await_close();
 await test_modules();

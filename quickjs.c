@@ -27301,11 +27301,17 @@ static int push_scope(JSParseState *s) {
         int scope = fd->scope_count;
         /* XXX: should check for scope overflow */
         if ((fd->scope_count + 1) > fd->scope_size) {
-            int new_size;
+            int64_t new_size;
             size_t slack;
             JSVarScope *new_buf;
-            /* XXX: potential arithmetic overflow */
-            new_size = max_int(fd->scope_count + 1, fd->scope_size * 3 / 2);
+            /* the sizes are computed in 64 bits: the int arithmetic could
+               overflow */
+            new_size = max_int64(fd->scope_count + 1, (int64_t)fd->scope_size * 3 / 2);
+            if (new_size > INT32_MAX ||
+                (uint64_t)new_size * sizeof(*fd->scopes) > SIZE_MAX) {
+                JS_ThrowOutOfMemory(s->ctx);
+                return -1;
+            }
             if (fd->scopes == fd->def_scope_array) {
                 new_buf = js_realloc2(s->ctx, NULL, new_size * sizeof(*fd->scopes), &slack);
                 if (!new_buf)
@@ -27316,7 +27322,7 @@ static int push_scope(JSParseState *s) {
                 if (!new_buf)
                     return -1;
             }
-            new_size += slack / sizeof(*new_buf);
+            new_size = min_int64(new_size + slack / sizeof(*new_buf), INT32_MAX);
             fd->scopes = new_buf;
             fd->scope_size = new_size;
         }
@@ -58572,7 +58578,13 @@ typedef enum {
 /* we add one extra limb to avoid having to test for overflows during the sum */
 #define SUM_PRECISE_ACC_LEN 39
 
-#define SUM_PRECISE_COUNTER_INIT 250
+/* Maximum number of additions between two renormalizations. After
+   sum_precise_renorm(), every limb is in [0, 2^56) except the top
+   carry limb whose absolute value is < 2^7. Each addition changes a
+   given limb by at most 2^56 - 1 (a0 < 2^56, a1 < 2^53). Hence after
+   k additions |acc[i]| <= (k + 1) * (2^56 - 1), which fits in int64_t
+   iff k <= 127. */
+#define SUM_PRECISE_COUNTER_INIT 127
 
 typedef struct {
     SumPreciseStateEnum state;
