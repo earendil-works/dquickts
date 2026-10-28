@@ -3149,32 +3149,61 @@ static void test_std_array_prototype(void)
         "Array.prototype[3] = 1",
         "Object.setPrototypeOf(Array.prototype, null)",
     };
+    static const char *const cross[] = {
+        "Object.defineProperty(other.Array.prototype, '0', { set(v) {} })",
+        "other.Object.prototype[0] = 1",
+        "Object.setPrototypeOf(other.Array.prototype, {})",
+    };
     JSRuntime *rt;
     JSContext *ctx, *ctx2;
-    JSValue v;
+    JSValue v, global;
+    const int *flag, *flag2;
     size_t i;
 
     rt = JS_NewRuntime();
     for (i = 0; i < countof(changes); i++) {
         ctx = JS_NewContext(rt);
         ctx2 = JS_NewContext(rt);
-        CHECK(JS_HasStdArrayPrototype(ctx));
+        flag = JS_GetStdArrayPrototypeFlag(ctx);
+        flag2 = JS_GetStdArrayPrototypeFlag(ctx2);
+        CHECK(flag != NULL && flag2 != NULL && flag != flag2);
+        CHECK(*flag);
         /* non-index properties and dense data elements can't intercept a set */
         v = eval_str(ctx, "Array.prototype.x = 1; Object.prototype.y = 2; Array.prototype.push(0)");
         JS_FreeValue(ctx, v);
-        CHECK(JS_HasStdArrayPrototype(ctx));
+        CHECK(*flag);
         v = eval_str(ctx, changes[i]);
         JS_FreeValue(ctx, v);
-        CHECK(!JS_HasStdArrayPrototype(ctx));
-        /* stays FALSE, other contexts are not affected */
+        CHECK(!*flag);
+        /* stays 0, other contexts are not affected */
         v = eval_str(ctx, "delete Array.prototype[0]; delete Object.prototype[0]");
         JS_FreeValue(ctx, v);
-        CHECK(!JS_HasStdArrayPrototype(ctx));
-        CHECK(JS_HasStdArrayPrototype(ctx2));
+        CHECK(!*flag && JS_GetStdArrayPrototypeFlag(ctx) == flag);
+        CHECK(*flag2);
         CHECK(!JS_HasException(ctx));
         JS_FreeContext(ctx2);
         JS_FreeContext(ctx);
     }
+
+    /* the prototypes of a context changed from another one */
+    for (i = 0; i < countof(cross); i++) {
+        ctx = JS_NewContext(rt);
+        ctx2 = JS_NewContext(rt);
+        global = JS_GetGlobalObject(ctx);
+        JS_SetPropertyStr(ctx, global, "other", JS_GetGlobalObject(ctx2));
+        JS_FreeValue(ctx, global);
+        v = eval_str(ctx, cross[i]);
+        JS_FreeValue(ctx, v);
+        CHECK(*JS_GetStdArrayPrototypeFlag(ctx));
+        CHECK(!*JS_GetStdArrayPrototypeFlag(ctx2));
+        JS_FreeContext(ctx2);
+        JS_FreeContext(ctx);
+    }
+
+    /* the basic objects of a raw context include Array.prototype */
+    ctx = JS_NewContextRaw(rt);
+    CHECK(*JS_GetStdArrayPrototypeFlag(ctx));
+    JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 }
 

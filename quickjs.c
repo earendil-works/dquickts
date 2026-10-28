@@ -572,6 +572,10 @@ struct JSContext {
 
     uint16_t binary_object_count;
     int binary_object_size;
+    /* mirror of the is_std_array_prototype flag of
+       class_proto[JS_CLASS_ARRAY], read through
+       JS_GetStdArrayPrototypeFlag() */
+    int std_array_prototype;
     
     JSShape *array_shape;   /* initial shape for Array objects */
     JSShape *arguments_shape;  /* shape for arguments objects */
@@ -10000,6 +10004,25 @@ static void JS_SetImmutablePrototype(JSContext *ctx, JSValueConst obj)
     p->has_immutable_prototype = TRUE;
 }
 
+/* clear the is_std_array_prototype flag of 'p' and the mirror of its
+   context */
+static void clear_std_array_prototype(JSRuntime *rt, JSObject *p)
+{
+    struct list_head *el;
+
+    if (likely(!p->is_std_array_prototype))
+        return;
+    p->is_std_array_prototype = FALSE;
+    list_for_each(el, &rt->context_list) {
+        JSContext *ctx1 = list_entry(el, JSContext, link);
+        if (JS_IsObject(ctx1->class_proto[JS_CLASS_ARRAY]) &&
+            JS_VALUE_GET_OBJ(ctx1->class_proto[JS_CLASS_ARRAY]) == p) {
+            ctx1->std_array_prototype = FALSE;
+            break;
+        }
+    }
+}
+
 /* Return -1 (exception) or TRUE/FALSE. 'throw_flag' = FALSE indicates
    that it is called from Reflect.setPrototypeOf(). */
 static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
@@ -10091,7 +10114,7 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
     if (sh->proto)
         JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, sh->proto));
     sh->proto = proto;
-    p->is_std_array_prototype = FALSE; 
+    clear_std_array_prototype(ctx->rt, p);
     return TRUE;
 }
 
@@ -11504,7 +11527,7 @@ static JSProperty *add_property(JSContext *ctx,
     if (unlikely(__JS_AtomIsTaggedInt(prop))) {
         /* update is_std_array_prototype */
         if (unlikely(p->is_std_array_prototype)) {
-            p->is_std_array_prototype = FALSE;
+            clear_std_array_prototype(ctx->rt, p);
         } else if (unlikely(p->has_immutable_prototype)) {
             struct list_head *el;
             
@@ -11516,6 +11539,7 @@ static JSProperty *add_property(JSContext *ctx,
                     if (JS_IsObject(ctx1->class_proto[JS_CLASS_ARRAY])) {
                         JSObject *p1 = JS_VALUE_GET_OBJ(ctx1->class_proto[JS_CLASS_ARRAY]);
                         p1->is_std_array_prototype = FALSE;
+                        ctx1->std_array_prototype = FALSE;
                     }
                     break;
                 }
@@ -11601,7 +11625,7 @@ static no_inline __exception int convert_fast_array_to_array(JSContext *ctx,
     p->u.array.u.values = NULL; /* fail safe */
     p->u.array.u1.size = 0;
     p->fast_array = 0;
-    p->is_std_array_prototype = FALSE;
+    clear_std_array_prototype(ctx->rt, p);
     return 0;
 }
 
@@ -11990,12 +12014,9 @@ JSValue JS_NewArrayFrom(JSContext *ctx, int count, const JSValue *values)
     return js_create_array_free(ctx, count, (JSValue *)values);
 }
 
-JS_BOOL JS_HasStdArrayPrototype(JSContext *ctx)
+const int *JS_GetStdArrayPrototypeFlag(JSContext *ctx)
 {
-    JSValueConst proto = ctx->class_proto[JS_CLASS_ARRAY];
-    /* can_extend_fast_array() of a new array */
-    return JS_VALUE_GET_TAG(proto) != JS_TAG_OBJECT ||
-        JS_VALUE_GET_OBJ(proto)->is_std_array_prototype;
+    return &ctx->std_array_prototype;
 }
 
 JS_BOOL JS_GetFastArray(JSContext *ctx, JSValueConst obj,
@@ -70987,6 +71008,7 @@ static int JS_AddIntrinsicBasicObjects(JSContext *ctx)
     {
         JSObject *p = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]);
         p->is_std_array_prototype = TRUE;
+        ctx->std_array_prototype = TRUE;
     }
     
     ctx->array_shape = js_new_shape2(ctx, get_proto_obj(ctx->class_proto[JS_CLASS_ARRAY]),

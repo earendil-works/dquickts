@@ -1072,15 +1072,17 @@ int JS_IsArray(JSContext *ctx, JSValueConst val);
 /* new array with the 'count' elements values[]. The values are freed,
    even in case of exception. */
 JSValue JS_NewArrayFrom(JSContext *ctx, int count, const JSValue *values);
-/* Return TRUE if setting the elements of a new array of 'ctx' in index
+/* Return a pointer to a flag of 'ctx', valid as long as 'ctx', which is
+   non zero while setting the elements of a new array of 'ctx' in index
    order (JS_SetPropertyUint32() on JS_NewArray()) only defines them
    as own data properties, as JS_NewArrayFrom() does: no object of the
    prototype chain of the arrays can intercept the sets (Array.prototype
    and Object.prototype have no index property other than writable data
    elements of Array.prototype, and the prototype of Array.prototype was
-   not changed). Conservative: once FALSE, it stays FALSE for 'ctx'.
-   Never throws. */
-JS_BOOL JS_HasStdArrayPrototype(JSContext *ctx);
+   not changed). Conservative: once 0, it stays 0. Only the engine
+   changes it, so reading it is enough after any operation which may
+   run JS. */
+const int *JS_GetStdArrayPrototypeFlag(JSContext *ctx);
 /* If 'obj' is an Array whose elements are stored contiguously (a
    "fast array"), return TRUE and set *pvalues to its element storage
    and *plen to the number of stored elements. Otherwise (array with
