@@ -1119,10 +1119,14 @@ mod test {
             let val: Object = ctx
                 .eval("({ a: 1, get b() { return 2 }, 'c\\0d': 3 })")
                 .unwrap();
-            let values = val.values().collect::<Result<Vec<i32>>>().unwrap();
-            assert_eq!(values, [1, 2, 3]);
-            let values = val.values().rev().collect::<Result<Vec<i32>>>().unwrap();
-            assert_eq!(values, [3, 2, 1]);
+            // values::<V>() needs V: FromAtom + FromJs
+            let ints = |values: Vec<Value>| -> Vec<Option<i32>> {
+                values.iter().map(Value::as_int).collect()
+            };
+            let values = val.values::<Value>().collect::<Result<Vec<_>>>().unwrap();
+            assert_eq!(ints(values), [Some(1), Some(2), Some(3)]);
+            let values = val.values::<Value>().rev().collect::<Result<Vec<_>>>().unwrap();
+            assert_eq!(ints(values), [Some(3), Some(2), Some(1)]);
             let props = val
                 .props()
                 .rev()
