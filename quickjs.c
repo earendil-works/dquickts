@@ -40947,6 +40947,16 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
                         fd->use_short_opcodes);
     dbuf_free(&fd->byte_code);
     js_free(ctx, fd->jump_slots);
+    if (fd->label_slots) {
+        /* relocations left by a failure of resolve_labels() */
+        for(i = 0; i < fd->label_count; i++) {
+            RelocEntry *re, *re_next;
+            for(re = fd->label_slots[i].first_reloc; re != NULL; re = re_next) {
+                re_next = re->next;
+                js_free(ctx, re);
+            }
+        }
+    }
     js_free(ctx, fd->label_slots);
     js_free(ctx, fd->line_number_slots);
 
