@@ -2,7 +2,7 @@
 
 use crate::{qjs, Ctx, Error, Result, String, Value};
 use alloc::string::{String as StdString, ToString as _};
-use core::{ffi::CStr, hash::Hash, ptr::null_mut};
+use core::hash::Hash;
 
 mod predefined;
 pub use predefined::PredefinedAtom;
@@ -113,14 +113,15 @@ impl<'js> Atom<'js> {
     /// Convert the atom to a JavaScript string.
     pub fn to_string(&self) -> Result<StdString> {
         unsafe {
-            let c_str = qjs::JS_AtomToCStringLen(self.ctx.as_ptr(), null_mut(), self.atom);
+            let mut len = 0;
+            let c_str = qjs::JS_AtomToCStringLen(self.ctx.as_ptr(), &mut len, self.atom);
             if c_str.is_null() {
                 // Might not ever happen but I am not 100% sure
                 // so just incase check it.
                 qjs::JS_FreeCString(self.ctx.as_ptr(), c_str);
                 return Err(Error::Unknown);
             }
-            let bytes = CStr::from_ptr(c_str).to_bytes();
+            let bytes = core::slice::from_raw_parts(c_str as *const u8, len as _);
             // Safety: QuickJS should return valid utf8 so this should be safe.
             let res = core::str::from_utf8_unchecked(bytes).to_string();
             qjs::JS_FreeCString(self.ctx.as_ptr(), c_str);

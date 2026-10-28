@@ -131,12 +131,29 @@ impl<'js> Object<'js> {
 
     /// Check the object for empty
     pub fn is_empty(&self) -> bool {
-        self.keys::<Atom>().next().is_none()
+        self.len() == 0
     }
 
-    /// Get the number of properties
+    /// Get the number of own string enumerable properties
+    ///
+    /// Returns 0 if they cannot be enumerated (e.g. a `Proxy` `ownKeys` trap throws); the
+    /// exception is left pending in the context, as with [`Object::keys`].
     pub fn len(&self) -> usize {
-        self.keys::<Atom>().count()
+        let mut len = 0u32;
+        unsafe {
+            if qjs::JS_GetOwnPropertyCount(
+                self.0.ctx.as_ptr(),
+                &mut len,
+                self.0.as_js_value(),
+                Filter::default().flags,
+            ) < 0
+            {
+                // Resume a panic of a Rust callback, the exception stays pending.
+                drop(self.0.ctx.raise_exception());
+                return 0;
+            }
+        }
+        len as usize
     }
 
     /// Get own string enumerable property names of an object
@@ -321,6 +338,37 @@ impl<'js> IterState<'js> {
             index: 0,
         })
     }
+
+    /// Take the next atom, the caller owns its reference.
+    fn next_raw(&mut self) -> Option<qjs::JSAtom> {
+        if self.index < self.count {
+            let elem = unsafe { &*self.enums.offset(self.index as _) };
+            self.index += 1;
+            Some(elem.atom)
+        } else {
+            None
+        }
+    }
+
+    /// Take the last atom, the caller owns its reference.
+    fn next_back_raw(&mut self) -> Option<qjs::JSAtom> {
+        if self.index < self.count {
+            self.count -= 1;
+            let elem = unsafe { &*self.enums.offset(self.count as _) };
+            Some(elem.atom)
+        } else {
+            None
+        }
+    }
+
+    /// Get the property `atom` of `obj` and free the atom taken by `next_raw`/`next_back_raw`.
+    fn get_and_free<V: FromJs<'js>>(&self, obj: &Object<'js>, atom: qjs::JSAtom) -> Result<V> {
+        unsafe {
+            let val = qjs::JS_GetProperty(self.ctx.as_ptr(), obj.0.as_js_value(), atom);
+            qjs::JS_FreeAtom(self.ctx.as_ptr(), atom);
+            obj.from_get_result(val)
+        }
+    }
 }
 
 impl<'js> Drop for IterState<'js> {
@@ -340,14 +388,8 @@ impl<'js> Iterator for IterState<'js> {
     type Item = Atom<'js>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index < self.count {
-            let elem = unsafe { &*self.enums.offset(self.index as _) };
-            self.index += 1;
-            let atom = unsafe { Atom::from_atom_val(self.ctx.clone(), elem.atom) };
-            Some(atom)
-        } else {
-            None
-        }
+        let atom = self.next_raw()?;
+        Some(unsafe { Atom::from_atom_val(self.ctx.clone(), atom) })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -358,14 +400,8 @@ impl<'js> Iterator for IterState<'js> {
 
 impl<'js> DoubleEndedIterator for IterState<'js> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.index < self.count {
-            self.count -= 1;
-            let elem = unsafe { &*self.enums.offset(self.count as _) };
-            let atom = unsafe { Atom::from_atom_val(self.ctx.clone(), elem.atom) };
-            Some(atom)
-        } else {
-            None
-        }
+        let atom = self.next_back_raw()?;
+        Some(unsafe { Atom::from_atom_val(self.ctx.clone(), atom) })
     }
 }
 
@@ -468,9 +504,11 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(Ok(state)) = &mut self.state {
             match state.next() {
+                // The value is read before the key conversion consumes the atom (no clone).
                 Some(atom) => Some(
-                    K::from_atom(atom.clone())
-                        .and_then(|key| self.object.get(atom).map(|val| (key, val))),
+                    self.object
+                        .get_atom(&atom)
+                        .and_then(|val| K::from_atom(atom).map(|key| (key, val))),
                 ),
                 None => {
                     self.state = None;
@@ -500,9 +538,11 @@ where
     fn next_back(&mut self) -> Option<Self::Item> {
         if let Some(Ok(state)) = &mut self.state {
             match state.next_back() {
+                // The value is read before the key conversion consumes the atom (no clone).
                 Some(atom) => Some(
-                    K::from_atom(atom.clone())
-                        .and_then(|key| self.object.get(atom).map(|val| (key, val))),
+                    self.object
+                        .get_atom(&atom)
+                        .and_then(|val| K::from_atom(atom).map(|key| (key, val))),
                 ),
                 None => {
                     self.state = None;
@@ -555,8 +595,8 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(Ok(state)) = &mut self.state {
-            match state.next() {
-                Some(atom) => Some(self.object.get(atom)),
+            match state.next_raw() {
+                Some(atom) => Some(state.get_and_free(&self.object, atom)),
                 None => {
                     self.state = None;
                     None
@@ -583,8 +623,8 @@ where
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         if let Some(Ok(state)) = &mut self.state {
-            match state.next_back() {
-                Some(atom) => Some(self.object.get(atom)),
+            match state.next_back_raw() {
+                Some(atom) => Some(state.get_and_free(&self.object, atom)),
                 None => {
                     self.state = None;
                     None
@@ -900,6 +940,8 @@ mod test {
             assert!(val.contains_key("toString").unwrap());
             assert!(!val.contains_key("never seen key either").unwrap());
             assert!(!val.contains_key(StdString::from("a")).unwrap());
+            let keys = val.keys().collect::<Result<Vec<StdString>>>().unwrap();
+            assert_eq!(keys, ["own", "héllo", "2fa", "😀", "a\0b"]);
         })
     }
 
@@ -1023,6 +1065,72 @@ mod test {
             assert_eq!(child.get::<_, StdString>("7 never seen").unwrap(), "get:7 never seen");
             assert!(child.contains_key("z never seen").unwrap());
             assert!(child.is_empty());
+        })
+    }
+
+    #[test]
+    fn len_and_is_empty() {
+        test_with(|ctx| {
+            let len = |src: &str| ctx.eval::<Object, _>(src).unwrap().len();
+            assert_eq!(len("({})"), 0);
+            assert_eq!(len("({ a: 1, b: 2, 3: 4, [Symbol()]: 5 })"), 3);
+            assert_eq!(
+                len("Object.defineProperty({ a: 1 }, 'hidden', { value: 2 })"),
+                1
+            );
+            assert_eq!(len("var o = { a: 1, b: 2 }; delete o.a; o"), 1);
+            assert_eq!(len("[1, 2, 3]"), 3);
+            assert_eq!(len("new String('ab')"), 2);
+            assert_eq!(len("new Uint16Array(4)"), 4);
+            assert!(ctx.eval::<Object, _>("({})").unwrap().is_empty());
+            assert!(!ctx.eval::<Object, _>("[0]").unwrap().is_empty());
+
+            // Proxy traps run as for keys()
+            let px: Object = ctx
+                .eval(
+                    r#"
+                    var calls = 0;
+                    new Proxy({ a: 1, b: 2 }, {
+                        ownKeys(t) { calls++; return Reflect.ownKeys(t) },
+                        getOwnPropertyDescriptor(t, k) {
+                            calls++;
+                            return Reflect.getOwnPropertyDescriptor(t, k)
+                        },
+                    })
+                "#,
+                )
+                .unwrap();
+            assert_eq!(px.len(), 2);
+            assert_eq!(ctx.eval::<i32, _>("calls").unwrap(), 3);
+            let px: Object = ctx
+                .eval("new Proxy({}, { ownKeys() { throw new RangeError('no') } })")
+                .unwrap();
+            assert_eq!(px.len(), 0);
+            assert!(ctx.has_exception());
+            drop(ctx.catch());
+            assert!(px.is_empty());
+            drop(ctx.catch());
+        })
+    }
+
+    #[test]
+    fn values_and_props_iter() {
+        test_with(|ctx| {
+            let val: Object = ctx
+                .eval("({ a: 1, get b() { return 2 }, 'c\\0d': 3 })")
+                .unwrap();
+            let values = val.values().collect::<Result<Vec<i32>>>().unwrap();
+            assert_eq!(values, [1, 2, 3]);
+            let values = val.values().rev().collect::<Result<Vec<i32>>>().unwrap();
+            assert_eq!(values, [3, 2, 1]);
+            let props = val
+                .props()
+                .rev()
+                .collect::<Result<Vec<(StdString, i32)>>>()
+                .unwrap();
+            let expected: [(StdString, i32); 3] =
+                [("c\0d".into(), 3), ("b".into(), 2), ("a".into(), 1)];
+            assert_eq!(props, expected);
         })
     }
 
