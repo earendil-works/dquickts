@@ -298,11 +298,12 @@ impl<'a, 'js, P: PendingElements> ArrayBuilder<'a, 'js, P> {
     fn make_array(&mut self) -> Result<Array<'js>> {
         let ctx = self.ctx;
         let values = self.pending.as_slice();
-        let count = values.len() as _;
-        let val = unsafe { qjs::JS_NewArrayFrom(ctx.as_ptr(), count, values.as_ptr()) };
-        self.pending.clear();
-        let val = ctx.handle_exception(val)?;
-        Ok(Array(Object(unsafe { Value::from_js_value(ctx.clone(), val) })))
+        unsafe {
+            let val = qjs::JS_NewArrayFrom(ctx.as_ptr(), values.len() as _, values.as_ptr());
+            self.pending.clear();
+            let val = ctx.handle_exception(val)?;
+            Ok(Array(Object(Value::from_js_value(ctx.clone(), val))))
+        }
     }
 }
 
