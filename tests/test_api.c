@@ -1787,6 +1787,46 @@ static void test_calloc(void)
     JS_FreeRuntime(rt);
 }
 
+/* bellard/quickjs#581: a WeakMap value is kept only while its key is
+   reachable and one GC pass collects the unreachable entries */
+static void test_weak_map_ephemeron(void)
+{
+    static const char src[] =
+        "globalThis.map = new WeakMap();\n"
+        "(function () {\n"
+        "  var key = {}, keys = [], i;\n"
+        "  map.set(key, { backRef: key });\n"
+        "  globalThis.selfRef = new WeakRef(key);\n"
+        "  key = {};\n"
+        "  for (i = 0; i < 20; i++) {\n"
+        "    var next = {};\n"
+        "    map.set(key, { child: next });\n"
+        "    key = next;\n"
+        "  }\n"
+        "  globalThis.chainTail = new WeakRef(key);\n"
+        "  /* reachable chain, records in reverse order */\n"
+        "  for (i = 0; i <= 20; i++)\n"
+        "    keys.push({ id: i });\n"
+        "  for (i = 19; i >= 0; i--)\n"
+        "    map.set(keys[i], { next: keys[i + 1] });\n"
+        "  globalThis.head = keys[0];\n"
+        "})();\n";
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue v;
+
+    v = eval_str(ctx, src);
+    CHECK(!JS_IsException(v));
+    JS_FreeValue(ctx, v);
+    JS_RunGC(rt);
+    CHECK(eval_bool(ctx, "selfRef.deref() === undefined"));
+    CHECK(eval_bool(ctx, "chainTail.deref() === undefined"));
+    CHECK(eval_bool(ctx, "var k = head; for (var i = 0; i < 20; i++) "
+                    "k = map.get(k).next; k.id === 20"));
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     JSRuntime *rt;
@@ -1802,6 +1842,7 @@ int main(void)
     test_runtime();
     test_normalize2();
     test_calloc();
+    test_weak_map_ephemeron();
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);

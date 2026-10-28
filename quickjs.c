@@ -221,6 +221,7 @@ typedef struct JSObject JSObject;
 typedef enum {
     JS_GC_PHASE_NONE,
     JS_GC_PHASE_DECREF,
+    JS_GC_PHASE_SCAN,
     JS_GC_PHASE_REMOVE_CYCLES,
 } JSGCPhaseEnum;
 
@@ -326,6 +327,11 @@ struct JSRuntime {
     /* list of JSGCObjectHeader.link. Used during JS_FreeValueRT() */
     struct list_head gc_zero_ref_count_list;
     struct list_head tmp_obj_list; /* used during GC */
+    /* used during gc_scan(): hash table of the weak map records whose
+       key is not reachable yet */
+    struct JSMapRecord **gc_weak_records;
+    int gc_weak_records_bits; /* log2 of the table size, 0 if no table */
+    uint32_t gc_weak_records_count;
     JSGCPhaseEnum gc_phase : 8;
     size_t malloc_gc_threshold;
     struct list_head weakref_list; /* list of JSWeakRefHeader.link */
@@ -1550,6 +1556,8 @@ static JSValue JS_InstantiateFunctionListItem2(JSContext *ctx, JSObject *p,
 static JSValue js_object_groupBy(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv, int is_map);
 static void map_delete_weakrefs(JSRuntime *rt, JSWeakRefHeader *wh);
+static void map_gc_mark_weak_records(JSRuntime *rt, JSObject *p);
+static void map_gc_drop_weak_records(JSRuntime *rt);
 static void weakref_delete_weakref(JSRuntime *rt, JSWeakRefHeader *wh);
 static void finrec_delete_weakref(JSRuntime *rt, JSWeakRefHeader *wh);
 static void JS_RunGCInternal(JSRuntime *rt, BOOL remove_weak_objects);
@@ -7451,13 +7459,23 @@ static void gc_scan(JSRuntime *rt)
     struct list_head *el;
     JSGCObjectHeader *p;
 
-    /* keep the objects with a refcount > 0 and their children. */
+    /* keep the objects with a refcount > 0 and their children. The
+       value of a weak map record is kept only if its key is kept (see
+       js_map_mark()). */
+    rt->gc_phase = JS_GC_PHASE_SCAN;
     list_for_each(el, &rt->gc_obj_list) {
         p = list_entry(el, JSGCObjectHeader, link);
         assert(js_rc(p)->ref_count > 0);
         js_rc(p)->mark = 0; /* reset the mark for the next GC call */
         mark_children(rt, p, gc_scan_incref_child);
+        if (rt->gc_weak_records_count != 0 &&
+            js_rc(p)->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT &&
+            ((JSObject *)p)->weakref_count != 0) {
+            map_gc_mark_weak_records(rt, (JSObject *)p);
+        }
     }
+    rt->gc_phase = JS_GC_PHASE_NONE;
+    map_gc_drop_weak_records(rt);
 
     /* restore the refcount of the objects to be deleted. */
     list_for_each(el, &rt->tmp_obj_list) {
@@ -64058,6 +64076,87 @@ static void js_map_finalizer(JSRuntime *rt, JSValue val)
     }
 }
 
+/* During gc_scan(), the value of a weak map record is marked only if
+   its key is reachable (ephemeron). The records whose key is not
+   reachable yet are stored in rt->gc_weak_records, a hash table
+   indexed by the key address, so that their value is marked when
+   their key is scanned. */
+static void map_gc_insert_weak_record(JSMapRecord **tab, int bits,
+                                      JSMapRecord *mr)
+{
+    uint32_t h, mask = ((uint32_t)1 << bits) - 1;
+
+    h = map_hash_pointer((uintptr_t)JS_VALUE_GET_PTR(mr->key), bits);
+    while (tab[h] != NULL)
+        h = (h + 1) & mask;
+    tab[h] = mr;
+}
+
+static int map_gc_add_weak_record(JSRuntime *rt, JSMapRecord *mr)
+{
+    JSMapRecord **tab, *mr1;
+    uint32_t i, size;
+    int bits;
+
+    bits = rt->gc_weak_records_bits;
+    size = bits ? (uint32_t)1 << bits : 0;
+    /* keep the load factor <= 1/2 */
+    if (2 * (rt->gc_weak_records_count + 1) > size) {
+        bits = max_int(bits + 1, 4);
+        tab = js_mallocz_rt(rt, sizeof(tab[0]) << bits);
+        if (!tab)
+            return -1;
+        for(i = 0; i < size; i++) {
+            mr1 = rt->gc_weak_records[i];
+            if (mr1)
+                map_gc_insert_weak_record(tab, bits, mr1);
+        }
+        js_free_rt(rt, rt->gc_weak_records);
+        rt->gc_weak_records = tab;
+        rt->gc_weak_records_bits = bits;
+    }
+    map_gc_insert_weak_record(rt->gc_weak_records, bits, mr);
+    rt->gc_weak_records_count++;
+    return 0;
+}
+
+/* mark the value of the weak map records whose key is 'p' */
+static void map_gc_mark_weak_records(JSRuntime *rt, JSObject *p)
+{
+    JSMapRecord *mr;
+    uint32_t h, mask;
+    int bits = rt->gc_weak_records_bits;
+
+    mask = ((uint32_t)1 << bits) - 1;
+    h = map_hash_pointer((uintptr_t)p, bits);
+    while ((mr = rt->gc_weak_records[h]) != NULL) {
+        if (JS_VALUE_GET_PTR(mr->key) == p)
+            JS_MarkValue(rt, mr->value, gc_scan_incref_child);
+        h = (h + 1) & mask;
+    }
+}
+
+/* At the end of gc_scan(), the value of the records whose key is not
+   reachable was not marked: the reference from the record is removed
+   from it. The records are deleted by the next GC. */
+static void map_gc_drop_weak_records(JSRuntime *rt)
+{
+    JSMapRecord *mr;
+    uint32_t i;
+
+    if (!rt->gc_weak_records)
+        return;
+    for(i = 0; i < ((uint32_t)1 << rt->gc_weak_records_bits); i++) {
+        mr = rt->gc_weak_records[i];
+        if (mr && !js_weakref_is_live(mr->key))
+            mr->value = JS_UNDEFINED;
+    }
+    js_free_rt(rt, rt->gc_weak_records);
+    rt->gc_weak_records = NULL;
+    rt->gc_weak_records_bits = 0;
+    rt->gc_weak_records_count = 0;
+}
+
 static void js_map_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
@@ -64069,8 +64168,15 @@ static void js_map_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
     if (s) {
         list_for_each(el, &s->records) {
             mr = list_entry(el, JSMapRecord, link);
-            if (!s->is_weak)
+            if (!s->is_weak) {
                 JS_MarkValue(rt, mr->key, mark_func);
+            } else if (rt->gc_phase == JS_GC_PHASE_SCAN &&
+                       JS_VALUE_GET_TAG(mr->value) == JS_TAG_OBJECT &&
+                       !js_weakref_is_live(mr->key) &&
+                       map_gc_add_weak_record(rt, mr) == 0) {
+                /* the value is marked if the key becomes reachable */
+                continue;
+            }
             JS_MarkValue(rt, mr->value, mark_func);
         }
     }
