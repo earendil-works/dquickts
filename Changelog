@@ -176,6 +176,25 @@ unreleased:
 - Temporal and Intl load the time zones missing from the embedded data
   from the system zoneinfo, so the default time zone is no longer
   treated as UTC on such hosts; unknown time zone names are rejected
+- faster embedding API (used by rquickjs): JS_DupContext() and
+  JS_FreeContext() are inline; added JS_GetFastArray(),
+  JS_GetStdArrayPrototypeFlag(), JS_GetStringData(),
+  JS_NewStringLatin1Len(), JS_GetTypedArrayData(), JS_FindAtomLen(),
+  JS_GetPropertyStrLen(), JS_HasPropertyStrLen(), JS_SetPropertyStrLen(),
+  JS_GetOwnPropertyCount(), JS_AtomGetStringData(),
+  JS_NewObjectSetIsDefine(), JS_NewErrorLen(), JS_ThrowErrorLen() and
+  JS_ExecutePendingJobs(); JSErrorEnum is public; JS_NewObjectFrom()
+  creates the object with its final shape (cached per context);
+  JS_GetPropertyStr() no longer creates an atom for an absent name
+- faster errors: the default stack trace is formatted on first read,
+  error objects reuse a cached shape and the messages are built without
+  printf (throw + catch about 4x faster); the JS_Throw*Error() messages
+  are no longer cut at 255 bytes
+- faster strings: UTF-8 decoding and the atom lookup of UTF-8 keys scan
+  several bytes at a time, String.prototype.repeat() of one character
+  uses memset
+- JS_GetTypedArrayBuffer() returns the current length of length-tracking
+  views
 
 2026-06-04:
 

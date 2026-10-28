@@ -22,10 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TypeScript: `EvalOptions::typescript`; files and modules named `*.ts`, `*.mts`, `*.cts` are TypeScript (`Ctx::eval_file`, `Module::declare`/`evaluate`, `ScriptLoader`); `FileResolver` resolves `./x.js` to an existing `./x.ts` and tries `{}.ts`/`{}.mts`; `Runtime::set_decorators` (`Decorators`: standard, TypeScript legacy, legacy with `design:*` metadata).
 - `#[rquickjs::methods]` accepts `enumerable`, `configurable`, and `writable` on functions, and `= false` to disable default attributes
 - Added `Value::loose_eq`, `Value::strict_eq`, `Value::same_value`, and `Value::same_value_zero` which map to the various concepts of equality exposed by QuickJS.
+- `Runtime::execute_pending_jobs` runs the pending jobs in one call (up to a limit), stopping at the first job that throws.
+- `String::to_str` borrows the contents of an ASCII string without copying.
+- `ObjectBuilder` builds a JS object from keys and values in one step, with the same result as `Object::new` followed by `set` calls.
 
 ### Changed
 
 - Updated repository references and internal documentation links for the dquickts engine
+- Faster bindings, using new engine APIs (inline context reference counting, `JS_GetFastArray`, `JS_GetStringData`, `JS_GetTypedArrayData`, `JS_GetPropertyStrLen`/`JS_SetPropertyStrLen`, `JS_NewObjectFrom` with cached shapes, lazy error stacks): calling a Rust function from JS went from 46 to 12 ns, a class method from 46 to 10 ns, `Function::call` from 34 to 13 ns, `Object::get` with a `&str` key from 12 to 3.4 ns, `Vec<i32>` (100) to JS from 1000 to 200 ns and back from 1100 to 230 ns, a 1 KB Latin-1 or UTF-16 string to Rust from about 1 µs to 60–120 ns, and throwing an error from Rust from 277 to 44 ns (macOS arm64).
+- rquickjs sets the opaque of the contexts it creates (`JS_SetContextOpaque`); embedders must not replace it.
+- Rust functions are called without dynamic dispatch, and `&self`/`&mut self` methods and `&T` class arguments borrow the class cell only for the call.
+- Length-tracking typed arrays (on resizable buffers) expose the current length of the buffer in `as_bytes`/`as_raw`/`as_slice`/`len`, instead of the initial one.
+- `Object::len`/`is_empty` return 0/`true` when the enumeration throws (the error was counted as one key).
+- Error messages thrown from Rust are no longer cut at 255 bytes or at a NUL character.
 
 ### Deprecated
 
@@ -38,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed `Promise::result` and `Promise::into_future` leaving an already rejected promise unhandled, which made the host promise rejection tracker report a false unhandled rejection
 - Fixed exotic classes freeing the value passed to `exotic_set_property` twice
 - `Atom::to_value` returns a symbol if the atom represents a symbol, instead of always returning a JS string
+- `CString::from_string` and `Atom::to_string` returned strings with invalid UTF-8 (undefined behaviour) for JS strings containing unpaired surrogates; they now return `Error::Utf8` like `String::to_string`.
+- `Function::call` with more than 4 arguments could panic when the argument count was under-estimated.
+- `TypedArray::len` no longer runs a user-defined `length` getter.
+- Checking whether a value is a class instance no longer clears an exception that was already pending.
 
 ### Security
 
