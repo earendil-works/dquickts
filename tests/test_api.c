@@ -3139,6 +3139,45 @@ static void test_pending_jobs(void)
     JS_FreeRuntime(rt);
 }
 
+static void test_std_array_prototype(void)
+{
+    static const char *const changes[] = {
+        "Object.defineProperty(Array.prototype, '0', { set(v) {}, configurable: true })",
+        "Object.defineProperty(Array.prototype, '1', { value: 1, writable: false })",
+        "Object.defineProperty(Object.prototype, '0', { get() { return 1 } })",
+        "Object.prototype[2] = 1",
+        "Array.prototype[3] = 1",
+        "Object.setPrototypeOf(Array.prototype, null)",
+    };
+    JSRuntime *rt;
+    JSContext *ctx, *ctx2;
+    JSValue v;
+    size_t i;
+
+    rt = JS_NewRuntime();
+    for (i = 0; i < countof(changes); i++) {
+        ctx = JS_NewContext(rt);
+        ctx2 = JS_NewContext(rt);
+        CHECK(JS_HasStdArrayPrototype(ctx));
+        /* non-index properties and dense data elements can't intercept a set */
+        v = eval_str(ctx, "Array.prototype.x = 1; Object.prototype.y = 2; Array.prototype.push(0)");
+        JS_FreeValue(ctx, v);
+        CHECK(JS_HasStdArrayPrototype(ctx));
+        v = eval_str(ctx, changes[i]);
+        JS_FreeValue(ctx, v);
+        CHECK(!JS_HasStdArrayPrototype(ctx));
+        /* stays FALSE, other contexts are not affected */
+        v = eval_str(ctx, "delete Array.prototype[0]; delete Object.prototype[0]");
+        JS_FreeValue(ctx, v);
+        CHECK(!JS_HasStdArrayPrototype(ctx));
+        CHECK(JS_HasStdArrayPrototype(ctx2));
+        CHECK(!JS_HasException(ctx));
+        JS_FreeContext(ctx2);
+        JS_FreeContext(ctx);
+    }
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     JSRuntime *rt;
@@ -3165,6 +3204,7 @@ int main(void)
     test_property_str_lookup();
     test_object_from();
     test_pending_jobs();
+    test_std_array_prototype();
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);

@@ -1370,6 +1370,9 @@ unsafe extern "C" {
     ) -> JSValue;
 }
 unsafe extern "C" {
+    pub fn JS_HasStdArrayPrototype(ctx: *mut JSContext) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn JS_GetFastArray(
         ctx: *mut JSContext,
         obj: JSValue,

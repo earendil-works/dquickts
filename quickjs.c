@@ -11990,6 +11990,14 @@ JSValue JS_NewArrayFrom(JSContext *ctx, int count, const JSValue *values)
     return js_create_array_free(ctx, count, (JSValue *)values);
 }
 
+JS_BOOL JS_HasStdArrayPrototype(JSContext *ctx)
+{
+    JSValueConst proto = ctx->class_proto[JS_CLASS_ARRAY];
+    /* can_extend_fast_array() of a new array */
+    return JS_VALUE_GET_TAG(proto) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_OBJ(proto)->is_std_array_prototype;
+}
+
 JS_BOOL JS_GetFastArray(JSContext *ctx, JSValueConst obj,
                         JSValue **pvalues, uint32_t *plen)
 {
