@@ -346,6 +346,71 @@ static void test_utf16_strings(JSContext *ctx)
     JS_FreeCStringRT_UTF16(rt, NULL);
 }
 
+static void test_string_data(JSContext *ctx)
+{
+    static const uint8_t latin1[] = { 'c', 'a', 'f', 0xe9, 0 };
+    const uint8_t *p8;
+    const uint16_t *p16;
+    const void *p;
+    size_t len;
+    JS_BOOL wide;
+    JSValue v, v2;
+
+    /* Latin-1 constructor and 8 bit view, including a NUL byte */
+    v = JS_NewStringLatin1Len(ctx, latin1, countof(latin1));
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_STRING);
+    set_global(ctx, "sl", JS_DupValue(ctx, v));
+    CHECK(eval_bool(ctx, "sl === 'caf\\xe9\\0'"));
+    p8 = JS_GetStringData(ctx, v, &len, &wide);
+    CHECK(p8 && !wide && len == countof(latin1) && !memcmp(p8, latin1, len));
+    JS_FreeValue(ctx, v);
+    v = JS_NewStringLatin1Len(ctx, NULL, 0);
+    p = JS_GetStringData(ctx, v, &len, &wide);
+    CHECK(p && len == 0 && !wide);
+    JS_FreeValue(ctx, v);
+    CHECK(JS_IsException(JS_NewStringLatin1Len(ctx, NULL, (size_t)1 << 31)));
+    check_exception(ctx, "InternalError");
+
+    /* wide strings: UTF-16 units, unpaired surrogates kept */
+    v = eval_str(ctx, "'\\ud83d\\ude00x\\udc00'");
+    p16 = JS_GetStringData(ctx, v, &len, &wide);
+    CHECK(p16 && wide && len == 4 && p16[0] == 0xd83d && p16[1] == 0xde00 &&
+          p16[2] == 'x' && p16[3] == 0xdc00);
+    JS_FreeValue(ctx, v);
+
+    /* ropes are flattened once; the view lives as long as the rope */
+    v = eval_str(ctx, "var r = 'a'.repeat(1000); r + 'b' + r + '\\u20ac'");
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_STRING_ROPE);
+    p16 = JS_GetStringData(ctx, v, &len, &wide);
+    CHECK(p16 && wide && len == 2002 && p16[0] == 'a' && p16[1000] == 'b' &&
+          p16[2000] == 'a' && p16[2001] == 0x20ac);
+    CHECK(JS_GetStringData(ctx, v, &len, &wide) == p16 && len == 2002);
+    /* the rope is still usable and dropping other refs keeps the view */
+    set_global(ctx, "rope", JS_DupValue(ctx, v));
+    CHECK(eval_bool(ctx, "rope.length === 2002 && rope[1000] === 'b' && "
+                    "(rope = r = undefined, true)"));
+    CHECK(p16[0] == 'a' && p16[2001] == 0x20ac);
+    v2 = JS_ToString(ctx, v);
+    CHECK(JS_VALUE_GET_TAG(v2) == JS_TAG_STRING);
+    p = JS_GetStringData(ctx, v2, &len, &wide);
+    CHECK(p == p16 && len == 2002 && wide);
+    JS_FreeValue(ctx, v2);
+    JS_FreeValue(ctx, v);
+    v = eval_str(ctx, "var r = 'x'.repeat(1000); r + 'y' + r");
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_STRING_ROPE);
+    p8 = JS_GetStringData(ctx, v, &len, &wide);
+    CHECK(p8 && !wide && len == 2001 && p8[0] == 'x' && p8[1000] == 'y' &&
+          p8[2000] == 'x');
+    JS_FreeValue(ctx, v);
+
+    /* other values are not converted */
+    len = 1;
+    wide = 1;
+    CHECK(JS_GetStringData(ctx, JS_NewInt32(ctx, 1), &len, &wide) == NULL &&
+          len == 0 && !wide);
+    check_exception(ctx, "TypeError");
+}
+
 static JSValue make_type_error(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
@@ -2538,6 +2603,7 @@ int main(void)
     test_errors(ctx);
     test_cstring(ctx);
     test_utf16_strings(ctx);
+    test_string_data(ctx);
     test_new_errors(ctx);
     test_error_len(ctx);
     test_integrity(ctx);

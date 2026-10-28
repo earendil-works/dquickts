@@ -1220,6 +1220,9 @@ unsafe extern "C" {
     pub fn JS_NewStringUTF16(ctx: *mut JSContext, buf: *const u16, len: size_t) -> JSValue;
 }
 unsafe extern "C" {
+    pub fn JS_NewStringLatin1Len(ctx: *mut JSContext, buf: *const u8, len: size_t) -> JSValue;
+}
+unsafe extern "C" {
     pub fn JS_NewAtomString(ctx: *mut JSContext, str_: *const ::core::ffi::c_char) -> JSValue;
 }
 unsafe extern "C" {
@@ -1245,6 +1248,14 @@ unsafe extern "C" {
         plen: *mut size_t,
         val1: JSValue,
     ) -> *const u16;
+}
+unsafe extern "C" {
+    pub fn JS_GetStringData(
+        ctx: *mut JSContext,
+        val: JSValue,
+        plen: *mut size_t,
+        pwide: *mut ::core::ffi::c_int,
+    ) -> *const ::core::ffi::c_void;
 }
 unsafe extern "C" {
     pub fn JS_FreeCString(ctx: *mut JSContext, ptr: *const ::core::ffi::c_char);

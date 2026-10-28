@@ -1440,6 +1440,7 @@ static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val);
 static int JS_ToFloat64Free(JSContext *ctx, double *pres, JSValue val);
 static int JS_ToUint8ClampFree(JSContext *ctx, int32_t *pres, JSValue val);
 static JSValue js_new_string8_len(JSContext *ctx, const char *buf, int len);
+static JSValue js_linearize_string_rope(JSContext *ctx, JSValue rope);
 static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
                                  JSValueConst flags);
 static JSValue js_compile_regexp_flags(JSContext *ctx, JSValueConst pattern,
@@ -4590,6 +4591,14 @@ static JSValue js_new_string8(JSContext *ctx, const char *buf)
     return js_new_string8_len(ctx, buf, strlen(buf));
 }
 
+/* create a string from Latin-1 (ISO-8859-1) bytes */
+JSValue JS_NewStringLatin1Len(JSContext *ctx, const uint8_t *buf, size_t len)
+{
+    if (len > JS_STRING_LEN_MAX)
+        return JS_ThrowInternalError(ctx, "string too long");
+    return js_new_string8_len(ctx, (const char *)buf, len);
+}
+
 static JSValue js_new_string16_len(JSContext *ctx, const uint16_t *buf, int len)
 {
     JSString *str;
@@ -5291,6 +5300,47 @@ const uint16_t *JS_ToCStringLenUTF16(JSContext *ctx, size_t *plen, JSValueConst 
  fail:
     if (plen)
         *plen = 0;
+    return NULL;
+}
+
+/* return (NULL, 0) if exception. */
+/* return the contents of the string 'val' without copying: Latin-1
+   bytes if *pwide is false, UTF-16 code units otherwise. A rope is
+   flattened in place, so the pointer stays valid as long as the caller
+   holds a reference to 'val' (strings are immutable). */
+const void *JS_GetStringData(JSContext *ctx, JSValueConst val, size_t *plen,
+                             JS_BOOL *pwide)
+{
+    JSString *p;
+
+    if (likely(JS_VALUE_GET_TAG(val) == JS_TAG_STRING)) {
+        p = JS_VALUE_GET_STRING(val);
+    } else if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING_ROPE) {
+        JSStringRope *r = JS_VALUE_GET_STRING_ROPE(val);
+        JSValue ret;
+
+        /* 'val' holds a reference besides ours: the rope caches the
+           flat string in r->left, which keeps it alive */
+        ret = js_linearize_string_rope(ctx, JS_DupValue(ctx, val));
+        if (JS_IsException(ret))
+            goto fail;
+        assert(JS_VALUE_GET_TAG(ret) == JS_TAG_STRING &&
+               JS_VALUE_GET_PTR(r->left) == JS_VALUE_GET_PTR(ret));
+        JS_FreeValue(ctx, ret);
+        p = JS_VALUE_GET_STRING(r->left);
+    } else {
+        JS_ThrowTypeError(ctx, "not a string");
+        goto fail;
+    }
+    *plen = p->len;
+    *pwide = p->is_wide_char;
+    if (p->is_wide_char)
+        return p->u.str16;
+    else
+        return p->u.str8;
+ fail:
+    *plen = 0;
+    *pwide = FALSE;
     return NULL;
 }
 

@@ -987,6 +987,8 @@ static inline JSValue JS_NewString(JSContext *ctx, const char *str)
 }
 /* copy 'len' UTF-16 code units; unpaired surrogates are kept */
 JSValue JS_NewStringUTF16(JSContext *ctx, const uint16_t *buf, size_t len);
+/* Latin-1 (ISO-8859-1) bytes: one code unit per byte, no UTF-8 decoding */
+JSValue JS_NewStringLatin1Len(JSContext *ctx, const uint8_t *buf, size_t len);
 JSValue JS_NewAtomString(JSContext *ctx, const char *str);
 JSValue JS_ToString(JSContext *ctx, JSValueConst val);
 JSValue JS_ToPropertyKey(JSContext *ctx, JSValueConst val);
@@ -1008,6 +1010,15 @@ static inline const uint16_t *JS_ToCStringUTF16(JSContext *ctx, JSValueConst val
 {
     return JS_ToCStringLenUTF16(ctx, NULL, val1);
 }
+/* Borrowed view of the contents of a string (JS_IsString(val)): *plen
+   Latin-1 bytes if *pwide is false, *plen UTF-16 code units in native
+   endianness otherwise. Not zero terminated. Nothing is copied or
+   freed: a rope is flattened in place and the pointer remains valid
+   while the caller holds a reference to val. Return NULL (and *plen =
+   0) with a pending exception if val is not a string or on memory
+   error. */
+const void *JS_GetStringData(JSContext *ctx, JSValueConst val, size_t *plen,
+                             JS_BOOL *pwide);
 void JS_FreeCString(JSContext *ctx, const char *ptr);
 void JS_FreeCStringRT(JSRuntime *rt, const char *ptr);
 void JS_FreeCStringUTF16(JSContext *ctx, const uint16_t *ptr);

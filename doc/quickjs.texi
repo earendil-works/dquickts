@@ -1263,7 +1263,12 @@ or atoms in a single call.
 Strings can be exchanged as UTF-16 code units with
 @code{JS_NewStringUTF16()} and @code{JS_ToCStringLenUTF16()} (released
 with @code{JS_FreeCStringUTF16()}). Unlike the UTF-8 functions, they
-preserve unpaired surrogates.
+preserve unpaired surrogates. @code{JS_NewStringLatin1Len()} creates a
+string from Latin-1 bytes. @code{JS_GetStringData()} returns the
+contents of a string without copying or encoding them: Latin-1 bytes or
+UTF-16 code units depending on the internal representation. A rope is
+flattened in place and the pointer is valid while the string value is
+held.
 
 @code{JS_NewUint8Array()} and @code{JS_NewUint8ArrayCopy()} create a
 @code{Uint8Array} over a new @code{ArrayBuffer};
