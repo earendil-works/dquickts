@@ -1157,6 +1157,40 @@ mod test {
     }
 
     #[test]
+    fn atom_keys_to_string() {
+        test_with(|ctx| {
+            let val: Object = ctx
+                .eval(
+                    r#"({
+                        4294967294: 1, 7: 2, 'h\u00e9': 3, '\u{1F600}': 4,
+                        [Symbol('desc')]: 5, [Symbol()]: 6, 'a\ud800b': 7, '': 8,
+                    })"#,
+                )
+                .unwrap();
+            let keys: Vec<Result<StdString>> =
+                val.own_keys(Filter::new().string().symbol()).collect();
+            let keys: Vec<_> = keys.into_iter().map(|key| key.ok()).collect();
+            let expected = [
+                Some("7"),
+                Some("4294967294"),
+                Some("hé"),
+                Some("😀"),
+                // an unpaired surrogate isn't UTF-8
+                None,
+                Some(""),
+                Some("desc"),
+                Some(""),
+            ];
+            assert_eq!(keys, expected.map(|key| key.map(StdString::from)));
+            let err = val
+                .own_keys::<StdString>(Filter::new().string())
+                .nth(4)
+                .unwrap();
+            assert!(matches!(err, Err(Error::Utf8(_))));
+        })
+    }
+
+    #[test]
     fn collect_js() {
         test_with(|ctx| {
             let object = [("a", "bc"), ("$_", ""), ("", "xyz")]
