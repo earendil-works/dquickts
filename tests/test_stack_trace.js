@@ -331,6 +331,46 @@ function test_stack_accessor()
     assert(typeof get.call(e), "string");
 }
 
+/* the stack trace is formatted when it is first read: it must be the
+   same as if it was formatted when the error was created */
+function test_lazy_stack()
+{
+    var e, e1, e2, e3, f, s;
+
+    function make() { return new Error("lazy"); }
+    function thrower() { null.x; }
+    e = make();
+    s = e.stack;
+    assert(s.includes("    at make (") && s.includes("test_lazy_stack"));
+    /* the function names are read when the error is created */
+    f = function () { return new RangeError("renamed"); };
+    Object.defineProperty(f, "name", { value: "before" });
+    e1 = f();
+    Object.defineProperty(f, "name", { value: "after" });
+    /* the configuration is read when the error is created */
+    e2 = (function limited() { return new Error(); })();
+    try { thrower(); } catch (ex) { e3 = ex; }
+    Error.stackTraceLimit = 1;
+    Error.prepareStackTrace = () => "prepared";
+    try {
+        assert(e1.stack.startsWith("    at before ("));
+        assert(e2.stack.split("\n").length > 2);
+        assert(e2.stack.startsWith("    at limited ("));
+        assert(e3.stack.startsWith("    at thrower ("));
+        assert(new Error().stack, "prepared");
+    } finally {
+        Error.stackTraceLimit = 10;
+        Error.prepareStackTrace = undefined;
+    }
+    /* the captured functions may be collected */
+    e = (new Function("return function collected() { return new TypeError('gc'); }"))()();
+    std.gc();
+    assert(e.stack.startsWith("    at collected (<input>:"));
+    /* same string each time */
+    assert(e.stack === e.stack);
+    assert(make().stack.replace(/:\d+:\d+\)/g, ""), s.replace(/:\d+:\d+\)/g, ""));
+}
+
 test_prepare_stack();
 test_prepare_arguments();
 test_stack_trace_limit();
@@ -340,3 +380,7 @@ test_callsite_native();
 test_callsite_parse_error();
 test_prepare_reentrancy();
 test_stack_accessor();
+test_lazy_stack();
+
+/* at the end: the line numbers of the tests above are checked */
+import * as std from "std";

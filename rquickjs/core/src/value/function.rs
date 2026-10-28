@@ -3,7 +3,6 @@
 use crate::{
     atom::PredefinedAtom,
     class::{Class, JsClass},
-    function::ffi::RustFunc,
     qjs, Ctx, Error, FromJs, IntoJs, Object, Result, Value,
 };
 
@@ -30,6 +29,17 @@ pub trait IntoJsFunc<'js, P> {
 
     /// Call the function with the given parameters.
     fn call<'a>(&self, params: Params<'a, 'js>) -> Result<Value<'js>>;
+
+    /// Same as [`IntoJsFunc::call`], but returns the owned raw value.
+    ///
+    /// Calls `call` by default; the implementations of this crate and of its macros implement
+    /// it directly (with [`IntoJs::into_js_raw`]) and `call` with it, it is what a JavaScript
+    /// call of a [`Function::new`] function calls.
+    #[doc(hidden)]
+    #[inline]
+    fn call_raw<'a>(&self, params: Params<'a, 'js>) -> Result<qjs::JSValue> {
+        self.call(params).map(Value::into_js_value)
+    }
 }
 
 /// A JavaScript function.
@@ -43,27 +53,23 @@ impl<'js> Function<'js> {
     where
         F: IntoJsFunc<'js, P> + 'js,
     {
-        let func = Box::new(move |params: Params<'_, 'js>| {
-            params.check_params(F::param_requirements())?;
-            f.call(params)
-        }) as Box<dyn RustFunc<'js> + 'js>;
-
-        let cls = Class::instance(ctx, RustFunction(func))?;
+        let cls = Class::instance_cell(ctx, ffi::JsFn::cell::<P>(f))?;
         debug_assert!(cls.is_function());
         Function(cls.into_inner()).with_length(F::param_requirements().min())
     }
 
     /// Call the function with given arguments.
+    #[inline]
     pub fn call<A, R>(&self, args: A) -> Result<R>
     where
         A: IntoArgs<'js>,
         R: FromJs<'js>,
     {
-        let ctx = self.ctx();
         let num = args.num_args();
-        let mut accum_args = Args::new(ctx.clone(), num);
+        // SAFETY: the args are dropped before the borrow of `self` ends
+        let mut accum_args = unsafe { Args::new_borrowed(self.ctx(), num) };
         args.into_args(&mut accum_args)?;
-        self.call_arg(accum_args)
+        accum_args.apply(self)
     }
 
     /// Call the function with given arguments in the form of an [`Args`] object.
@@ -198,13 +204,12 @@ impl<'js> Constructor<'js> {
         let func = Box::new(move |params: Params<'_, 'js>| -> Result<Value<'js>> {
             params.check_params(F::param_requirements())?;
             let this = params.this();
-            let ctx = params.ctx().clone();
 
             // get the prototype of thie class from itself or the inate class prototype.
             let proto = this
                 .into_function()
                 .map(|func| func.get(PredefinedAtom::Prototype))
-                .unwrap_or_else(|| Class::<C>::prototype(&ctx))?;
+                .unwrap_or_else(|| Class::<C>::prototype(params.ctx()))?;
 
             let res = f.call(params)?;
             res.as_object()
@@ -271,16 +276,17 @@ impl<'js> Constructor<'js> {
     /// Call the constructor as a constructor.
     ///
     /// Equivalent to calling any constructor function with the new keyword.
+    #[inline]
     pub fn construct<A, R>(&self, args: A) -> Result<R>
     where
         A: IntoArgs<'js>,
         R: FromJs<'js>,
     {
-        let ctx = self.ctx();
         let num = args.num_args();
-        let mut accum_args = Args::new(ctx.clone(), num);
+        // SAFETY: the args are dropped before the borrow of `self` ends
+        let mut accum_args = unsafe { Args::new_borrowed(self.ctx(), num) };
         args.into_args(&mut accum_args)?;
-        self.construct_args(accum_args)
+        accum_args.construct(self)
     }
 
     /// Call the constructor as a constructor with an [`Args`] object.
@@ -843,5 +849,138 @@ mod test {
             let is_instance: bool = ctx.eval("var f = new Foo(); f instanceof Foo").unwrap();
             assert!(is_instance);
         });
+    }
+
+    #[test]
+    fn call_js_fn_with_more_args_than_reserved() {
+        use crate::function::Args;
+
+        test_with(|ctx| {
+            let f: Function = ctx.eval("(...x) => x.join()").unwrap();
+
+            // fewer slots than arguments used to index past the arguments kept on the stack
+            let mut args = Args::new(ctx.clone(), 0);
+            args.push_args(0..12).unwrap();
+            let res: StdString = f.call_arg(args).unwrap();
+            assert_eq!(res, "0,1,2,3,4,5,6,7,8,9,10,11");
+
+            let mut args = Args::new(ctx.clone(), 2);
+            args.this(1).unwrap();
+            args.push_args(0..9).unwrap();
+            let res: StdString = f.call_arg(args).unwrap();
+            assert_eq!(res, "0,1,2,3,4,5,6,7,8");
+
+            let res: StdString = f.call((1, 2, 3, 4, 5, 6, Rest(vec![7, 8]))).unwrap();
+            assert_eq!(res, "1,2,3,4,5,6,7,8");
+            let res: StdString = f.call((1, 2, 3, 4, 5, 6, Rest(vec![7, 8, 9]))).unwrap();
+            assert_eq!(res, "1,2,3,4,5,6,7,8,9");
+        })
+    }
+
+    #[test]
+    fn call_js_fn_with_owned_results() {
+        test_with(|ctx| {
+            let f: Function = ctx
+                .eval("(function(a, b) { 'use strict'; return { a, b, t: this } })")
+                .unwrap();
+            // the results outlive the arguments of the calls
+            let obj: Object = f.call((1, "x")).unwrap();
+            let val: Value = f.call((This(2), 3, Opt(Some(4)))).unwrap();
+            assert_eq!(obj.get::<_, StdString>("b").unwrap(), "x");
+            let obj2 = val.into_object().unwrap();
+            assert_eq!(obj2.get::<_, i32>("b").unwrap(), 4);
+            assert_eq!(obj2.get::<_, Value>("t").unwrap().as_number(), Some(2.0));
+            assert_eq!(obj2.get::<_, Option<i32>>("missing").unwrap(), None);
+            // a failed conversion of the result
+            let err = f.call::<_, StdString>((This(obj2.clone()), 5)).unwrap_err();
+            assert!(err.is_from_js(), "{err}");
+
+            let ctor: Constructor = ctx
+                .eval("(class { constructor(a, b) { this.v = a * b } })")
+                .unwrap();
+            let inst: Object = ctor.construct((6, 7)).unwrap();
+            assert_eq!(inst.get::<_, i32>("v").unwrap(), 42);
+
+            let thrower: Function = ctx.eval("(x) => { throw x + 1 }").unwrap();
+            let err = thrower.call::<_, i32>((1,)).unwrap_err();
+            assert!(err.is_exception(), "{err}");
+            assert_eq!(ctx.catch().as_int(), Some(2));
+
+            let getter: Object = ctx.eval("({ get x() { throw 'g' } })").unwrap();
+            let err = getter.get::<_, i32>("x").unwrap_err();
+            assert!(err.is_exception(), "{err}");
+            let caught: StdString = ctx.catch().get().unwrap();
+            assert_eq!(caught, "g");
+        })
+    }
+
+    #[test]
+    fn call_js_fn_of_other_context() {
+        use crate::function::Args;
+
+        let rt = Runtime::new().unwrap();
+        let ctx_a = Context::full(&rt).unwrap();
+        let ctx_b = Context::full(&rt).unwrap();
+        let raw_b = ctx_b.with(|ctx_b| ctx_b.as_raw());
+        ctx_a.with(|ctx_a| {
+            let f: Function = ctx_a.eval("(a, b) => [a, b]").unwrap();
+            let res: Vec<i32> = f.call((1, 2)).unwrap();
+            assert_eq!(res, [1, 2]);
+
+            // arguments of another context of the runtime than the one of the function
+            let ctx_b = unsafe { Ctx::from_raw(raw_b) };
+            let mut args = Args::new(ctx_b.clone(), 1);
+            args.push_arg(3).unwrap();
+            let res: Vec<Option<i32>> = f.call_arg(args).unwrap();
+            assert_eq!(res, [Some(3), None]);
+            let mut args = Args::new(ctx_b, 1);
+            args.push_arg(3).unwrap();
+            let err = f.call_arg::<StdString>(args).unwrap_err();
+            assert!(err.is_from_js(), "{err}");
+
+            let err = f.call::<_, StdString>((1, 2)).unwrap_err();
+            assert!(err.is_from_js(), "{err}");
+        });
+    }
+
+    #[test]
+    fn call_rust_fn_with_primitive_args() {
+        test_with(|ctx| {
+            let global = ctx.globals();
+            global
+                .set(
+                    "prims",
+                    Func::from(|a: i32, b: f64, c: bool, d: u8| format!("{a} {b} {c} {d}")),
+                )
+                .unwrap();
+            let res: StdString = ctx.eval("prims(2.75, 3, false, 255)").unwrap();
+            assert_eq!(res, "2 3 false 255");
+            let res: StdString = ctx.eval("prims(-1e100, -0, true, 0.5)").unwrap();
+            assert_eq!(res, "-2147483648 -0 true 0");
+
+            let res: StdString = ctx
+                .eval("try { prims(1, 2, 0, 3) } catch (e) { e.message }")
+                .unwrap();
+            assert_eq!(res, "Error converting from js 'int' into type 'bool'");
+            let res: StdString = ctx
+                .eval("try { prims('1', 2, true, 3) } catch (e) { e.message }")
+                .unwrap();
+            assert_eq!(res, "Error converting from js 'string' into type 'i32'");
+            let res: StdString = ctx
+                .eval("try { prims(1, {}, true, 3) } catch (e) { e.message }")
+                .unwrap();
+            assert_eq!(res, "Error converting from js 'object' into type 'f64'");
+            let res: StdString = ctx
+                .eval("try { prims(1, 2, true, 256) } catch (e) { e.message }")
+                .unwrap();
+            assert!(res.contains("'u8'"), "{res}");
+            let res: StdString = ctx
+                .eval("try { prims(1, 2) } catch (e) { e.message }")
+                .unwrap();
+            assert!(
+                res.contains("Error calling function with 2 argument(s) while 4 where expected"),
+                "{res}"
+            );
+        })
     }
 }

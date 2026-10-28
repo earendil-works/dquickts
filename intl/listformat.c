@@ -588,8 +588,8 @@ static const JSCFunctionListEntry js_listformat_static_funcs[] = {
 
 int js_add_listformat(JSContext *ctx, JSValue intl_obj)
 {
-    JS_NewClassID(&js_listformat_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_listformat_class_id, &js_listformat_class);
+    if (js_intl_new_class(ctx, &js_listformat_class_id, &js_listformat_class))
+        return -1;
 
     if (JS_IsException(js_intl_new_constructor(ctx, intl_obj,
                                                 JS_INTL_CTOR_LISTFORMAT,

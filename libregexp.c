@@ -58,9 +58,6 @@ typedef enum {
 
 #define CAPTURE_COUNT_MAX 255
 #define REGISTER_COUNT_MAX 255
-/* must be large enough to have a negligible runtime cost and small
-   enough to call the interrupt callback often. */
-#define INTERRUPT_COUNTER_INIT 10000
 
 /* unicode code points */
 #define CP_LS   0x2028
@@ -2756,7 +2753,9 @@ typedef struct {
     int cbuf_type;
     int capture_count;
     BOOL is_unicode;
+    /* local copy of *host_interrupt_counter */
     int interrupt_counter;
+    int *host_interrupt_counter;
     void *opaque; /* used for stack overflow check */
 
     StackElem *stack_buf;
@@ -2767,8 +2766,11 @@ typedef struct {
 static int lre_poll_timeout(REExecContext *s)
 {
     if (unlikely(--s->interrupt_counter <= 0)) {
-        s->interrupt_counter = INTERRUPT_COUNTER_INIT;
-        if (lre_check_timeout(s->opaque))
+        int ret;
+        *s->host_interrupt_counter = s->interrupt_counter;
+        ret = lre_check_timeout(s->opaque);
+        s->interrupt_counter = *s->host_interrupt_counter;
+        if (ret)
             return LRE_RET_TIMEOUT;
     }
     return 0;
@@ -3366,7 +3368,8 @@ int lre_exec(uint8_t **capture,
     s->cbuf_type = cbuf_type;
     if (s->cbuf_type == 1 && s->is_unicode)
         s->cbuf_type = 2;
-    s->interrupt_counter = INTERRUPT_COUNTER_INIT;
+    s->host_interrupt_counter = lre_get_interrupt_counter(opaque);
+    s->interrupt_counter = *s->host_interrupt_counter;
     s->opaque = opaque;
 
     s->stack_buf = s->static_stack_buf;
@@ -3384,6 +3387,7 @@ int lre_exec(uint8_t **capture,
     }
 
     ret = lre_exec_backtrack(s, capture, bc_buf + RE_HEADER_LEN, cptr);
+    *s->host_interrupt_counter = s->interrupt_counter;
 
     if (s->stack_buf != s->static_stack_buf)
         lre_realloc(s->opaque, s->stack_buf, 0);
@@ -3427,6 +3431,19 @@ BOOL lre_check_stack_overflow(void *opaque, size_t alloca_size)
 void *lre_realloc(void *opaque, void *ptr, size_t size)
 {
     return realloc(ptr, size);
+}
+
+static int interrupt_counter;
+
+int *lre_get_interrupt_counter(void *opaque)
+{
+    return &interrupt_counter;
+}
+
+int lre_check_timeout(void *opaque)
+{
+    interrupt_counter = 10000;
+    return 0;
 }
 
 int main(int argc, char **argv)

@@ -7,6 +7,10 @@ function Ctor() { this.e = new RangeError("in ctor"); }
 var thrown;
 try { thrower(); } catch (e) { thrown = e; }
 var created = new TypeError("created");
+// stack traces formatted lazily: only read after the hibernation
+var unreadThrown;
+try { thrower(); } catch (e) { unreadThrown = e; }
+var unreadCreated = (function lazyMaker() { return new SyntaxError("unread"); })();
 var captured = {};
 Error.captureStackTrace(captured);
 var notCaptured = Reflect.construct(Error, ["no stack"], Object);
@@ -43,6 +47,7 @@ report();
 // called by the host after the last hibernation
 function onResume() {
     Error.prepareStackTrace = undefined;
+    print("unread", unreadThrown.stack, unreadCreated.stack);
     print("default now", new Error("again").stack);
     Error.stackTraceLimit = 10;
     report();

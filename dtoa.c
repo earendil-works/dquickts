@@ -1181,8 +1181,8 @@ int js_dtoa(char *buf, double d, int radix, int n_digits, int flags,
     E = 1 + mul_log2_radix(e - 1, radix);
     
     if (fmt == JS_DTOA_FORMAT_FREE) {
-        int P_max, E0, e1, E_found, P_found;
-        uint64_t m1, mant_found, mant, mant_max1;
+        int P_max, E0, e1, E_found, P_found, P1, E1;
+        uint64_t m1, mant_found, mant, mant_max1, mant1;
         /* P_max is guarranteed to work by construction */
         P_max = dtoa_max_digits_table[radix - 2];
         E0 = E;
@@ -1204,20 +1204,38 @@ int js_dtoa(char *buf, double d, int radix, int n_digits, int flags,
                     break;
                 E++; /* at most one iteration is possible */
             }
-            /* remove useless trailing zero digits */
-            while ((mant % radix) == 0) {
-                mant /= radix;
-                P--;
+            P1 = P;
+            E1 = E;
+            mant1 = mant;
+            for(i = 0;; i++) {
+                /* remove useless trailing zero digits */
+                while ((mant % radix) == 0) {
+                    mant /= radix;
+                    P--;
+                }
+                /* garanteed to work for P = P_max */
+                if (P_found == 0)
+                    goto prec_found;
+                /* convert back to base 2 */
+                mpb_set_u64(tmp1, mant);
+                m1 = mul_pow_round_to_d(&e1, tmp1, radix1, radix_shift, E - P, JS_RNDN);
+                /* Note: (m, e) is never zero here, so the exponent for m1
+                   = 0 does not matter */
+                if (m1 == m && e1 == e)
+                    break;
+                /* when m is a power of two, the rounding interval is
+                   asymmetric: the nearest P digit number may be below
+                   the interval while the next one above is inside */
+                if (i != 0 || m != ((uint64_t)1 << 52))
+                    break;
+                P = P1;
+                E = E1;
+                mant = mant1 + 1;
+                if (mant == mant_max1) {
+                    mant /= radix;
+                    E++;
+                }
             }
-            /* garanteed to work for P = P_max */
-            if (P_found == 0)
-                goto prec_found;
-            /* convert back to base 2 */
-            mpb_set_u64(tmp1, mant);
-            m1 = mul_pow_round_to_d(&e1, tmp1, radix1, radix_shift, E - P, JS_RNDN);
-            //            printf("P=%2d: m=0x%016" PRIx64 " e=%d m1=0x%016" PRIx64 " e1=%d\n", P, m, e, m1, e1);
-            /* Note: (m, e) is never zero here, so the exponent for m1
-               = 0 does not matter */
             if (m1 == m && e1 == e) {
             prec_found:
                 P_found = P;

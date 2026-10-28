@@ -3340,8 +3340,8 @@ int js_add_duration(JSContext *ctx, JSValue temporal_obj)
 {
     JSValue ctor;
     
-    JS_NewClassID(&js_duration_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_duration_class_id, &js_duration_class);
+    if (ti_new_class(ctx, &js_duration_class_id, &js_duration_class))
+        return -1;
     
     ctor = JS_NewCConstructor(ctx, (int)js_duration_class_id, "Duration",
                                (JSCFunction *)js_duration_constructor, 0,

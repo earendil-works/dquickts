@@ -1,5 +1,11 @@
 use super::{JsClass, Tracer};
-use crate::{class::JsCell, function::Params, qjs, runtime::opaque::Opaque, Atom, Ctx, Value};
+use crate::{
+    class::JsCell,
+    function::{Params, RustFunction},
+    qjs,
+    runtime::opaque::Opaque,
+    Atom, Ctx, Value,
+};
 use alloc::boxed::Box;
 use core::{any::TypeId, mem, panic::AssertUnwindSafe, ptr::NonNull};
 
@@ -17,17 +23,27 @@ unsafe fn throw_missing_data(ctx: *mut qjs::JSContext) -> qjs::JSValue {
     qjs::JS_ThrowTypeError(ctx, c"Rust object without its Rust data".as_ptr())
 }
 
+/// An uncounted copy of the context of a value given to an exotic hook, which the hook lends to
+/// the class: the engine keeps the context alive while it runs the hook.
+#[inline]
+unsafe fn hook_ctx<'js>(ctx: &Ctx<'js>) -> mem::ManuallyDrop<Ctx<'js>> {
+    mem::ManuallyDrop::new(core::ptr::read(ctx))
+}
+
 /// FFI finalizer, destroying the object once it is delete by the Gc.
-pub(crate) unsafe extern "C" fn class_finalizer(rt: *mut qjs::JSRuntime, val: qjs::JSValue) {
-    let class_id = Opaque::from_runtime_ptr(rt).get_class_id();
+pub(crate) unsafe extern "C" fn class_finalizer(_rt: *mut qjs::JSRuntime, val: qjs::JSValue) {
+    let class_id = Opaque::class_id();
     if let Some(ptr) = class_cell(val, class_id) {
         (ptr.as_ref().v_table.finalizer)(ptr);
     }
 }
 
 /// FFI finalizer, destroying the object once it is delete by the Gc.
-pub(crate) unsafe extern "C" fn exotic_class_finalizer(rt: *mut qjs::JSRuntime, val: qjs::JSValue) {
-    let class_id = Opaque::from_runtime_ptr(rt).get_exotic_id();
+pub(crate) unsafe extern "C" fn exotic_class_finalizer(
+    _rt: *mut qjs::JSRuntime,
+    val: qjs::JSValue,
+) {
+    let class_id = Opaque::exotic_id();
     if let Some(ptr) = class_cell(val, class_id) {
         (ptr.as_ref().v_table.finalizer)(ptr);
     }
@@ -39,7 +55,7 @@ pub(crate) unsafe extern "C" fn class_trace(
     val: qjs::JSValue,
     mark_func: qjs::JS_MarkFunc,
 ) {
-    let class_id = Opaque::from_runtime_ptr(rt).get_class_id();
+    let class_id = Opaque::class_id();
     if let Some(ptr) = class_cell(val, class_id) {
         let tracer = Tracer::from_ffi(rt, mark_func);
         (ptr.as_ref().v_table.trace)(ptr, tracer)
@@ -52,7 +68,7 @@ pub(crate) unsafe extern "C" fn exotic_class_trace(
     val: qjs::JSValue,
     mark_func: qjs::JS_MarkFunc,
 ) {
-    let class_id = Opaque::from_runtime_ptr(rt).get_exotic_id();
+    let class_id = Opaque::exotic_id();
     if let Some(ptr) = class_cell(val, class_id) {
         let tracer = Tracer::from_ffi(rt, mark_func);
         (ptr.as_ref().v_table.trace)(ptr, tracer)
@@ -60,8 +76,8 @@ pub(crate) unsafe extern "C" fn exotic_class_trace(
 }
 
 /// FFI finalizer, destroying the object once it is delete by the Gc.
-pub(crate) unsafe extern "C" fn callable_finalizer(rt: *mut qjs::JSRuntime, val: qjs::JSValue) {
-    let class_id = Opaque::from_runtime_ptr(rt).get_callable_id();
+pub(crate) unsafe extern "C" fn callable_finalizer(_rt: *mut qjs::JSRuntime, val: qjs::JSValue) {
+    let class_id = Opaque::callable_id();
     if let Some(ptr) = class_cell(val, class_id) {
         (ptr.as_ref().v_table.finalizer)(ptr)
     }
@@ -73,7 +89,7 @@ pub(crate) unsafe extern "C" fn callable_trace(
     val: qjs::JSValue,
     mark_func: qjs::JS_MarkFunc,
 ) {
-    let class_id = Opaque::from_runtime_ptr(rt).get_callable_id();
+    let class_id = Opaque::callable_id();
     if let Some(ptr) = class_cell(val, class_id) {
         let tracer = Tracer::from_ffi(rt, mark_func);
         (ptr.as_ref().v_table.trace)(ptr, tracer)
@@ -89,8 +105,7 @@ pub(crate) unsafe extern "C" fn call(
     argv: *mut qjs::JSValue,
     flags: qjs::c_int,
 ) -> qjs::JSValue {
-    let rt = qjs::JS_GetRuntime(ctx);
-    let id = Opaque::from_runtime_ptr(rt).get_callable_id();
+    let id = Opaque::callable_id();
     let Some(ptr) = class_cell(function, id) else {
         return throw_missing_data(ctx);
     };
@@ -104,8 +119,7 @@ pub(crate) unsafe extern "C" fn exotic_get_property(
     atom: qjs::JSAtom,
     receiver: qjs::JSValueConst,
 ) -> qjs::JSValue {
-    let rt = qjs::JS_GetRuntime(ctx);
-    let id = Opaque::from_runtime_ptr(rt).get_exotic_id();
+    let id = Opaque::exotic_id();
     let Some(ptr) = class_cell(obj, id) else {
         return throw_missing_data(ctx);
     };
@@ -121,8 +135,7 @@ pub(crate) unsafe extern "C" fn exotic_set_property(
     receiver: qjs::JSValueConst,
     flags: qjs::c_int,
 ) -> qjs::c_int {
-    let rt = qjs::JS_GetRuntime(ctx);
-    let id = Opaque::from_runtime_ptr(rt).get_exotic_id();
+    let id = Opaque::exotic_id();
     let Some(ptr) = class_cell(obj, id) else {
         throw_missing_data(ctx);
         return -1;
@@ -136,8 +149,7 @@ pub(crate) unsafe extern "C" fn exotic_has_property(
     obj: qjs::JSValueConst,
     atom: qjs::JSAtom,
 ) -> qjs::c_int {
-    let rt = qjs::JS_GetRuntime(ctx);
-    let id = Opaque::from_runtime_ptr(rt).get_exotic_id();
+    let id = Opaque::exotic_id();
     let Some(ptr) = class_cell(obj, id) else {
         throw_missing_data(ctx);
         return -1;
@@ -151,8 +163,7 @@ pub(crate) unsafe extern "C" fn exotic_delete_property(
     obj: qjs::JSValueConst,
     prop: qjs::JSAtom,
 ) -> qjs::c_int {
-    let rt = qjs::JS_GetRuntime(ctx);
-    let id = Opaque::from_runtime_ptr(rt).get_exotic_id();
+    let id = Opaque::exotic_id();
     let Some(ptr) = class_cell(obj, id) else {
         throw_missing_data(ctx);
         return -1;
@@ -167,8 +178,7 @@ pub(crate) unsafe extern "C" fn exotic_get_own_property(
     obj: qjs::JSValueConst,
     prop: qjs::JSAtom,
 ) -> qjs::c_int {
-    let rt = qjs::JS_GetRuntime(ctx);
-    let id = Opaque::from_runtime_ptr(rt).get_exotic_id();
+    let id = Opaque::exotic_id();
     let Some(ptr) = class_cell(obj, id) else {
         throw_missing_data(ctx);
         return -1;
@@ -183,8 +193,7 @@ pub(crate) unsafe extern "C" fn exotic_get_own_property_names(
     plen: *mut u32,
     obj: qjs::JSValueConst,
 ) -> qjs::c_int {
-    let rt = qjs::JS_GetRuntime(ctx);
-    let id = Opaque::from_runtime_ptr(rt).get_exotic_id();
+    let id = Opaque::exotic_id();
     let Some(ptr) = class_cell(obj, id) else {
         throw_missing_data(ctx);
         return -1;
@@ -295,7 +304,9 @@ impl VTable {
     ) -> qjs::JSValue {
         let this_ptr = this_ptr.cast::<ClassCell<JsCell<C>>>();
         let params = Params::from_ffi_class(ctx, function, this, argc, argv, flags);
-        let ctx = params.ctx().clone();
+        // An uncounted context for handling a panic or throwing the error after `params` has been
+        // consumed: the engine keeps the context alive for the whole call.
+        let ctx = Ctx::from_ptr_uncounted(ctx);
 
         ctx.handle_panic(AssertUnwindSafe(|| {
             C::call(&this_ptr.as_ref().data, params)
@@ -312,9 +323,9 @@ impl VTable {
         receiver: qjs::JSValueConst,
     ) -> qjs::JSValue {
         let this_ptr = this_ptr.cast::<ClassCell<JsCell<C>>>();
-        let ctx = Ctx::from_ptr(ctx);
-        let atom = Atom::from_atom_val_dup(ctx.clone(), atom);
-        let receiver = Value::from_js_value_const(ctx.clone(), receiver);
+        let receiver = Value::from_js_value_const(Ctx::from_ptr(ctx), receiver);
+        let ctx = hook_ctx(receiver.ctx());
+        let atom = Atom::from_atom_val_dup((*ctx).clone(), atom);
 
         ctx.handle_panic(AssertUnwindSafe(|| {
             C::exotic_get_property(&this_ptr.as_ref().data, &ctx, atom, receiver)
@@ -333,10 +344,10 @@ impl VTable {
         _flags: qjs::c_int,
     ) -> qjs::c_int {
         let this_ptr = this_ptr.cast::<ClassCell<JsCell<C>>>();
-        let ctx = Ctx::from_ptr(ctx);
-        let atom = Atom::from_atom_val_dup(ctx.clone(), atom);
-        let receiver = Value::from_js_value_const(ctx.clone(), receiver);
-        let value = Value::from_js_value_const(ctx.clone(), value);
+        let value = Value::from_js_value_const(Ctx::from_ptr(ctx), value);
+        let ctx = hook_ctx(value.ctx());
+        let atom = Atom::from_atom_val_dup((*ctx).clone(), atom);
+        let receiver = Value::from_js_value_const((*ctx).clone(), receiver);
 
         ctx.handle_panic_exotic(AssertUnwindSafe(|| {
             match C::exotic_set_property(&this_ptr.as_ref().data, &ctx, atom, receiver, value) {
@@ -362,8 +373,8 @@ impl VTable {
         atom: qjs::JSAtom,
     ) -> qjs::c_int {
         let this_ptr = this_ptr.cast::<ClassCell<JsCell<C>>>();
-        let ctx = Ctx::from_ptr(ctx);
-        let atom = Atom::from_atom_val_dup(ctx.clone(), atom);
+        let atom = Atom::from_atom_val_dup(Ctx::from_ptr(ctx), atom);
+        let ctx = hook_ctx(&atom.ctx);
 
         ctx.handle_panic_exotic(AssertUnwindSafe(|| {
             match C::exotic_has_property(&this_ptr.as_ref().data, &ctx, atom) {
@@ -389,8 +400,8 @@ impl VTable {
         atom: qjs::JSAtom,
     ) -> qjs::c_int {
         let this_ptr = this_ptr.cast::<ClassCell<JsCell<C>>>();
-        let ctx = Ctx::from_ptr(ctx);
-        let atom = Atom::from_atom_val_dup(ctx.clone(), atom);
+        let atom = Atom::from_atom_val_dup(Ctx::from_ptr(ctx), atom);
+        let ctx = hook_ctx(&atom.ctx);
 
         ctx.handle_panic_exotic(AssertUnwindSafe(|| {
             match C::exotic_delete_property(&this_ptr.as_ref().data, &ctx, atom) {
@@ -417,8 +428,8 @@ impl VTable {
         prop: qjs::JSAtom,
     ) -> qjs::c_int {
         let this_ptr = this_ptr.cast::<ClassCell<JsCell<C>>>();
-        let ctx = Ctx::from_ptr(ctx);
-        let atom = Atom::from_atom_val_dup(ctx.clone(), prop);
+        let atom = Atom::from_atom_val_dup(Ctx::from_ptr(ctx), prop);
+        let ctx = hook_ctx(&atom.ctx);
 
         ctx.handle_panic_exotic(AssertUnwindSafe(|| {
             match C::exotic_get_own_property(&this_ptr.as_ref().data, &ctx, atom) {
@@ -495,6 +506,26 @@ impl VTable {
                 }
             }
         }))
+    }
+
+    /// The v-table of [`RustFunction`] with the given call function.
+    ///
+    /// For the functions whose call function knows the type of the Rust function in the
+    /// `RustFunction`, which it calls without its dynamic dispatch. The v-table is otherwise
+    /// the one of `RustFunction`: the cell is a `RustFunction` to everything else.
+    pub(crate) const fn rust_function(call: CallFunc) -> VTable {
+        VTable {
+            id_fn: TypeId::of::<RustFunction<'static>>,
+            finalizer: VTable::finalizer_impl::<'static, RustFunction<'static>>,
+            trace: VTable::trace_impl::<RustFunction<'static>>,
+            call,
+            get_property: VTable::get_property_impl::<RustFunction<'static>>,
+            set_property: VTable::set_property_impl::<RustFunction<'static>>,
+            has_property: VTable::has_property_impl::<RustFunction<'static>>,
+            delete_property: VTable::delete_property_impl::<RustFunction<'static>>,
+            get_own_property: VTable::get_own_property_impl::<RustFunction<'static>>,
+            get_own_property_names: VTable::get_own_property_names_impl::<RustFunction<'static>>,
+        }
     }
 
     pub fn get<'js, C: JsClass<'js>>() -> &'static VTable {

@@ -245,6 +245,17 @@ pub fn main() {
             if(pairDesc.configurable !== true || pairDesc.enumerable !== true){
                 throw new Error(25)
             }
+            // the function wrappers check the argument count of the generated functions
+            let missingArg = null;
+            try { TestClass.compare(t) } catch(e) { missingArg = e }
+            if(!(missingArg instanceof TypeError) || !missingArg.message.includes("1 argument(s) while 2")){
+                throw new Error(26)
+            }
+            missingArg = null;
+            try { new TestClass() } catch(e) { missingArg = e }
+            if(!(missingArg instanceof TypeError) || !missingArg.message.includes("0 argument(s) while 1")){
+                throw new Error(27)
+            }
         "#,
         )
         .catch(&ctx)

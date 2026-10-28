@@ -1,6 +1,6 @@
 use core::ptr::NonNull;
 
-use crate::qjs;
+use crate::{qjs, Ctx};
 
 #[cfg(feature = "parallel")]
 use std::sync::Arc;
@@ -39,10 +39,12 @@ pub(crate) struct ContextOwner<R: DropContext> {
 impl<R: DropContext> ContextOwner<R> {
     #[cfg(not(feature = "parallel"))]
     pub(crate) unsafe fn new(ctx: NonNull<qjs::JSContext>, rt: R) -> Self {
+        Ctx::init_opaque(ctx);
         Self { ctx, rt }
     }
     #[cfg(feature = "parallel")]
     pub(crate) unsafe fn new(ctx: NonNull<qjs::JSContext>, rt: R) -> Self {
+        Ctx::init_opaque(ctx);
         Self {
             ctx: Arc::new(CtxPtr(ctx)),
             rt,

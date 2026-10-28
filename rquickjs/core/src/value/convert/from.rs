@@ -1,6 +1,6 @@
 use crate::{
-    convert::List, Array, CString, Ctx, Error, FromAtom, FromJs, Object, Result, StdString, String,
-    Type, Value,
+    convert::List, qjs, Array, CString, Ctx, Error, FromAtom, FromJs, Object, Result, StdString,
+    String, Value,
 };
 use alloc::{
     boxed::Box,
@@ -36,40 +36,69 @@ impl<'js> FromJs<'js> for Value<'js> {
     }
 }
 
+/// The JavaScript string in `value`, checked from its tag alone.
+fn js_string(value: Value<'_>) -> Result<String<'_>> {
+    if value.is_string() {
+        Ok(String(value))
+    } else {
+        Err(Error::new_from_js(value.type_name(), "string"))
+    }
+}
+
 impl<'js> FromJs<'js> for StdString {
     fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-        String::from_value(value).and_then(|string| string.to_string())
+        js_string(value)?.to_string()
     }
 }
 
 impl<'js> FromJs<'js> for char {
     fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-        let type_name = value.type_name();
-        let s = String::from_value(value)?.to_string()?;
+        use crate::value::string::StringData;
 
-        let mut chars = s.chars();
-        let (c, more) = (chars.next(), chars.next());
-
-        match (c, more) {
-            (Some(c), None) => Ok(c),
-            _ => Err(Error::FromJs {
-                from: type_name,
-                to: "char",
-                message: Some("The length of the string converted to char must be 1".into()),
-            }),
+        let string = js_string(value)?;
+        // one code point: no allocation
+        match string.data()? {
+            StringData::Latin1(&[b]) => return Ok(b as char),
+            StringData::Latin1(_) => {}
+            StringData::Utf16(units) => {
+                if let Some(Ok(c)) = char::decode_utf16(units.iter().copied()).next() {
+                    if c.len_utf16() == units.len() {
+                        return Ok(c);
+                    }
+                }
+                // an unpaired surrogate is reported as an UTF-8 error
+                string.to_string()?;
+            }
         }
+        Err(Error::FromJs {
+            from: "string",
+            to: "char",
+            message: Some("The length of the string converted to char must be 1".into()),
+        })
     }
 }
 
 impl<'js> FromJs<'js> for CString<'js> {
     fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-        String::from_value(value)?.to_cstring()
+        js_string(value)?.to_cstring()
     }
 }
 
 /// Convert from JS as any
 impl<'js> FromJs<'js> for () {
+    #[inline]
     fn from_js(_: &Ctx<'js>, _: Value<'js>) -> Result<Self> {
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn from_js_raw(_: &Ctx<'js>, _: qjs::JSValueConst) -> Result<Self> {
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn from_js_raw_owned(ctx: &Ctx<'js>, value: qjs::JSValue) -> Result<Self> {
+        qjs::JS_FreeValue(ctx.as_ptr(), value);
         Ok(())
     }
 }
@@ -156,6 +185,33 @@ fn number_match_range<T: PartialOrd>(
     }
 }
 
+/// The payload getters and the error of the primitive conversions from raw values.
+mod raw {
+    use crate::{qjs, Ctx, Error, Value};
+
+    #[inline]
+    pub unsafe fn get_bool(value: qjs::JSValueConst) -> bool {
+        qjs::JS_VALUE_GET_BOOL(value)
+    }
+
+    #[inline]
+    pub unsafe fn get_int(value: qjs::JSValueConst) -> i32 {
+        qjs::JS_VALUE_GET_INT(value)
+    }
+
+    #[inline]
+    pub unsafe fn get_float(value: qjs::JSValueConst) -> f64 {
+        qjs::JS_VALUE_GET_FLOAT64(value)
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub unsafe fn type_error(ctx: &Ctx<'_>, value: qjs::JSValueConst, to: &'static str) -> Error {
+        let value = Value::from_js_value_const(ctx.clone(), value);
+        Error::new_from_js(value.type_of().as_str(), to)
+    }
+}
+
 macro_rules! from_js_impls {
     // for reference types
     (ref: $($(#[$meta:meta])* $type:ident,)*) => {
@@ -180,14 +236,14 @@ macro_rules! from_js_impls {
                 $($type: FromJs<'js>,)*
             {
                 fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-                    let array = Array::from_value(value)?;
+                    let array = Array::from_list_value(value)?;
 
                     let tuple_len = 0 $(+ from_js_impls!(@one $type))*;
                     let array_len = array.len();
                     tuple_match_size(array_len, tuple_len)?;
 
                     Ok(List((
-                        $(array.get::<$type>(from_js_impls!(@idx $type))?,)*
+                        $(array.get_element::<$type>(from_js_impls!(@idx $type))?,)*
                     )))
                 }
             }
@@ -204,8 +260,9 @@ macro_rules! from_js_impls {
                 $($param: $($pguard)*,)*
             {
                 fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-                    let array = Array::from_value(value)?;
-                    array.iter().collect::<Result<_>>()
+                    // A vector is collected in place, the other types as from any iterator.
+                    let elements = Array::from_list_value(value)?.collect_vec::<T>()?;
+                    Ok(elements.into_iter().collect())
                 }
             }
         )*
@@ -223,23 +280,45 @@ macro_rules! from_js_impls {
             {
                 fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
                     let object = Object::from_value(value)?;
-                    object.props().collect::<Result<_>>()
+                    // Collecting the `Result`s would lose the exact length: the entries go to a
+                    // vector first, which the `BTreeMap`s sort when built from an iterator anyway.
+                    let props = object.props::<K, V>();
+                    let mut entries = Vec::with_capacity(props.len());
+                    for entry in props {
+                        entries.push(entry?);
+                    }
+                    Ok(entries.into_iter().collect())
                 }
             }
         )*
     };
 
     // for basic primitive types (int and float)
-    // (ex. f64 => Float as_float Int as_int)
-    (val: $($type:ty => $($jstype:ident $getfn:ident)*,)*) => {
+    // (ex. f64 => JS_TAG_FLOAT64 get_float JS_TAG_INT get_int)
+    //
+    // Matches on the value tag directly: these tags map one to one to the accepted `Type`s
+    // (Bool, Int, Float), so the full `Value::type_of` is only computed for the error.
+    (val: $($type:ty => $($jstag:ident $getfn:ident)*,)*) => {
         $(
             impl<'js> FromJs<'js> for $type {
-                fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-                    let type_ = value.type_of();
-                    match type_ {
-                        $(Type::$jstype => Ok(unsafe { value.$getfn() } as _),)*
-                        _ => Err(Error::new_from_js(type_.as_str(), stringify!($type))),
+                #[inline]
+                fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+                    unsafe { Self::from_js_raw(ctx, value.as_js_value()) }
+                }
+
+                #[inline]
+                unsafe fn from_js_raw(ctx: &Ctx<'js>, value: qjs::JSValueConst) -> Result<Self> {
+                    match qjs::JS_VALUE_GET_NORM_TAG(value) {
+                        $(qjs::$jstag => Ok(raw::$getfn(value) as _),)*
+                        _ => Err(raw::type_error(ctx, value, stringify!($type))),
                     }
+                }
+
+                #[inline]
+                unsafe fn from_js_raw_owned(ctx: &Ctx<'js>, value: qjs::JSValue) -> Result<Self> {
+                    let res = Self::from_js_raw(ctx, value);
+                    qjs::JS_FreeValue(ctx.as_ptr(), value);
+                    res
                 }
             }
         )*
@@ -250,10 +329,23 @@ macro_rules! from_js_impls {
         $(
             $(
                 impl<'js> FromJs<'js> for $type {
+                    #[inline]
                     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-                        let num = <$base>::from_js(ctx, value)?;
+                        unsafe { Self::from_js_raw(ctx, value.as_js_value()) }
+                    }
+
+                    #[inline]
+                    unsafe fn from_js_raw(ctx: &Ctx<'js>, value: qjs::JSValueConst) -> Result<Self> {
+                        let num = <$base>::from_js_raw(ctx, value)?;
                         number_match_range(num, $type::MIN as $base, $type::MAX as $base, stringify!($base), stringify!($type))?;
                         Ok(num as $type)
+                    }
+
+                    #[inline]
+                    unsafe fn from_js_raw_owned(ctx: &Ctx<'js>, value: qjs::JSValue) -> Result<Self> {
+                        let res = Self::from_js_raw(ctx, value);
+                        qjs::JS_FreeValue(ctx.as_ptr(), value);
+                        res
                     }
                 }
             )*
@@ -288,9 +380,9 @@ from_js_impls! {
 
 from_js_impls! {
     val:
-    bool => Bool get_bool,
-    i32 => Float get_float Int get_int,
-    f64 => Float get_float Int get_int,
+    bool => JS_TAG_BOOL get_bool,
+    i32 => JS_TAG_FLOAT64 get_float JS_TAG_INT get_int,
+    f64 => JS_TAG_FLOAT64 get_float JS_TAG_INT get_int,
 }
 
 from_js_impls! {
@@ -434,6 +526,33 @@ chrono_from_js_impls! {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn js_to_maps() {
+        use crate::{test_with, Error, StdString};
+        use alloc::collections::BTreeMap;
+        use hashbrown::HashMap;
+
+        test_with(|ctx| {
+            let src = "({ b: 2, a: 1, 0: 0 })";
+            let map: BTreeMap<StdString, i32> = ctx.eval(src).unwrap();
+            assert_eq!(map.keys().collect::<Vec<_>>(), ["0", "a", "b"]);
+            assert_eq!(map.values().copied().collect::<Vec<_>>(), [0, 1, 2]);
+            let map: HashMap<StdString, i32> = ctx.eval(src).unwrap();
+            assert_eq!(map.len(), 3);
+            assert_eq!((map["0"], map["a"], map["b"]), (0, 1, 2));
+            let map: BTreeMap<StdString, i32> = ctx.eval("({})").unwrap();
+            assert!(map.is_empty());
+
+            let src = "({ a: 1, get b() { throw 'getter' } })";
+            let err = ctx.eval::<BTreeMap<StdString, i32>, _>(src).unwrap_err();
+            assert!(matches!(err, Error::Exception));
+            assert_eq!(ctx.catch().get::<StdString>().unwrap(), "getter");
+            let src = "({ a: 'x' })";
+            assert!(ctx.eval::<HashMap<StdString, i32>, _>(src).is_err());
+            assert!(ctx.eval::<HashMap<StdString, i32>, _>("1").is_err());
+        })
+    }
+
     #[test]
     fn js_to_system_time() {
         use crate::{Context, Runtime};

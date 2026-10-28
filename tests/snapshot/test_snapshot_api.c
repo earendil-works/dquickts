@@ -991,6 +991,95 @@ static void free_roots(JSContext *ctx, JSValue *roots, int n)
         JS_FreeValue(ctx, roots[i]);
 }
 
+/* allocator failing the allocation number 'alloc_fail_at' counted
+   while 'alloc_armed' is set */
+static int alloc_armed;
+static long alloc_count, alloc_fail_at;
+
+static int alloc_fails(void)
+{
+    return alloc_armed && alloc_count++ == alloc_fail_at;
+}
+
+static void *f_calloc(JSMallocState *s, size_t count, size_t size)
+{
+    return alloc_fails() ? NULL : calloc(count, size);
+}
+
+static void *f_malloc(JSMallocState *s, size_t size)
+{
+    return alloc_fails() ? NULL : malloc(size);
+}
+
+static void f_free(JSMallocState *s, void *ptr)
+{
+    free(ptr);
+}
+
+static void *f_realloc(JSMallocState *s, void *ptr, size_t size)
+{
+    if (size == 0) {
+        free(ptr);
+        return NULL;
+    }
+    return alloc_fails() ? NULL : realloc(ptr, size);
+}
+
+static const JSMallocFunctions failing_mf = {
+    f_calloc, f_malloc, f_free, f_realloc, NULL,
+};
+
+/* the stack trace of an Error not read yet is formatted when it is
+   written: an allocation failure fails the write, a null stack trace is
+   never saved instead. Each allocation of the write fails once. */
+static void test_error_stack_oom(void)
+{
+    long n;
+    int failed;
+
+    for(n = 0; ; n++) {
+        JSRuntime *rt = JS_NewRuntime2(&failing_mf, NULL);
+        JSContext *ctx;
+        uint8_t *snap, *buf = NULL;
+        size_t size;
+
+        JS_NewClass(rt, counter_class_id, &counter_class);
+        ctx = new_context(rt);
+        JS_FreeValue(ctx, eval(ctx,
+            "function thrower() { return new Error('x') } var err = thrower();"));
+        alloc_count = 0;
+        alloc_fail_at = n;
+        alloc_armed = 1;
+        snap = JS_WriteSnapshot(ctx, &size, &host, NULL, 0, 0);
+        alloc_armed = 0;
+        failed = alloc_count > n;
+        if (snap) {
+            buf = malloc(size);
+            memcpy(buf, snap, size);
+            js_free(ctx, snap);
+        } else {
+            CHECK(failed);
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        }
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+        if (buf) {
+            ctx = read_snapshot(buf, size, NULL, 0);
+            free(buf);
+            if (ctx) {
+                if (eval_int(ctx, "typeof err.stack === 'string' && "
+                             "err.stack.includes('at thrower') ? 1 : 0") != 1) {
+                    fprintf(stderr, "allocation %ld failed: no stack trace\n", n);
+                    failures++;
+                }
+                free_context_and_runtime(ctx);
+            }
+        }
+        if (!failed)
+            break; /* every allocation of the write was tried */
+    }
+}
+
 static void test_private_symbols(void)
 {
     JSRuntime *rt = new_runtime();
@@ -1115,6 +1204,7 @@ int main(void)
     test_suspend_call();
     test_errors();
     test_c_closure();
+    test_error_stack_oom();
     test_private_symbols();
     test_performance();
     if (failures) {

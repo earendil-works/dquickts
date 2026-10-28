@@ -74,6 +74,7 @@ impl<'js> Hash for Value<'js> {
 }
 
 impl<'js> Clone for Value<'js> {
+    #[inline]
     fn clone(&self) -> Self {
         let ctx = self.ctx.clone();
         let value = unsafe { qjs::JS_DupValue(ctx.as_ptr(), self.value) };
@@ -82,6 +83,7 @@ impl<'js> Clone for Value<'js> {
 }
 
 impl<'js> Drop for Value<'js> {
+    #[inline]
     fn drop(&mut self) {
         unsafe {
             qjs::JS_FreeValue(self.ctx.as_ptr(), self.value);
@@ -614,15 +616,18 @@ macro_rules! sub_types {
                 }
 
                 /// Returns the underlying super type.
+                #[inline]
                 pub fn into_inner(self) -> sub_types!(@head_ty $($sub_type),*) {
                     self.0
                 }
                 /// Returns a reference to the underlying super type.
+                #[inline]
                 pub fn as_inner(&self) -> & sub_types!(@head_ty $($sub_type),*) {
                     &self.0
                 }
 
                 /// Returns the [`Ctx`] object associated with this value
+                #[inline]
                 pub fn ctx(&self) -> &Ctx<'js>{
                     self.0.ctx()
                 }
@@ -638,6 +643,7 @@ macro_rules! sub_types {
                 }
 
                 #[allow(unused)]
+                #[inline]
                 pub(crate) unsafe fn from_js_value_const(ctx: Ctx<'js>, value: qjs::JSValueConst) -> Self {
                     let v = Value::from_js_value_const(ctx, value);
                     debug_assert!(v.$as().is_some(),"tried to cource js value {:?} to the wrong type `{}`, this is a rquickjs bug",v, stringify!($head));
@@ -645,6 +651,7 @@ macro_rules! sub_types {
                 }
 
                 #[allow(unused)]
+                #[inline]
                 pub(crate) unsafe fn from_js_value(ctx: Ctx<'js>, value: qjs::JSValue) -> Self {
                     let v = Value::from_js_value(ctx, value);
                     debug_assert!(v.$as().is_some(),"tried to cource js value {:?} to the wrong type `{}`, this is a rquickjs bug",v, stringify!($head));
@@ -652,11 +659,13 @@ macro_rules! sub_types {
                 }
 
                 #[allow(unused)]
+                #[inline]
                 pub(crate) fn into_js_value(self) -> qjs::JSValue{
                     self.0.into_js_value()
                 }
 
                 #[allow(unused)]
+                #[inline]
                 pub(crate) fn as_js_value(&self) -> qjs::JSValueConst{
                     self.0.as_js_value()
                 }
@@ -665,6 +674,7 @@ macro_rules! sub_types {
             impl<'js> Deref for $head<'js> {
                 type Target = sub_types!(@head_ty $($sub_type),*);
 
+                #[inline]
                 fn deref(&self) -> &Self::Target {
                     &self.0
                 }

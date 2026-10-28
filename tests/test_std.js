@@ -113,14 +113,26 @@ function test_file_read_write()
 
 function test_write_file()
 {
-    var fname = "tmp_write_file.txt", ta, f;
+    var fname = "tmp_write_file.txt", ta, ab, f;
 
-    /* only the bytes of the typed array view are written */
-    ta = new Uint16Array([0x6968, 0x6a6b, 0x6c6d]);
+    /* only the bytes of the typed array view are written (the bytes are
+       set with an Uint8Array so that the test does not depend on the
+       endianness) */
+    ta = new Uint16Array(new Uint8Array([0x68, 0x69, 0x6b, 0x6a, 0x6d, 0x6c]).buffer);
     std.writeFile(fname, ta.subarray(1, 2));
     assert(std.loadFile(fname), "kj");
     std.writeFile(fname, ta.buffer);
     assert(std.loadFile(fname), "hikjml");
+    /* a length-tracking view writes the current bytes of its buffer */
+    ab = new ArrayBuffer(2, { maxByteLength: 8 });
+    ta = new Uint8Array(ab, 1);
+    ab.resize(4);
+    ta.set([0x61, 0x62, 0x63]);
+    std.writeFile(fname, ta);
+    assert(std.loadFile(fname), "abc");
+    ab.resize(3);
+    std.writeFile(fname, ta);
+    assert(std.loadFile(fname), "ab");
     std.writeFile(fname, "héllo");
     f = std.open(fname, "r");
     assert(f.readAsArrayBuffer().byteLength, 6);

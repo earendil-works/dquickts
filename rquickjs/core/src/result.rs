@@ -2,12 +2,13 @@ use core::{
     error::Error as StdError,
     ffi::FromBytesWithNulError,
     fmt::{self, Display, Formatter, Result as FmtResult},
+    mem::MaybeUninit,
     panic::UnwindSafe,
     str::{FromStr, Utf8Error},
 };
 
 use alloc::{
-    ffi::{CString, NulError},
+    ffi::NulError,
     string::{FromUtf8Error, ToString as _},
 };
 
@@ -288,52 +289,23 @@ impl Error {
         matches!(self, Self::TooManyArgs { .. } | Self::MissingArgs { .. })
     }
 
-    /// Optimized conversion to [`CString`]
-    pub(crate) fn to_cstring(&self) -> CString {
-        // stringify error with NUL at end
-        let mut message = alloc::format!("{self}\0").into_bytes();
-
-        message.pop(); // pop last NUL because CString add this later
-
-        // TODO: Replace by `CString::from_vec_with_nul_unchecked` later when it will be stabilized
-        unsafe { CString::from_vec_unchecked(message) }
-    }
-
     /// Throw an exception
     pub(crate) fn throw(&self, ctx: &Ctx) -> qjs::JSValue {
         use Error::*;
-        match self {
+        let kind = match self {
             // the pending exception (or suspension marker) keeps unwinding
-            Exception | Suspended => qjs::JS_EXCEPTION,
-            Allocation => unsafe { qjs::JS_ThrowOutOfMemory(ctx.as_ptr()) },
+            Exception | Suspended => return qjs::JS_EXCEPTION,
+            Allocation => return unsafe { qjs::JS_ThrowOutOfMemory(ctx.as_ptr()) },
             InvalidString(_)
             | Utf8(_)
             | FromJs { .. }
             | IntoJs { .. }
             | TooManyArgs { .. }
-            | MissingArgs { .. } => {
-                let message = self.to_cstring();
-                unsafe { qjs::JS_ThrowTypeError(ctx.as_ptr(), c"%s".as_ptr(), message.as_ptr()) }
-            }
-            AsSlice(_) => {
-                let message = self.to_cstring();
-                unsafe {
-                    qjs::JS_ThrowReferenceError(ctx.as_ptr(), c"%s".as_ptr(), message.as_ptr())
-                }
-            }
+            | MissingArgs { .. } => qjs::JSErrorEnum_JS_TYPE_ERROR,
+            AsSlice(_) => qjs::JSErrorEnum_JS_REFERENCE_ERROR,
             #[cfg(feature = "loader")]
-            Resolving { .. } | Loading { .. } => {
-                let message = self.to_cstring();
-                unsafe {
-                    qjs::JS_ThrowReferenceError(ctx.as_ptr(), c"%s".as_ptr(), message.as_ptr())
-                }
-            }
-            Unknown => {
-                let message = self.to_cstring();
-                unsafe {
-                    qjs::JS_ThrowInternalError(ctx.as_ptr(), c"%s".as_ptr(), message.as_ptr())
-                }
-            }
+            Resolving { .. } | Loading { .. } => qjs::JSErrorEnum_JS_REFERENCE_ERROR,
+            Unknown => qjs::JSErrorEnum_JS_INTERNAL_ERROR,
             error => {
                 unsafe {
                     let value = qjs::JS_NewError(ctx.as_ptr());
@@ -351,10 +323,86 @@ impl Error {
                         }
                     }
                     let js_val = (obj).into_js_value();
-                    qjs::JS_Throw(ctx.as_ptr(), js_val)
+                    return qjs::JS_Throw(ctx.as_ptr(), js_val);
                 }
             }
+        };
+        // the message is not formatted nor truncated by QuickJS
+        let mut stack = MaybeUninit::uninit();
+        let mut heap = StdString::new();
+        let message = match self {
+            // frequent: built without the formatting machinery nor an allocation (same text
+            // as `Display`)
+            FromJs { from, to, message } => conversion_message(
+                &mut stack,
+                &mut heap,
+                ["Error converting from js '", *from, "' into type '", *to],
+                message,
+            ),
+            IntoJs { from, to, message } => conversion_message(
+                &mut stack,
+                &mut heap,
+                ["Error converting from '", *from, "' into js '", *to],
+                message,
+            ),
+            _ => {
+                heap = self.to_string();
+                heap.as_str()
+            }
+        };
+        unsafe {
+            qjs::JS_ThrowErrorLen(
+                ctx.as_ptr(),
+                kind,
+                message.as_ptr().cast(),
+                message.len() as _,
+            )
         }
+    }
+}
+
+/// Size of the stack buffer of [`concat_message`].
+const MESSAGE_STACK_SIZE: usize = 256;
+
+/// Returns the concatenation of `parts`, stored in `stack` or, if it is longer, in `heap`.
+fn concat_message<'a>(
+    stack: &'a mut MaybeUninit<[u8; MESSAGE_STACK_SIZE]>,
+    heap: &'a mut StdString,
+    parts: &[&str],
+) -> &'a str {
+    let len: usize = parts.iter().map(|part| part.len()).sum();
+    if len > MESSAGE_STACK_SIZE {
+        heap.reserve_exact(len);
+        for part in parts {
+            heap.push_str(part);
+        }
+        return heap.as_str();
+    }
+    let base = stack.as_mut_ptr().cast::<u8>();
+    let mut pos = 0;
+    for part in parts {
+        // SAFETY: `pos + part.len() <= len <= MESSAGE_STACK_SIZE`
+        unsafe { core::ptr::copy_nonoverlapping(part.as_ptr(), base.add(pos), part.len()) };
+        pos += part.len();
+    }
+    // SAFETY: the first `len` bytes are initialized with a concatenation of UTF-8 strings
+    unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(base, len)) }
+}
+
+/// Returns the message of a `FromJs` or `IntoJs` error (see `Display`) whose text before the
+/// closing quote of the target type is `head`.
+fn conversion_message<'a>(
+    stack: &'a mut MaybeUninit<[u8; MESSAGE_STACK_SIZE]>,
+    heap: &'a mut StdString,
+    head: [&str; 4],
+    message: &Option<StdString>,
+) -> &'a str {
+    let [a, b, c, d] = head;
+    match message.as_deref() {
+        Some(message) if !message.is_empty() => {
+            concat_message(stack, heap, &[a, b, c, d, "': ", message])
+        }
+        _ => concat_message(stack, heap, &[a, b, c, d, "'"]),
     }
 }
 
@@ -693,20 +741,36 @@ impl Display for AsyncJobException {
 }
 
 impl<'js> Ctx<'js> {
+    /// Calls `f` from a callback of the engine, which a panic must not unwind through.
+    ///
+    /// Inlined into the callbacks: when nothing panics, the catch costs nothing but its
+    /// landing pad.
+    #[inline]
     fn handle_panic_inner<R, F>(&self, f: F, err_val: R) -> R
     where
         F: FnOnce() -> R + UnwindSafe,
     {
         match crate::util::catch_unwind(f) {
             Ok(x) => x,
-            Err(e) => unsafe {
-                self.get_opaque().set_panic(e);
-                qjs::JS_Throw(self.as_ptr(), qjs::JS_MKVAL(qjs::JS_TAG_EXCEPTION, 0));
+            Err(e) => {
+                self.raise_panic(e);
                 err_val
-            },
+            }
         }
     }
 
+    /// Keeps the panic `payload` for resuming it when the engine returns to Rust, and throws
+    /// the uncatchable exception that unwinds the JavaScript frames until then.
+    #[cold]
+    #[inline(never)]
+    fn raise_panic(&self, payload: alloc::boxed::Box<dyn core::any::Any + Send + 'static>) {
+        unsafe {
+            self.get_opaque().set_panic(payload);
+            qjs::JS_Throw(self.as_ptr(), qjs::JS_MKVAL(qjs::JS_TAG_EXCEPTION, 0));
+        }
+    }
+
+    #[inline]
     pub(crate) fn handle_panic<F>(&self, f: F) -> qjs::JSValue
     where
         F: FnOnce() -> qjs::JSValue + UnwindSafe,
@@ -715,6 +779,7 @@ impl<'js> Ctx<'js> {
         self.handle_panic_inner(f, qjs::JS_EXCEPTION)
     }
 
+    #[inline]
     pub(crate) fn handle_panic_exotic<F>(&self, f: F) -> qjs::c_int
     where
         F: FnOnce() -> qjs::c_int + UnwindSafe,
@@ -730,19 +795,29 @@ impl<'js> Ctx<'js> {
     ///
     /// A suspension by the `snapshot()` builtin is carried out (the runtime is saved) and the
     /// execution continues; one by the `restore()` builtin is returned as [`Error::Restore`].
+    #[inline]
     pub(crate) unsafe fn handle_exception(&self, js_val: qjs::JSValue) -> Result<qjs::JSValue> {
-        let mut js_val = js_val;
+        if qjs::JS_VALUE_GET_NORM_TAG(js_val) != qjs::JS_TAG_EXCEPTION {
+            return Ok(js_val);
+        }
+        self.handle_exception_slow()
+    }
+
+    /// The part of [`Ctx::handle_exception`] for a [`JSValue`] which is an exception.
+    #[cold]
+    #[inline(never)]
+    unsafe fn handle_exception_slow(&self) -> Result<qjs::JSValue> {
         loop {
-            if qjs::JS_VALUE_GET_NORM_TAG(js_val) != qjs::JS_TAG_EXCEPTION {
-                return Ok(js_val);
-            }
             let error = self.raise_exception();
             // taken in any case: when the suspension of the builtin call failed (e.g. out of
             // memory), the request must not be carried out by a later suspension
             let request = self.get_opaque().take_builtin_request();
             match request {
                 Some(request) if error.is_suspended() => {
-                    js_val = crate::snapshot::complete_builtin(self, request)?
+                    let js_val = crate::snapshot::complete_builtin(self, request)?;
+                    if qjs::JS_VALUE_GET_NORM_TAG(js_val) != qjs::JS_TAG_EXCEPTION {
+                        return Ok(js_val);
+                    }
                 }
                 _ => return Err(error),
             }

@@ -1870,8 +1870,8 @@ static const JSCFunctionListEntry js_locale_proto_funcs[] = {
 
 int js_add_locale(JSContext *ctx, JSValue intl_obj)
 {
-    JS_NewClassID(&js_locale_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_locale_class_id, &js_locale_class);
+    if (js_intl_new_class(ctx, &js_locale_class_id, &js_locale_class))
+        return -1;
 
     if (JS_IsException(js_intl_new_constructor(ctx, intl_obj,
                                                 JS_INTL_CTOR_LOCALE,

@@ -95,6 +95,7 @@ pub struct Ctx<'js> {
 }
 
 impl<'js> Clone for Ctx<'js> {
+    #[inline]
     fn clone(&self) -> Self {
         unsafe { qjs::JS_DupContext(self.ctx.as_ptr()) };
         Ctx {
@@ -105,6 +106,7 @@ impl<'js> Clone for Ctx<'js> {
 }
 
 impl<'js> Drop for Ctx<'js> {
+    #[inline]
     fn drop(&mut self) {
         unsafe { qjs::JS_FreeContext(self.ctx.as_ptr()) };
     }
@@ -113,10 +115,12 @@ impl<'js> Drop for Ctx<'js> {
 unsafe impl Send for Ctx<'_> {}
 
 impl<'js> Ctx<'js> {
+    #[inline]
     pub(crate) fn as_ptr(&self) -> *mut qjs::JSContext {
         self.ctx.as_ptr()
     }
 
+    #[inline]
     pub(crate) unsafe fn from_ptr(ctx: *mut qjs::JSContext) -> Self {
         unsafe { qjs::JS_DupContext(ctx) };
         let ctx = NonNull::new_unchecked(ctx);
@@ -124,6 +128,20 @@ impl<'js> Ctx<'js> {
             ctx,
             _marker: Invariant::new(),
         }
+    }
+
+    /// An uncounted `Ctx` of `ctx`, for lending a context the engine keeps alive (e.g. during a
+    /// call from it) without the reference counting of [`Ctx::from_ptr`].
+    ///
+    /// # Safety
+    /// `ctx` must be a live context which outlives the returned value; the value must not be
+    /// dropped (cloning it is fine, the clones are counted).
+    #[inline]
+    pub(crate) unsafe fn from_ptr_uncounted(ctx: *mut qjs::JSContext) -> mem::ManuallyDrop<Self> {
+        mem::ManuallyDrop::new(Ctx {
+            ctx: NonNull::new_unchecked(ctx),
+            _marker: Invariant::new(),
+        })
     }
 
     pub(crate) unsafe fn new(ctx: &'js Context) -> Self {
@@ -496,8 +514,24 @@ impl<'js> Ctx<'js> {
         res != 0
     }
 
+    /// Points the context opaque of `ctx` at the Rust data of its runtime, which
+    /// `Ctx::get_opaque` then reads with one call instead of two.
+    ///
+    /// # Safety
+    /// `ctx` must be a context of a runtime created by rquickjs.
+    pub(crate) unsafe fn init_opaque(ctx: NonNull<qjs::JSContext>) {
+        let opaque = qjs::JS_GetRuntimeOpaque(qjs::JS_GetRuntime(ctx.as_ptr()));
+        qjs::JS_SetContextOpaque(ctx.as_ptr(), opaque);
+    }
+
     pub(crate) unsafe fn get_opaque(&self) -> &Opaque<'js> {
-        Opaque::from_runtime_ptr(qjs::JS_GetRuntime(self.ctx.as_ptr()))
+        let opaque = qjs::JS_GetContextOpaque(self.ctx.as_ptr());
+        if opaque.is_null() {
+            // a context which rquickjs didn't create or wrap (see `Ctx::from_raw`)
+            Opaque::from_runtime_ptr(qjs::JS_GetRuntime(self.ctx.as_ptr()))
+        } else {
+            &*opaque.cast::<Opaque<'js>>()
+        }
     }
 
     /// Spawn future using configured async runtime
@@ -516,6 +550,9 @@ impl<'js> Ctx<'js> {
     /// User must ensure that a lock was acquired over the runtime and that invariant is a unique
     /// lifetime which can't be coerced to a lifetime outside the scope of the lock of to the
     /// lifetime of another runtime.
+    /// The context opaque (`JS_SetContextOpaque`) of the context must be null or the one set by
+    /// rquickjs.
+    #[inline]
     pub unsafe fn from_raw_invariant(ctx: NonNull<qjs::JSContext>, inv: Invariant<'js>) -> Self {
         unsafe { qjs::JS_DupContext(ctx.as_ptr()) };
         Ctx { ctx, _marker: inv }
@@ -527,6 +564,9 @@ impl<'js> Ctx<'js> {
     /// User must ensure that a lock was acquired over the runtime and that invariant is a unique
     /// lifetime which can't be coerced to a lifetime outside the scope of the lock of to the
     /// lifetime of another runtime.
+    /// The context opaque (`JS_SetContextOpaque`) of the context must be null or the one set by
+    /// rquickjs.
+    #[inline]
     pub unsafe fn from_raw(ctx: NonNull<qjs::JSContext>) -> Self {
         unsafe { qjs::JS_DupContext(ctx.as_ptr()) };
         Ctx {
@@ -597,6 +637,9 @@ impl<'js> Ctx<'js> {
     }
 
     /// Returns the pointer to the C library context.
+    ///
+    /// rquickjs keeps its data in the context opaque (`JS_SetContextOpaque`) of the context,
+    /// which must not be changed.
     pub fn as_raw(&self) -> NonNull<qjs::JSContext> {
         self.ctx
     }

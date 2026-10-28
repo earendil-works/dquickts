@@ -113,9 +113,14 @@ JSValue js_std_console_log(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv);
 void js_std_eval_binary(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                         int flags);
+/* define the JSON, text or bytes module 'module_name' whose default
+   export is the value serialized in 'buf'. 'type' is the 'type' import
+   attribute of its imports ("json", "json5", "text" or "bytes") or NULL
+   if they have no attributes. */
 void js_std_eval_binary_json_module(JSContext *ctx,
                                     const uint8_t *buf, size_t buf_len,
-                                    const char *module_name);
+                                    const char *module_name,
+                                    const char *type);
 void js_std_promise_rejection_tracker(JSContext *ctx, JSValueConst promise,
                                       JSValueConst reason,
                                       JS_BOOL is_handled, void *opaque);

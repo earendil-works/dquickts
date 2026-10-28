@@ -17,6 +17,7 @@
 #include "quickjs-libc.h"
 
 static int nbinterrupts = 0;
+static int interrupt_counter = 10000;
 
 int lre_check_stack_overflow(void *opaque, size_t alloca_size) { return 0; }
 
@@ -25,8 +26,14 @@ void *lre_realloc(void *opaque, void *ptr, size_t size)
     return realloc(ptr, size);
 }
 
+int *lre_get_interrupt_counter(void *opaque)
+{
+    return &interrupt_counter;
+}
+
 int lre_check_timeout(void *opaque)
  {
+    interrupt_counter = 10000;
     nbinterrupts++;
     return (nbinterrupts > 100);
  }

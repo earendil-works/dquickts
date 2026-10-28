@@ -110,6 +110,207 @@ static void test_objects(JSContext *ctx)
     JS_FreeValue(ctx, obj);
 }
 
+/* new object of JS_NewObjectFrom() with the properties 'names' (comma
+   separated) set to 0, 1, ... */
+static JSValue new_object_from(JSContext *ctx, const char *names)
+{
+    /* initialized so that gcc doesn't warn when no name is given */
+    JSAtom atoms[128] = { 0 };
+    JSValue values[128] = { 0 }, obj;
+    const char *p, *q;
+    int i, n;
+
+    n = 0;
+    for(p = names; *p != '\0'; p = *q ? q + 1 : q) {
+        q = strchr(p, ',');
+        if (!q)
+            q = p + strlen(p);
+        CHECK(n < countof(atoms));
+        atoms[n] = JS_NewAtomLen(ctx, p, q - p);
+        values[n] = JS_NewInt32(ctx, n);
+        n++;
+    }
+    obj = JS_NewObjectFrom(ctx, n, atoms, values);
+    for(i = 0; i < n; i++)
+        JS_FreeAtom(ctx, atoms[i]);
+    return obj;
+}
+
+static void test_object_from(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx, *ctx2;
+    JSValue obj;
+    JSAtom atom;
+    char names[1024];
+    int i, len;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+
+    /* integer keys first in increasing order, then insertion order */
+    obj = new_object_from(ctx, "b,1,a,0");
+    CHECK(!JS_IsException(obj));
+    set_global(ctx, "o", obj);
+    CHECK(eval_bool(ctx, "JSON.stringify(o) === '{\"0\":3,\"1\":1,\"b\":0,\"a\":2}'"));
+    CHECK(eval_bool(ctx, "Object.values(Object.getOwnPropertyDescriptors(o))"
+                    ".every(d => d.writable && d.enumerable && d.configurable)"));
+    /* objects of the same properties are independent */
+    set_global(ctx, "o2", new_object_from(ctx, "b,1,a,0"));
+    CHECK(eval_bool(ctx, "o2.b = 5; delete o2.a; o2.c = 6;"
+                    "JSON.stringify(o) === '{\"0\":3,\"1\":1,\"b\":0,\"a\":2}' &&"
+                    "JSON.stringify(o2) === '{\"0\":3,\"1\":1,\"b\":5,\"c\":6}'"));
+    /* same shape as an object literal built by the program */
+    CHECK(eval_bool(ctx, "var l = {}; l.b = 0; l[1] = 1; l.a = 2; l[0] = 3;"
+                    "JSON.stringify(l) === JSON.stringify(o)"));
+    set_global(ctx, "o3", new_object_from(ctx, "b,1,a,0"));
+    CHECK(eval_bool(ctx, "o3.z = 1; delete l.b; JSON.stringify(o3) === "
+                    "'{\"0\":3,\"1\":1,\"b\":0,\"a\":2,\"z\":1}'"));
+
+    /* a repeated property keeps its first position and its last value */
+    set_global(ctx, "o", new_object_from(ctx, "a,b,a"));
+    CHECK(eval_bool(ctx, "JSON.stringify(o) === '{\"a\":2,\"b\":1}'"));
+
+    /* the properties are defined: '__proto__' is an own property */
+    set_global(ctx, "o", new_object_from(ctx, "x,__proto__"));
+    CHECK(eval_bool(ctx, "Object.getPrototypeOf(o) === Object.prototype &&"
+                    "Object.hasOwn(o, '__proto__') && o.__proto__ === 1 &&"
+                    "Object.keys(o).join() === 'x,__proto__'"));
+
+    /* sized for many properties */
+    len = 0;
+    for(i = 0; i < 100; i++)
+        len += snprintf(names + len, sizeof(names) - len, "%sp%d", i ? "," : "", i);
+    set_global(ctx, "o", new_object_from(ctx, names));
+    CHECK(eval_bool(ctx, "Object.keys(o).length === 100 && o.p0 === 0 && o.p99 === 99"
+                    "&& Object.keys(o).every((k, i) => k === 'p' + i && o[k] === i)"));
+    CHECK(eval_bool(ctx, "o.p100 = 100; delete o.p50; Object.keys(o).length === 100"));
+
+    /* more property lists than the shapes kept by the context */
+    for(i = 0; i < 100; i++) {
+        snprintf(names, sizeof(names), "x%d,y", i % 40);
+        obj = new_object_from(ctx, names);
+        CHECK(!JS_IsException(obj));
+        if (i == 50)
+            set_global(ctx, "o", obj);
+        else
+            JS_FreeValue(ctx, obj);
+    }
+    JS_RunGC(rt);
+    CHECK(eval_bool(ctx, "JSON.stringify(o) === '{\"x10\":0,\"y\":1}'"));
+
+    /* JS_SetProperty() on a new object only defines the property */
+    atom = JS_NewAtom(ctx, "a");
+    CHECK(JS_NewObjectSetIsDefine(ctx, atom));
+    CHECK(eval_bool(ctx, "Object.defineProperty(Object.prototype, 'a', "
+                    "{ set(v) { globalThis.setter = v }, configurable: true }); true"));
+    CHECK(!JS_NewObjectSetIsDefine(ctx, atom));
+    /* JS_NewObjectFrom() defines the property, the setter isn't called */
+    set_global(ctx, "o", new_object_from(ctx, "a"));
+    CHECK(eval_bool(ctx, "Object.hasOwn(o, 'a') && !('setter' in globalThis)"));
+    CHECK(eval_bool(ctx, "Object.defineProperty(Object.prototype, 'a', "
+                    "{ value: 1, writable: false }); true"));
+    CHECK(!JS_NewObjectSetIsDefine(ctx, atom));
+    CHECK(eval_bool(ctx, "delete Object.prototype.a"));
+    CHECK(JS_NewObjectSetIsDefine(ctx, atom));
+    JS_FreeAtom(ctx, atom);
+    atom = JS_NewAtom(ctx, "__proto__");
+    CHECK(!JS_NewObjectSetIsDefine(ctx, atom));
+    JS_FreeAtom(ctx, atom);
+    /* a writable data property of the prototype is shadowed */
+    atom = JS_NewAtom(ctx, "w");
+    CHECK(eval_bool(ctx, "Object.prototype.w = 1; true"));
+    CHECK(JS_NewObjectSetIsDefine(ctx, atom));
+    CHECK(eval_bool(ctx, "delete Object.prototype.w"));
+    JS_FreeAtom(ctx, atom);
+    atom = JS_NewAtomUInt32(ctx, 7);
+    CHECK(JS_NewObjectSetIsDefine(ctx, atom));
+    CHECK(eval_bool(ctx, "Object.defineProperty(Object.prototype, 7, "
+                    "{ get() { return 0 }, configurable: true }); true"));
+    CHECK(!JS_NewObjectSetIsDefine(ctx, atom));
+    CHECK(eval_bool(ctx, "delete Object.prototype[7]"));
+    JS_FreeAtom(ctx, atom);
+
+    /* the shapes kept by a context are freed with it */
+    ctx2 = JS_NewContext(rt);
+    obj = new_object_from(ctx2, "a,b,c");
+    CHECK(!JS_IsException(obj));
+    JS_FreeValue(ctx2, obj);
+    JS_FreeContext(ctx2);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+/* check JS_AtomGetStringData() of the atom of 'val' against 'latin1'
+   (Latin-1) or 'utf16' */
+static void check_atom_data(JSContext *ctx, JSValue val, const char *latin1,
+                            const uint16_t *utf16, size_t len)
+{
+    char buf[JS_ATOM_DATA_BUF_SIZE];
+    const void *data;
+    JSAtom atom;
+    size_t len1;
+    JS_BOOL wide;
+
+    atom = JS_ValueToAtom(ctx, val);
+    JS_FreeValue(ctx, val);
+    CHECK(atom != JS_ATOM_NULL);
+    data = JS_AtomGetStringData(ctx, atom, &len1, &wide, buf);
+    CHECK(data != NULL && len1 == len);
+    /* an empty string has any width */
+    if (utf16)
+        CHECK(wide && memcmp(data, utf16, len * 2) == 0);
+    else
+        CHECK((!wide || len == 0) && memcmp(data, latin1, len) == 0);
+    JS_FreeAtom(ctx, atom);
+}
+
+static void test_atom_string_data(JSContext *ctx)
+{
+    static const uint16_t euro[] = { 'a', 0x20ac };
+
+    check_atom_data(ctx, JS_NewString(ctx, "abc"), "abc", NULL, 3);
+    check_atom_data(ctx, JS_NewString(ctx, ""), "", NULL, 0);
+    check_atom_data(ctx, JS_NewString(ctx, "\xc3\xa9t\xc3\xa9"), "\xe9t\xe9", NULL, 3);
+    check_atom_data(ctx, JS_NewString(ctx, "a\xe2\x82\xac"), NULL, euro, 2);
+    /* integer atoms */
+    check_atom_data(ctx, JS_NewInt32(ctx, 0), "0", NULL, 1);
+    check_atom_data(ctx, JS_NewInt32(ctx, 123), "123", NULL, 3);
+    check_atom_data(ctx, JS_NewInt32(ctx, 2147483647), "2147483647", NULL, 10);
+    check_atom_data(ctx, JS_NewString(ctx, "4294967294"), "4294967294", NULL, 10);
+    /* symbols: their description */
+    check_atom_data(ctx, eval_str(ctx, "Symbol('desc')"), "desc", NULL, 4);
+    check_atom_data(ctx, eval_str(ctx, "Symbol()"), "", NULL, 0);
+    check_atom_data(ctx, eval_str(ctx, "Symbol.iterator"), "Symbol.iterator", NULL, 15);
+}
+
+static void test_set_property_str_len(JSContext *ctx)
+{
+    JSValue obj;
+
+    obj = JS_NewObject(ctx);
+    /* not zero terminated, non ASCII, embedded zero, integer key */
+    CHECK(JS_SetPropertyStrLen(ctx, obj, "abc", 2, JS_NewInt32(ctx, 1)) == 1);
+    CHECK(JS_SetPropertyStrLen(ctx, obj, "h\xc3\xa9llo", 6, JS_NewInt32(ctx, 2)) == 1);
+    CHECK(JS_SetPropertyStrLen(ctx, obj, "a\0b", 3, JS_NewInt32(ctx, 3)) == 1);
+    CHECK(JS_SetPropertyStrLen(ctx, obj, "12", 2, JS_NewInt32(ctx, 4)) == 1);
+    set_global(ctx, "o", obj);
+    CHECK(eval_bool(ctx, "JSON.stringify(o) === "
+                    "'{\"12\":4,\"ab\":1,\"h\\u00e9llo\":2,\"a\\\\u0000b\":3}'"));
+    /* setters are called, failures throw */
+    CHECK(eval_bool(ctx, "o = { set s(v) { this.r = v } };"
+                    "Object.defineProperty(o, 'ro', { value: 0 }); true"));
+    obj = eval_str(ctx, "o");
+    CHECK(JS_SetPropertyStrLen(ctx, obj, "s", 1, JS_NewInt32(ctx, 5)) == 1);
+    CHECK(JS_SetPropertyStrLen(ctx, obj, "ro", 2, JS_NewInt32(ctx, 6)) == -1);
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    CHECK(JS_SetPropertyStrLen(ctx, JS_UNDEFINED, "x", 1, JS_NewInt32(ctx, 7)) == -1);
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, obj);
+    CHECK(eval_bool(ctx, "o.r === 5 && o.ro === 0"));
+}
+
 static void test_numbers(JSContext *ctx)
 {
     JSValue v;
@@ -346,6 +547,108 @@ static void test_utf16_strings(JSContext *ctx)
     JS_FreeCStringRT_UTF16(rt, NULL);
 }
 
+static void test_string_data(JSContext *ctx)
+{
+    static const uint8_t latin1[] = { 'c', 'a', 'f', 0xe9, 0 };
+    const uint8_t *p8;
+    const uint16_t *p16;
+    const void *p;
+    size_t len;
+    JS_BOOL wide;
+    JSValue v, v2;
+
+    /* Latin-1 constructor and 8 bit view, including a NUL byte */
+    v = JS_NewStringLatin1Len(ctx, latin1, countof(latin1));
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_STRING);
+    set_global(ctx, "sl", JS_DupValue(ctx, v));
+    CHECK(eval_bool(ctx, "sl === 'caf\\xe9\\0'"));
+    p8 = JS_GetStringData(ctx, v, &len, &wide);
+    CHECK(p8 && !wide && len == countof(latin1) && !memcmp(p8, latin1, len));
+    JS_FreeValue(ctx, v);
+    v = JS_NewStringLatin1Len(ctx, NULL, 0);
+    p = JS_GetStringData(ctx, v, &len, &wide);
+    CHECK(p && len == 0 && !wide);
+    JS_FreeValue(ctx, v);
+    CHECK(JS_IsException(JS_NewStringLatin1Len(ctx, NULL, (size_t)1 << 31)));
+    check_exception(ctx, "InternalError");
+
+    /* wide strings: UTF-16 units, unpaired surrogates kept */
+    v = eval_str(ctx, "'\\ud83d\\ude00x\\udc00'");
+    p16 = JS_GetStringData(ctx, v, &len, &wide);
+    CHECK(p16 && wide && len == 4 && p16[0] == 0xd83d && p16[1] == 0xde00 &&
+          p16[2] == 'x' && p16[3] == 0xdc00);
+    JS_FreeValue(ctx, v);
+
+    /* ropes are flattened once; the view lives as long as the rope */
+    v = eval_str(ctx, "var r = 'a'.repeat(1000); r + 'b' + r + '\\u20ac'");
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_STRING_ROPE);
+    p16 = JS_GetStringData(ctx, v, &len, &wide);
+    CHECK(p16 && wide && len == 2002 && p16[0] == 'a' && p16[1000] == 'b' &&
+          p16[2000] == 'a' && p16[2001] == 0x20ac);
+    CHECK(JS_GetStringData(ctx, v, &len, &wide) == p16 && len == 2002);
+    /* the rope is still usable and dropping other refs keeps the view */
+    set_global(ctx, "rope", JS_DupValue(ctx, v));
+    CHECK(eval_bool(ctx, "rope.length === 2002 && rope[1000] === 'b' && "
+                    "(rope = r = undefined, true)"));
+    CHECK(p16[0] == 'a' && p16[2001] == 0x20ac);
+    v2 = JS_ToString(ctx, v);
+    CHECK(JS_VALUE_GET_TAG(v2) == JS_TAG_STRING);
+    p = JS_GetStringData(ctx, v2, &len, &wide);
+    CHECK(p == p16 && len == 2002 && wide);
+    JS_FreeValue(ctx, v2);
+    JS_FreeValue(ctx, v);
+    v = eval_str(ctx, "var r = 'x'.repeat(1000); r + 'y' + r");
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_STRING_ROPE);
+    p8 = JS_GetStringData(ctx, v, &len, &wide);
+    CHECK(p8 && !wide && len == 2001 && p8[0] == 'x' && p8[1000] == 'y' &&
+          p8[2000] == 'x');
+    JS_FreeValue(ctx, v);
+
+    /* other values are not converted */
+    len = 1;
+    wide = 1;
+    CHECK(JS_GetStringData(ctx, JS_NewInt32(ctx, 1), &len, &wide) == NULL &&
+          len == 0 && !wide);
+    check_exception(ctx, "TypeError");
+}
+
+/* JS_NewStringLen() with ASCII runs of every length around 2 and 3 byte
+   sequences and an invalid byte (which also consumes the next byte) */
+static void test_new_string_utf8(JSContext *ctx)
+{
+    JSValue f, v, expected, arg;
+    char buf[128], *p;
+    int k, i;
+
+    f = eval_str(ctx, "(k) => 'x'.repeat(k) + '\\xe9' + 'y'.repeat(k) + "
+                 "'\\u2713' + 'z'.repeat(k) + '\\ufffd' + "
+                 "'w'.repeat(Math.max(k - 1, 0))");
+    CHECK(JS_IsFunction(ctx, f));
+    for(k = 0; k < 20; k++) {
+        p = buf;
+        for(i = 0; i < k; i++)
+            *p++ = 'x';
+        memcpy(p, "\xc3\xa9", 2);
+        p += 2;
+        for(i = 0; i < k; i++)
+            *p++ = 'y';
+        memcpy(p, "\xe2\x9c\x93", 3);
+        p += 3;
+        for(i = 0; i < k; i++)
+            *p++ = 'z';
+        *p++ = '\x80';
+        for(i = 0; i < k; i++)
+            *p++ = 'w';
+        v = JS_NewStringLen(ctx, buf, p - buf);
+        arg = JS_NewInt32(ctx, k);
+        expected = JS_Call(ctx, f, JS_UNDEFINED, 1, &arg);
+        CHECK(JS_StrictEq(ctx, v, expected));
+        JS_FreeValue(ctx, expected);
+        JS_FreeValue(ctx, v);
+    }
+    JS_FreeValue(ctx, f);
+}
+
 static JSValue make_type_error(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
@@ -386,6 +689,63 @@ static void test_new_errors(JSContext *ctx)
     CHECK(eval_bool(ctx, "function outer_caller() { return make_type_error() } "
                     "var te = outer_caller(); te instanceof TypeError && "
                     "te.message === 'from C' && te.stack.includes('outer_caller')"));
+    CHECK(!JS_HasException(ctx));
+}
+
+static JSValue throw_range_len(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+{
+    return JS_ThrowErrorLen(ctx, JS_RANGE_ERROR, "from C\0len", 10);
+}
+
+static void test_error_len(JSContext *ctx)
+{
+    static const char utf8[] = "caf\xc3\xa9";
+    char long_msg[1001];
+    JSValue e;
+
+    /* the message is not formatted and may contain any character */
+    e = JS_NewErrorLen(ctx, JS_TYPE_ERROR, utf8, strlen(utf8));
+    CHECK(JS_IsError(ctx, e));
+    CHECK(!JS_HasException(ctx));
+    set_global(ctx, "le", e);
+    CHECK(eval_bool(ctx, "Object.getPrototypeOf(le) === TypeError.prototype && "
+                    "le.message === 'caf\\u00e9' && typeof le.stack === 'string' && "
+                    "!Object.getOwnPropertyDescriptor(le, 'message').enumerable"));
+    e = JS_NewErrorLen(ctx, JS_PLAIN_ERROR, "%s", 2);
+    set_global(ctx, "le", e);
+    CHECK(eval_bool(ctx, "Object.getPrototypeOf(le) === Error.prototype && "
+                    "le.message === '%s'"));
+    e = JS_NewErrorLen(ctx, JS_SUPPRESSED_ERROR, "", 0);
+    set_global(ctx, "le", e);
+    CHECK(eval_bool(ctx, "le instanceof SuppressedError && le.message === ''"));
+
+    /* the backtrace includes the JS callers of the C function */
+    set_global(ctx, "throw_range_len",
+               JS_NewCFunction(ctx, throw_range_len, "throw_range_len", 0));
+    CHECK(eval_bool(ctx, "function len_caller() { try { throw_range_len() } catch (e) { return e } } "
+                    "var re = len_caller(); re instanceof RangeError && "
+                    "re.message === 'from C\\0len' && "
+                    "re.stack.startsWith('    at throw_range_len (native)\\n    at len_caller (')"));
+    CHECK(JS_IsException(JS_ThrowErrorLen(ctx, JS_URI_ERROR, "uri", 3)));
+    check_exception(ctx, "URIError");
+
+    /* long messages are not truncated */
+    memset(long_msg, 'x', sizeof(long_msg) - 1);
+    long_msg[sizeof(long_msg) - 1] = '\0';
+    CHECK(JS_IsException(JS_ThrowTypeError(ctx, "%s!", long_msg)));
+    set_global(ctx, "le", JS_GetException(ctx));
+    CHECK(eval_bool(ctx, "le instanceof TypeError && le.message.length === 1001 && "
+                    "le.message === 'x'.repeat(1000) + '!'"));
+    e = JS_NewRangeError(ctx, "%s", long_msg);
+    set_global(ctx, "le", e);
+    CHECK(eval_bool(ctx, "le.message === 'x'.repeat(1000)"));
+    CHECK(JS_IsException(JS_ThrowErrorLen(ctx, JS_INTERNAL_ERROR, long_msg, 1000)));
+    set_global(ctx, "le", JS_GetException(ctx));
+    CHECK(eval_bool(ctx, "le instanceof InternalError && le.message === 'x'.repeat(1000)"));
+    CHECK(JS_IsException(JS_ThrowDOMException(ctx, "NotFoundError", "%s", long_msg)));
+    set_global(ctx, "le", JS_GetException(ctx));
+    CHECK(eval_bool(ctx, "le instanceof DOMException && le.message === 'x'.repeat(1000)"));
     CHECK(!JS_HasException(ctx));
 }
 
@@ -551,6 +911,62 @@ static void test_set_length(JSContext *ctx)
     check_exception(ctx, "TypeError");
 }
 
+static void test_fast_array(JSContext *ctx)
+{
+    static const char *const slow[] = {
+        "var sp = []; sp[10] = 1; sp", /* holes */
+        "Object.defineProperty([1, 2], 0, { get() { return 3 } })",
+        "new Proxy([1, 2], {})",
+        "new Int32Array(2)",
+        "(function() { return arguments })(1, 2)",
+        "({ length: 1, 0: 1 })",
+    };
+    JSValue obj, vals[2], *tab;
+    uint32_t len;
+    int64_t len64;
+    const char *str;
+    size_t i;
+
+    obj = eval_str(ctx, "[1, 'ab', {}]");
+    tab = NULL;
+    len = 0;
+    CHECK(JS_GetFastArray(ctx, obj, &tab, &len));
+    CHECK(len == 3 && tab != NULL);
+    CHECK(JS_VALUE_GET_TAG(tab[0]) == JS_TAG_INT && JS_VALUE_GET_INT(tab[0]) == 1);
+    str = JS_ToCString(ctx, tab[1]);
+    CHECK(str && !strcmp(str, "ab"));
+    JS_FreeCString(ctx, str);
+    CHECK(JS_IsObject(tab[2]));
+    JS_FreeValue(ctx, obj);
+
+    /* trailing holes: only the stored elements are returned */
+    obj = eval_str(ctx, "var th = [1, 2]; th.length = 5; th");
+    CHECK(JS_GetFastArray(ctx, obj, &tab, &len) && len == 2);
+    CHECK(JS_GetLength(ctx, obj, &len64) == 0 && len64 == 5);
+    JS_FreeValue(ctx, obj);
+
+    vals[0] = JS_NewInt32(ctx, 7);
+    vals[1] = JS_NewString(ctx, "x");
+    obj = JS_NewArrayFrom(ctx, 2, vals);
+    CHECK(JS_GetFastArray(ctx, obj, &tab, &len) && len == 2);
+    CHECK(JS_VALUE_GET_INT(tab[0]) == 7 && JS_IsString(tab[1]));
+    JS_FreeValue(ctx, obj);
+
+    obj = JS_NewArray(ctx);
+    CHECK(JS_GetFastArray(ctx, obj, &tab, &len) && len == 0);
+    JS_FreeValue(ctx, obj);
+
+    for (i = 0; i < countof(slow); i++) {
+        obj = eval_str(ctx, slow[i]);
+        CHECK(!JS_IsException(obj));
+        CHECK(!JS_GetFastArray(ctx, obj, &tab, &len));
+        JS_FreeValue(ctx, obj);
+    }
+    CHECK(!JS_GetFastArray(ctx, JS_NewInt32(ctx, 1), &tab, &len));
+    CHECK(!JS_GetFastArray(ctx, JS_UNDEFINED, &tab, &len));
+    CHECK(!JS_HasException(ctx));
+}
+
 static void test_conversions(JSContext *ctx)
 {
     JSValue v, obj;
@@ -693,6 +1109,97 @@ static void test_uint8_arrays(JSContext *ctx)
     size = 1;
     CHECK(JS_GetUint8Array(ctx, &size, JS_UNDEFINED) == NULL && size == 0);
     check_exception(ctx, "TypeError");
+}
+
+/* JS_GetTypedArrayData() on 'v' (freed): NULL and no exception, or the
+   data with the expected byte offset, byte length and element size */
+static uint8_t *check_ta_data(JSContext *ctx, JSValue v, int64_t offset,
+                              int64_t len, int64_t elem_size)
+{
+    size_t off1, len1, elem1;
+    uint8_t *p;
+
+    CHECK(!JS_IsException(v));
+    off1 = len1 = elem1 = 1;
+    p = JS_GetTypedArrayData(ctx, v, &off1, &len1, &elem1);
+    CHECK(!JS_HasException(ctx));
+    if (offset < 0) {
+        CHECK(p == NULL && off1 == 0 && len1 == 0 && elem1 == 0);
+    } else {
+        CHECK(p != NULL && off1 == offset && len1 == len &&
+              elem1 == elem_size);
+        /* NULL output pointers are allowed */
+        CHECK(JS_GetTypedArrayData(ctx, v, NULL, NULL, NULL) == p);
+    }
+    JS_FreeValue(ctx, v);
+    return p;
+}
+
+static void test_typed_array_data(JSContext *ctx)
+{
+    static const char *bad_src[] = {
+        "new DataView(new ArrayBuffer(4))",
+        "new ArrayBuffer(4)",
+        "[1, 2]",
+        "({ length: 1, 0: 1 })",
+        "1",
+        "var td = new Float64Array(4); td.buffer.transfer(); td",
+        /* fixed length view out of bounds of a shrunk buffer */
+        "var tr = new ArrayBuffer(16, { maxByteLength: 16 }); var to = new Int16Array(tr, 2, 4); tr.resize(8); to",
+    };
+    static const int elem_sizes[] = { 1, 1, 1, 2, 2, 4, 4, 8, 8, 2, 4, 8 };
+    JSValue v, buf, arg;
+    uint8_t *p, *base;
+    size_t size, off;
+    int t, i;
+
+    CHECK(countof(elem_sizes) == JS_TYPED_ARRAY_FLOAT64 + 1);
+    for(t = 0; t <= JS_TYPED_ARRAY_FLOAT64; t++) {
+        arg = JS_NewInt32(ctx, 3);
+        v = JS_NewTypedArray(ctx, 1, &arg, t);
+        buf = JS_GetTypedArrayBuffer(ctx, v, NULL, NULL, NULL);
+        base = JS_GetArrayBuffer(ctx, &size, buf);
+        CHECK(base != NULL && size == 3 * elem_sizes[t]);
+        JS_FreeValue(ctx, buf);
+        p = check_ta_data(ctx, v, 0, 3 * elem_sizes[t], elem_sizes[t]);
+        CHECK(p == base);
+    }
+
+    /* view with an offset: the pointer is the start of the view */
+    v = eval_str(ctx, "var tab = new ArrayBuffer(16); "
+                 "var t32 = new Int32Array(tab, 4, 2); t32[1] = -2; t32");
+    buf = JS_GetTypedArrayBuffer(ctx, v, NULL, NULL, NULL);
+    base = JS_GetArrayBuffer(ctx, &size, buf);
+    JS_FreeValue(ctx, buf);
+    p = check_ta_data(ctx, v, 4, 8, 4);
+    CHECK(p == base + 4 && ((int32_t *)p)[1] == -2);
+    ((int32_t *)p)[0] = 42;
+    CHECK(eval_bool(ctx, "t32[0] === 42"));
+
+    /* length-tracking view of a resizable buffer */
+    v = eval_str(ctx, "var rab = new ArrayBuffer(8, { maxByteLength: 32 }); "
+                 "var tl = new Float32Array(rab, 4); rab.resize(20); tl");
+    check_ta_data(ctx, v, 4, 16, 4);
+    check_ta_data(ctx, eval_str(ctx, "rab.resize(10); tl"), 4, 4, 4);
+    check_ta_data(ctx, eval_str(ctx, "rab.resize(6); tl"), 4, 0, 4);
+    check_ta_data(ctx, eval_str(ctx, "rab.resize(4); tl"), 4, 0, 4);
+    check_ta_data(ctx, eval_str(ctx, "rab.resize(2); tl"), -1, 0, 0);
+    check_ta_data(ctx, eval_str(ctx, "rab.resize(32); tl"), 4, 28, 4);
+    /* JS_GetTypedArrayBuffer() returns the same current byte length */
+    v = eval_str(ctx, "rab.resize(20); tl");
+    buf = JS_GetTypedArrayBuffer(ctx, v, &off, &size, NULL);
+    CHECK(!JS_IsException(buf) && off == 4 && size == 16);
+    JS_FreeValue(ctx, buf);
+    JS_FreeValue(ctx, v);
+
+    /* length-tracking view of a growable SharedArrayBuffer */
+    v = eval_str(ctx, "var gsab = new SharedArrayBuffer(4, { maxByteLength: 16 }); "
+                 "var tg = new Uint16Array(gsab, 2); gsab.grow(12); tg");
+    check_ta_data(ctx, v, 2, 10, 2);
+
+    for(i = 0; i < countof(bad_src); i++)
+        check_ta_data(ctx, eval_str(ctx, bad_src[i]), -1, 0, 0);
+    check_ta_data(ctx, JS_UNDEFINED, -1, 0, 0);
 }
 
 static void test_free_macros(JSContext *ctx)
@@ -999,6 +1506,224 @@ static void test_with_resolvers_oom(void)
     CHECK(ok);
 }
 
+/* the small blocks come from arenas, so a memory limit alone does not
+   make them fail: take every free small block, then give back all but
+   those of size 'keep_size' or, if keep_size is 0, the last 'n' ones */
+static void *oom_blocks[1 << 16];
+static size_t oom_sizes[1 << 16];
+
+static int oom_fill(JSRuntime *rt, size_t keep_size, int n)
+{
+    int i, j, count = 0, any = 1;
+    size_t size;
+
+    while (any && count < (int)countof(oom_blocks) - 64) {
+        any = 0;
+        for(size = 8; size <= 496; size += 8) {
+            void *p = js_malloc_rt(rt, size);
+            if (p) {
+                oom_sizes[count] = size;
+                oom_blocks[count++] = p;
+                any = 1;
+            }
+        }
+    }
+    if (keep_size) {
+        for(i = j = 0; i < count; i++) {
+            if (oom_sizes[i] == keep_size)
+                oom_blocks[j++] = oom_blocks[i];
+            else
+                js_free_rt(rt, oom_blocks[i]);
+        }
+        count = j;
+    } else {
+        while (n-- > 0 && count > 0)
+            js_free_rt(rt, oom_blocks[--count]);
+    }
+    return count;
+}
+
+/* regression test: running out of memory while instantiating a lazy
+   (autoinit) property made it undefined for good and could leak the
+   value (bellard/quickjs#580, #576); a failed push on a fast array
+   incremented its length (bellard/quickjs#576) */
+static void test_autoinit_oom(void)
+{
+    static const char *const names[] = {
+        "JSON.parse", "decodeURIComponent", "JSON.stringify"
+    };
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSMemoryUsage stats;
+    JSValue global, json, o, v;
+    char buf[64];
+    int which, i, count, failed, n_failed = 0;
+    size_t limit;
+
+    for(which = 0; which < 3; which++) {
+        for(i = 0; i < 62 + 16; i++) {
+            rt = JS_NewRuntime();
+            ctx = JS_NewContext(rt);
+            global = JS_GetGlobalObject(ctx);
+            json = JS_GetPropertyStr(ctx, global, "JSON");
+            o = JS_NewObjectProto(ctx, json);
+            v = which == 2 ? JS_NewObject(ctx) : JS_UNDEFINED;
+            JS_ComputeMemoryUsage(rt, &stats);
+            JS_SetMemoryLimit(rt, stats.malloc_size);
+            if (i < 62)
+                count = oom_fill(rt, 8 + 8 * i, 0);
+            else
+                count = oom_fill(rt, 0, i - 62);
+            if (which == 0) {
+                v = JS_GetPropertyStr(ctx, json, "parse");
+                failed = JS_IsException(v);
+            } else if (which == 1) {
+                v = JS_GetPropertyStr(ctx, global, "decodeURIComponent");
+                failed = JS_IsException(v);
+            } else {
+                failed = JS_SetPropertyStr(ctx, o, "stringify", v) < 0;
+                v = JS_UNDEFINED;
+            }
+            JS_FreeValue(ctx, v);
+            if (failed)
+                JS_FreeValue(ctx, JS_GetException(ctx));
+            while (count > 0)
+                js_free_rt(rt, oom_blocks[--count]);
+            JS_SetMemoryLimit(rt, -1);
+            if (failed) {
+                n_failed++;
+                snprintf(buf, sizeof(buf), "typeof %s === 'function'",
+                         names[which]);
+                CHECK(eval_bool(ctx, buf));
+            }
+            JS_FreeValue(ctx, o);
+            JS_FreeValue(ctx, json);
+            JS_FreeValue(ctx, global);
+            JS_FreeContext(ctx);
+            JS_FreeRuntime(rt); /* asserts that no object is leaked */
+        }
+    }
+    CHECK(n_failed > 0);
+
+    n_failed = 0;
+    for(limit = 0; limit < 2048; limit += 64) {
+        rt = JS_NewRuntime();
+        ctx = JS_NewContext(rt);
+        global = JS_GetGlobalObject(ctx);
+        o = JS_NewArray(ctx);
+        JS_SetPropertyStr(ctx, global, "a", JS_DupValue(ctx, o));
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, stats.malloc_size + limit);
+        for(i = 0; i < 100000; i++) {
+            if (JS_SetPropertyUint32(ctx, o, i, JS_NewInt32(ctx, i)) < 0)
+                break;
+        }
+        JS_SetMemoryLimit(rt, -1);
+        if (i < 100000) {
+            n_failed++;
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            CHECK(eval_bool(ctx, "a.length === a.filter(() => true).length"));
+        }
+        JS_FreeValue(ctx, o);
+        JS_FreeValue(ctx, global);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+    }
+    CHECK(n_failed > 0);
+}
+
+/* regression test: JSON.parse() with a reviver freed the parsed value
+   twice when out of memory while storing it in the root holder. The
+   sweep reaches every allocation only when all the blocks come from
+   malloc() (JS_MALLOC_LARGE_BLOCKS_ONLY: gcc ASan builds); otherwise
+   the small blocks come from arenas and nothing fails. */
+static void test_json_parse_oom(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSMemoryUsage stats;
+    JSValue parse, args[2], v;
+    size_t limit;
+    int n_ok = 0;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    parse = eval_str(ctx, "JSON.parse");
+    args[0] = JS_NewString(ctx, "{\"a\":[1,2],\"b\":{}}");
+    args[1] = eval_str(ctx, "(k, v) => v");
+    for(limit = 0; limit < 64 * 1024 && n_ok < 4; limit += 8) {
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, stats.malloc_size + limit);
+        v = JS_Call(ctx, parse, JS_UNDEFINED, 2, (JSValueConst *)args);
+        JS_SetMemoryLimit(rt, -1);
+        if (JS_IsException(v)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        } else {
+            n_ok++;
+            JS_FreeValue(ctx, v);
+        }
+    }
+    CHECK(n_ok > 0);
+    JS_FreeValue(ctx, args[1]);
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, parse);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt); /* asserts that no object is leaked */
+}
+
+/* regression test: out of memory errors during the compilation were
+   ignored in some places (variable resolution, constant pool, lookahead,
+   bytecode patches), which led to crashes and assertion failures or to
+   a successful compilation with a pending exception (upstream
+   bellard/quickjs issues 528, 530 and 532) */
+static void test_parser_oom(void)
+{
+    static const char src_head[] =
+        "function f(a, [b, c] = [1, 2], {d, e} = {}) {\n"
+        "  class C { #x = 1; static y = `t${a}`; m() { return this.#x; } }\n"
+        "  switch (a) { case 1: break; default: a++; }\n"
+        "  var g = (u, v) => u + v, h = async (w) => w;\n"
+        "  for (var [k, l] of [[1, 2]]) a += k + l;\n"
+        "  return function () { eval(''); return String.raw`x${b}` + [";
+    static const char src_tail[] = "]; };\n}\n";
+    char src[4096];
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSMemoryUsage stats;
+    JSValue v, e;
+    size_t limit, len;
+    int i, n_ok = 0, n_failed = 0;
+
+    len = snprintf(src, sizeof(src), "%s", src_head);
+    for(i = 0; i < 120; i++)
+        len += snprintf(src + len, sizeof(src) - len, "g%d, ", i);
+    len += snprintf(src + len, sizeof(src) - len, "%s", src_tail);
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    for(limit = 0; limit < 256 * 1024 && n_ok < 4; limit += 64) {
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, stats.malloc_size + limit);
+        v = JS_Eval(ctx, src, len, "<oom>",
+                    JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        JS_SetMemoryLimit(rt, -1);
+        if (JS_IsException(v)) {
+            /* the compilation fails with the exception */
+            e = JS_GetException(ctx);
+            CHECK(!JS_IsUninitialized(e));
+            JS_FreeValue(ctx, e);
+            n_failed++;
+        } else {
+            CHECK(!JS_HasException(ctx));
+            JS_FreeValue(ctx, v);
+            n_ok++;
+        }
+    }
+    CHECK(n_failed > 0 && n_ok > 0);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static int detect_module(const char *src)
 {
     return JS_DetectModule(src, strlen(src));
@@ -1171,6 +1896,42 @@ static void test_cfunctions(void)
     CHECK(closure_finalized == 1);
     JS_FreeRuntime(rt);
     CHECK(closure_finalized == 2);
+}
+
+static int trigger_polls;
+
+static int count_interrupt(JSRuntime *rt, void *opaque)
+{
+    trigger_polls++;
+    return 0;
+}
+
+static JSValue trigger_interrupt(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    JS_TriggerInterruptHandler(ctx);
+    return JS_UNDEFINED;
+}
+
+/* JS_TriggerInterruptHandler(): the handler is called at the next poll
+   instead of after 10000 instructions */
+static void test_trigger_interrupt(void)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+
+    JS_SetInterruptHandler(rt, count_interrupt, NULL);
+    set_global(ctx, "trigger", JS_NewCFunction(ctx, trigger_interrupt,
+                                               "trigger", 0));
+    /* the first poll of a new context may call the handler */
+    CHECK(eval_bool(ctx, "for (var i = 0; i < 10; i++); true"));
+    trigger_polls = 0;
+    CHECK(eval_bool(ctx, "for (var i = 0; i < 10; i++); true"));
+    CHECK(trigger_polls == 0);
+    CHECK(eval_bool(ctx, "trigger(); for (var i = 0; i < 10; i++); true"));
+    CHECK(trigger_polls == 1);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
 }
 
 /* proxy handler logging every trap call in 'traps' */
@@ -1489,6 +2250,74 @@ static void test_read_object2(void)
     JS_FreeRuntime(rt);
 }
 
+/* growable SharedArrayBuffer: the memory is allocated upfront and the
+   byte length is shared by the clones (upstream bellard/quickjs issue
+   546) */
+static void test_growable_sab(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSValue sab, copy;
+    uint8_t *buf, **wtab, **rtab, *data, *p16;
+    size_t len, wlen, rlen, size, off, blen, elem;
+    int i;
+
+    /* without SharedArrayBuffer allocator */
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    CHECK(eval_bool(ctx, "var s = new SharedArrayBuffer(1, { maxByteLength: 4096 }); "
+                    "var a = new Uint8Array(s); s.grow(4096); a.fill(7); "
+                    "s.byteLength === 4096 && a.length === 4096 && a[4095] === 7"));
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+
+    rt = JS_NewRuntime();
+    JS_SetSharedArrayBufferFunctions(rt, &t_sab_funcs);
+    ctx = JS_NewContext(rt);
+    sab = eval_str(ctx, "globalThis.sab = new SharedArrayBuffer(1, { maxByteLength: 16 }); "
+                   "globalThis.view = new Uint8Array(sab); sab");
+    CHECK(!JS_IsException(sab));
+    buf = JS_WriteObject2(ctx, &len, sab, JS_WRITE_OBJ_SAB, &wtab, &wlen);
+    CHECK(buf != NULL && wlen == 1);
+    for(i = 0; i < 2; i++) {
+        copy = JS_ReadObject2(ctx, buf, len, JS_READ_OBJ_SAB, &rtab, &rlen);
+        CHECK(!JS_IsException(copy));
+        CHECK(rlen == 1 && rtab[0] == wtab[0]);
+        CHECK(test_sab(rtab[0])->ref_count == 2 + i);
+        js_free(ctx, rtab);
+        set_global(ctx, i == 0 ? "copy" : "copy2", copy);
+    }
+    /* the growth is visible from all the clones and their views */
+    CHECK(eval_bool(ctx, "copy.grow(8); new Uint8Array(copy)[7] = 5; "
+                    "view[7] === 5 && view.length === 8 && sab.byteLength === 8 && "
+                    "copy2.byteLength === 8 && copy2.maxByteLength === 16"));
+    data = JS_GetArrayBuffer(ctx, &size, sab);
+    CHECK(data != NULL && size == 8 && data[7] == 5);
+    /* cannot shrink: another clone already grew the memory */
+    CHECK(eval_bool(ctx, "var ok; copy2.grow(12); "
+                    "try { copy.grow(10); ok = false; } "
+                    "catch(e) { ok = e instanceof RangeError; } "
+                    "ok && view.length === 12 && copy.byteLength === 12"));
+    CHECK(eval_bool(ctx, "sab.grow(12); sab.byteLength === 12"));
+    /* the views of a clone that was not used since the growth follow it */
+    CHECK(eval_bool(ctx, "globalThis.v16 = new Uint16Array(copy2, 2); "
+                    "copy.grow(16); copy.byteLength === 16"));
+    copy = eval_str(ctx, "v16");
+    p16 = JS_GetTypedArrayData(ctx, copy, &off, &blen, &elem);
+    data = JS_GetArrayBuffer(ctx, &size, sab);
+    CHECK(p16 != NULL && p16 == data + 2 && off == 2 && blen == 14 &&
+          elem == 2);
+    JS_FreeValue(ctx, copy);
+    js_free(ctx, wtab);
+    js_free(ctx, buf);
+    JS_FreeValue(ctx, sab);
+    eval_bool(ctx, "delete globalThis.sab; delete globalThis.view; "
+              "delete globalThis.copy; delete globalThis.copy2; "
+              "delete globalThis.v16");
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static char finalizer_log[8];
 
 static void runtime_finalizer(JSRuntime *rt, void *arg)
@@ -1661,6 +2490,724 @@ static void test_calloc(void)
     JS_FreeRuntime(rt);
 }
 
+static int64_t obj_count(JSRuntime *rt)
+{
+    JSMemoryUsage m;
+    JS_RunGC(rt);
+    JS_ComputeMemoryUsage(rt, &m);
+    return m.obj_count;
+}
+
+/* JS_DupContext() / JS_FreeContext() are inline: a context outlives
+   the release of its owner reference while other references exist */
+static void test_context_refcount(void)
+{
+    const JSMallocFunctions *mfs[] = { NULL, &t_mf };
+    int i;
+
+    for(i = 0; i < (int)countof(mfs); i++) {
+        JSRuntime *rt = mfs[i] ? JS_NewRuntime2(mfs[i], NULL) : JS_NewRuntime();
+        JSContext *ctx, *ctx2, *pctx;
+        int64_t n0;
+
+        CHECK(rt != NULL);
+        n0 = obj_count(rt);
+        ctx = JS_NewContext(rt);
+        CHECK(ctx != NULL);
+        CHECK(obj_count(rt) > n0);
+
+        ctx2 = JS_DupContext(ctx);
+        CHECK(ctx2 == ctx);
+        CHECK(eval_bool(ctx, "globalThis.x = 42; true"));
+        JS_FreeContext(ctx); /* the owner reference */
+        CHECK(eval_bool(ctx2, "x === 42"));
+        CHECK(JS_DupContext(JS_DupContext(ctx2)) == ctx2);
+        JS_FreeContext(ctx2);
+        JS_FreeContext(ctx2);
+        CHECK(eval_bool(ctx2, "x === 42"));
+        JS_FreeContext(ctx2); /* the last reference frees the context */
+        CHECK(obj_count(rt) == n0);
+
+        /* a pending job keeps its realm alive after the owner release */
+        ctx = JS_NewContext(rt);
+        CHECK(eval_bool(ctx, "Promise.resolve().then(() => { globalThis.done = 1; }); true"));
+        JS_FreeContext(ctx);
+        CHECK(JS_IsJobPending(rt));
+        CHECK(JS_ExecutePendingJob(rt, &pctx) == 1);
+        /* only cycles through the realm's objects keep it now */
+        CHECK(obj_count(rt) == n0);
+
+        /* the job reports its realm while another reference exists */
+        ctx = JS_NewContext(rt);
+        CHECK(eval_bool(ctx, "Promise.resolve().then(() => { globalThis.done = 1; }); true"));
+        CHECK(JS_ExecutePendingJob(rt, &pctx) == 1);
+        CHECK(pctx == ctx);
+        CHECK(eval_bool(ctx, "done === 1"));
+        JS_FreeContext(ctx);
+        CHECK(obj_count(rt) == n0);
+        JS_FreeRuntime(rt);
+    }
+}
+
+/* bellard/quickjs#581: a WeakMap value is kept only while its key is
+   reachable and one GC pass collects the unreachable entries */
+static void test_weak_map_ephemeron(void)
+{
+    static const char src[] =
+        "globalThis.map = new WeakMap();\n"
+        "(function () {\n"
+        "  var key = {}, keys = [], i;\n"
+        "  map.set(key, { backRef: key });\n"
+        "  globalThis.selfRef = new WeakRef(key);\n"
+        "  key = {};\n"
+        "  for (i = 0; i < 20; i++) {\n"
+        "    var next = {};\n"
+        "    map.set(key, { child: next });\n"
+        "    key = next;\n"
+        "  }\n"
+        "  globalThis.chainTail = new WeakRef(key);\n"
+        "  /* reachable chain, records in reverse order */\n"
+        "  for (i = 0; i <= 20; i++)\n"
+        "    keys.push({ id: i });\n"
+        "  for (i = 19; i >= 0; i--)\n"
+        "    map.set(keys[i], { next: keys[i + 1] });\n"
+        "  globalThis.head = keys[0];\n"
+        "})();\n";
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue v;
+
+    v = eval_str(ctx, src);
+    CHECK(!JS_IsException(v));
+    JS_FreeValue(ctx, v);
+    JS_RunGC(rt);
+    CHECK(eval_bool(ctx, "selfRef.deref() === undefined"));
+    CHECK(eval_bool(ctx, "chainTail.deref() === undefined"));
+    CHECK(eval_bool(ctx, "var k = head; for (var i = 0; i < 20; i++) "
+                    "k = map.get(k).next; k.id === 20"));
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+/* the partial result is freed when a BigInt power fails */
+static void test_bigint_pow_leak(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSMemoryUsage mu1, mu2;
+    const char *str = "try { 3n ** 10000000n } catch (e) {}";
+    int i;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    for(i = 0; i < 2; i++) {
+        JS_ComputeMemoryUsage(rt, &mu1);
+        JS_FreeValue(ctx, eval_str(ctx, str));
+        JS_ComputeMemoryUsage(rt, &mu2);
+    }
+    CHECK(mu2.malloc_count == mu1.malloc_count);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static int poll_count, poll_limit;
+
+static int counting_interrupt_handler(JSRuntime *rt, void *opaque)
+{
+    poll_count++;
+    return poll_limit > 0 && poll_count >= poll_limit;
+}
+
+/* return the number of interrupt polls during the evaluation of 'str'
+   which is interrupted at the poll 'limit' if limit > 0 */
+static int count_polls(JSContext *ctx, const char *str, int limit)
+{
+    JSValue val;
+
+    poll_count = 0;
+    poll_limit = limit;
+    val = eval_str(ctx, str);
+    if (limit > 0) {
+        CHECK(JS_IsException(val));
+        CHECK(JS_IsUncatchableException(ctx));
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    } else {
+        CHECK(!JS_IsException(val));
+        JS_FreeValue(ctx, val);
+    }
+    return poll_count;
+}
+
+/* the long BigInt operations and regexp executions poll the interrupt
+   handler at its usual rate and can be interrupted (upstream
+   bellard/quickjs issue 546) */
+static void test_interrupt_polls(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSValue val;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    val = eval_str(ctx, "var a = BigInt('0x' + 'f'.repeat(20000)),"
+                   "b = BigInt('0x' + 'f'.repeat(10000)),"
+                   "c = (1n << 500000n) - 1n, d = '9'.repeat(100000);");
+    CHECK(!JS_IsException(val));
+    JS_FreeValue(ctx, val);
+    JS_SetInterruptHandler(rt, counting_interrupt_handler, NULL);
+
+    CHECK(count_polls(ctx, "for (let i = 0; i < 10; i++) a / b;", 0) >= 50);
+    CHECK(count_polls(ctx, "for (let i = 0; i < 10; i++) a * b;", 0) >= 50);
+    CHECK(count_polls(ctx, "for (let i = 0; i < 10; i++) b ** 2n;", 0) >= 50);
+    /* a single long operation is interrupted */
+    count_polls(ctx, "try { c * c } catch (e) {}", 3);
+    count_polls(ctx, "try { c / (c >> 250000n) } catch (e) {}", 3);
+    count_polls(ctx, "try { String(c) } catch (e) {}", 3);
+    count_polls(ctx, "try { BigInt(d) } catch (e) {}", 3);
+    /* the interruption is not ignored by the comparison */
+    count_polls(ctx, "try { d < 1n } catch (e) {}", 3);
+    count_polls(ctx, "try { d == 1n } catch (e) {}", 3);
+
+    /* many short regexp executions */
+    CHECK(count_polls(ctx, "let re = /(a|aa)+b/, s = 'a'.repeat(13);"
+                      "for (let i = 0; i < 100; i++) re.test(s);", 0) >= 20);
+    count_polls(ctx, "try { /(a+)+b/.test('a'.repeat(40)) } catch (e) {}", 3);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static int64_t ac_allocs; /* allocations made by the runtime so far */
+
+static void *ac_calloc(JSMallocState *s, size_t count, size_t size)
+{
+    void *ptr = calloc(count, size);
+    if (ptr) {
+        ac_allocs++;
+        s->malloc_count++;
+    }
+    return ptr;
+}
+
+static void *ac_malloc(JSMallocState *s, size_t size)
+{
+    void *ptr = malloc(size);
+    if (ptr) {
+        ac_allocs++;
+        s->malloc_count++;
+    }
+    return ptr;
+}
+
+static void ac_free(JSMallocState *s, void *ptr)
+{
+    if (ptr)
+        s->malloc_count--;
+    free(ptr);
+}
+
+static void *ac_realloc(JSMallocState *s, void *ptr, size_t size)
+{
+    if (!ptr)
+        return size ? ac_malloc(s, size) : NULL;
+    if (size == 0) {
+        ac_free(s, ptr);
+        return NULL;
+    }
+    ac_allocs++;
+    return realloc(ptr, size);
+}
+
+static const JSMallocFunctions ac_mf = {
+    ac_calloc, ac_malloc, ac_free, ac_realloc, NULL,
+};
+
+static int64_t atom_count(JSRuntime *rt)
+{
+    JSMemoryUsage mu;
+    JS_ComputeMemoryUsage(rt, &mu);
+    return mu.atom_count;
+}
+
+/* JS_FindAtomLen() and JS_NewAtomLen() on existing atoms: no
+   allocation, whatever the key looks like */
+static void test_find_atom(void)
+{
+    static const char *const keys[] = {
+        "s4 plain", "s4 h\xc3\xa9llo", "2fa", "01", "4294967295",
+        "2147483648", "s4 \xf0\x9f\x98\x80 astral", "\xff\xfe", "a\x80\x62",
+    };
+    JSRuntime *rt = JS_NewRuntime2(&ac_mf, NULL);
+    JSContext *ctx = JS_NewContext(rt);
+    JSAtom a, b;
+    JSValue v;
+    int64_t n;
+    size_t i, len;
+
+    for(i = 0; i < countof(keys); i++) {
+        len = strlen(keys[i]);
+        CHECK(JS_FindAtomLen(ctx, keys[i], len) == JS_ATOM_NULL);
+        a = JS_NewAtomLen(ctx, keys[i], len);
+        CHECK(a != JS_ATOM_NULL);
+        n = ac_allocs;
+        b = JS_NewAtomLen(ctx, keys[i], len);
+        CHECK(b == a);
+        JS_FreeAtom(ctx, b);
+        b = JS_FindAtomLen(ctx, keys[i], len);
+        CHECK(b == a);
+        JS_FreeAtom(ctx, b);
+        CHECK(ac_allocs == n);
+        /* same atom as the one of the JS string */
+        v = JS_NewStringLen(ctx, keys[i], len);
+        b = JS_ValueToAtom(ctx, v);
+        JS_FreeValue(ctx, v);
+        CHECK(b == a);
+        JS_FreeAtom(ctx, b);
+        JS_FreeAtom(ctx, a);
+        /* the atom is gone once its last reference is freed */
+        CHECK(JS_FindAtomLen(ctx, keys[i], len) == JS_ATOM_NULL);
+    }
+
+    /* invalid UTF-8 is decoded like JS_NewStringLen() does */
+    a = JS_NewAtomLen(ctx, "a\x80\x62", 3);
+    b = JS_FindAtomLen(ctx, "a\xef\xbf\xbd", 4);
+    CHECK(b == a);
+    JS_FreeAtoms(ctx, a, b);
+    a = JS_NewAtomLen(ctx, "s4\xff\xfe", 4);
+    b = JS_FindAtomLen(ctx, "s4\xef\xbf\xbd\xef\xbf\xbd", 8);
+    CHECK(b == a);
+    JS_FreeAtoms(ctx, a, b);
+
+    /* array indexes are always found, as integer atoms */
+    n = ac_allocs;
+    a = JS_FindAtomLen(ctx, "2147483647", 10);
+    CHECK(a == JS_NewAtomUInt32(ctx, 2147483647));
+    CHECK(JS_FindAtomLen(ctx, "0", 1) == JS_NewAtomUInt32(ctx, 0));
+    CHECK(JS_NewAtomLen(ctx, "123", 3) == JS_NewAtomUInt32(ctx, 123));
+    CHECK(ac_allocs == n);
+    /* not zero terminated, predefined and atoms created by JS code */
+    a = JS_FindAtomLen(ctx, "lengthXYZ", 6);
+    b = JS_NewAtom(ctx, "length");
+    CHECK(a != JS_ATOM_NULL && a == b);
+    JS_FreeAtoms(ctx, a, b);
+    CHECK(JS_FindAtomLen(ctx, "", 0) != JS_ATOM_NULL);
+    CHECK(JS_FindAtomLen(ctx, "s4_\xce\xbb_js", 8) == JS_ATOM_NULL);
+    v = eval_str(ctx, "({ s4_\xce\xbb_js: 1, '\\u{1F600}s4': 2 })");
+    a = JS_FindAtomLen(ctx, "s4_\xce\xbb_js", 8);
+    CHECK(a != JS_ATOM_NULL);
+    JS_FreeAtom(ctx, a);
+    a = JS_FindAtomLen(ctx, "\xf0\x9f\x98\x80s4", 6);
+    CHECK(a != JS_ATOM_NULL);
+    JS_FreeAtom(ctx, a);
+    JS_FreeValue(ctx, v);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+/* JS_GetPropertyStrLen()/JS_HasPropertyStrLen() do not create atoms for
+   ordinary objects and behave like JS_GetProperty()/JS_HasProperty()
+   on exotic ones */
+static void test_property_str_len(void)
+{
+    static const char mod_src[] = "export const x = 1; export let y = 2;";
+    JSRuntime *rt = JS_NewRuntime2(&ac_mf, NULL);
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue obj, v, mod;
+    JSModuleDef *m;
+    int64_t n, atoms;
+
+    obj = eval_str(ctx, "var s4p = Object.create({ get s4_g() { return this.s4_own * 2 } });"
+                   "s4p.s4_own = 21; s4p['s4 \\u00e9'] = 3; s4p");
+    atoms = atom_count(rt);
+    n = ac_allocs;
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "s4_absent", 9)));
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "s4 \xc3\xa8", 5)));
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "7up", 3)));
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4_absent", 9) == 0);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4 \xc3\xa8", 5) == 0);
+    v = JS_GetPropertyStrLen(ctx, obj, "s4 \xc3\xa9", 5);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 3);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4 \xc3\xa9", 5) == 1);
+    CHECK(ac_allocs == n);
+    CHECK(atom_count(rt) == atoms);
+    /* inherited getter, key not zero terminated */
+    v = JS_GetPropertyStrLen(ctx, obj, "s4_gXX", 4);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 42);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4_g", 4) == 1);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "toString", 8) == 1);
+    v = JS_GetPropertyStr(ctx, obj, "s4_own");
+    CHECK(JS_VALUE_GET_INT(v) == 21);
+    JS_FreeValue(ctx, obj);
+
+    /* Proxy traps see keys which are not atoms yet, also from the
+       prototype chain */
+    obj = eval_str(ctx, "var s4log = []; var s4px = new Proxy({}, {"
+                   "get(t, k, r) { s4log.push(k); return 'p:' + k },"
+                   "has(t, k) { s4log.push('has:' + k); return k !== 'no' } });"
+                   "s4px");
+    check_string(ctx, JS_GetPropertyStrLen(ctx, obj, "s4_trap_1", 9), "p:s4_trap_1");
+    check_string(ctx, JS_GetPropertyStrLen(ctx, obj, "s4 trap \xc3\xa9", 10),
+                 "p:s4 trap \xc3\xa9");
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4_trap_2", 9) == 1);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "no", 2) == 0);
+    JS_FreeValue(ctx, obj);
+    obj = eval_str(ctx, "Object.create(Object.create(s4px))");
+    check_string(ctx, JS_GetPropertyStrLen(ctx, obj, "s4_trap_3", 9), "p:s4_trap_3");
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4_trap_4", 9) == 1);
+    JS_FreeValue(ctx, obj);
+    CHECK(eval_bool(ctx, "s4log.join() === 's4_trap_1,s4 trap \\u00e9,has:s4_trap_2,"
+                    "has:no,s4_trap_3,has:s4_trap_4'"));
+
+    /* typed arrays: numeric keys are not looked up in the prototype */
+    obj = eval_str(ctx, "Object.prototype['1.5'] = 'proto'; new Uint8Array([5, 6])");
+    v = JS_GetPropertyStrLen(ctx, obj, "1", 1);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 6);
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "1.5", 3)));
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "-0", 2)));
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "s4_ta", 5)));
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "1.5", 3) == 0);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "-0", 2) == 0);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "0", 1) == 1);
+    v = JS_GetPropertyStrLen(ctx, obj, "length", 6);
+    CHECK(JS_VALUE_GET_INT(v) == 2);
+    JS_FreeValue(ctx, obj);
+    CHECK(eval_bool(ctx, "delete Object.prototype['1.5']"));
+
+    /* String objects and primitives */
+    obj = eval_str(ctx, "new String('abc')");
+    check_string(ctx, JS_GetPropertyStrLen(ctx, obj, "1", 1), "b");
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "2", 1) == 1);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "3", 1) == 0);
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "s4_str", 6)));
+    JS_FreeValue(ctx, obj);
+    obj = JS_NewString(ctx, "xyz");
+    v = JS_GetPropertyStrLen(ctx, obj, "length", 6);
+    CHECK(JS_VALUE_GET_INT(v) == 3);
+    check_string(ctx, JS_GetPropertyStrLen(ctx, obj, "2", 1), "z");
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "s4_prim", 7)));
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "length", 6) == 0);
+    JS_FreeValue(ctx, obj);
+    CHECK(JS_IsException(JS_GetPropertyStrLen(ctx, JS_UNDEFINED, "s4_undef", 8)));
+    check_exception(ctx, "TypeError");
+    CHECK(eval_bool(ctx, "exc.message.includes('s4_undef')"));
+
+    /* module namespace */
+    mod = JS_Eval(ctx, mod_src, strlen(mod_src), "<s4mod>",
+                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    CHECK(JS_IsModule(mod));
+    m = JS_VALUE_GET_PTR(mod);
+    v = JS_EvalFunction(ctx, mod);
+    CHECK(!JS_IsException(v));
+    JS_FreeValue(ctx, v);
+    obj = JS_GetModuleNamespace(ctx, m);
+    CHECK(JS_IsObject(obj));
+    v = JS_GetPropertyStrLen(ctx, obj, "y", 1);
+    CHECK(JS_VALUE_GET_INT(v) == 2);
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "s4_ns", 5)));
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "x", 1) == 1);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4_ns", 5) == 0);
+    JS_FreeValue(ctx, obj);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+/* the UTF-8 key lookups find the keys of any length and only them (also
+   when another key has the same length and atom hash), and read own
+   properties like JS_GetProperty() */
+static void test_property_str_lookup(void)
+{
+    /* pairs of keys of the same length and atom hash */
+    static const char *const same_hash[][2] = {
+        { "qKgiNI", "q732ga" },
+        { "qk9ZqoarNL7f", "qeKzUdkKT2a8" },
+        { "qzPOmw_0Fom2Vfj0k7iJ", "qWcOM4g1UZCGbvhiQL66" },
+    };
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    char key[64];
+    JSValue obj, v;
+    JSAtom a, b;
+    size_t i, j, len;
+
+    /* ASCII, Latin-1 and wide keys of all lengths, the non-ASCII part
+       after ASCII prefixes of all lengths */
+    obj = eval_str(ctx, "var s4k = {}; for (let i = 0; i <= 40; i++) {"
+                   "s4k['k'.repeat(i)] = i; s4k['k'.repeat(i) + '\\u00e9'] = 100 + i;"
+                   "s4k['k'.repeat(i) + '\\u03bb' + 'k'.repeat(i % 7)] = 200 + i } s4k");
+    for(i = 0; i <= 40; i++) {
+        memset(key, 'k', i);
+        v = JS_GetPropertyStrLen(ctx, obj, key, i);
+        CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == i);
+        CHECK(JS_HasPropertyStrLen(ctx, obj, key, i) == 1);
+        /* same length, another first or last character */
+        if (i > 0) {
+            key[i - 1] = 'j';
+            CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, key, i)));
+            key[i - 1] = 'k';
+            key[0] = 'j';
+            CHECK(JS_HasPropertyStrLen(ctx, obj, key, i) == 0);
+        }
+        memset(key, 'k', i);
+        memcpy(key + i, "\xc3\xa9", 2);
+        v = JS_GetPropertyStrLen(ctx, obj, key, i + 2);
+        CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 100 + i);
+        memcpy(key + i, "\xce\xbb", 2);
+        len = i + 2;
+        for(j = 0; j < i % 7; j++)
+            key[len++] = 'k';
+        v = JS_GetPropertyStrLen(ctx, obj, key, len);
+        CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 200 + i);
+        a = JS_FindAtomLen(ctx, key, len);
+        CHECK(a != JS_ATOM_NULL);
+        JS_FreeAtom(ctx, a);
+    }
+
+    for(i = 0; i < countof(same_hash); i++) {
+        const char *k0 = same_hash[i][0], *k1 = same_hash[i][1];
+        len = strlen(k0);
+        CHECK(JS_SetPropertyStr(ctx, obj, k0, JS_NewInt32(ctx, 1000)) == 1);
+        CHECK(JS_FindAtomLen(ctx, k1, len) == JS_ATOM_NULL);
+        CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, k1, len)));
+        CHECK(JS_HasPropertyStrLen(ctx, obj, k1, len) == 0);
+        a = JS_NewAtomLen(ctx, k0, len);
+        b = JS_NewAtomLen(ctx, k1, len);
+        CHECK(a != JS_ATOM_NULL && b != JS_ATOM_NULL && a != b);
+        JS_FreeAtom(ctx, a);
+        a = JS_FindAtomLen(ctx, k0, len);
+        CHECK(a != JS_ATOM_NULL && a != b);
+        CHECK(JS_FindAtomLen(ctx, k1, len) == b);
+        CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, k1, len)));
+        v = JS_GetPropertyStrLen(ctx, obj, k0, len);
+        CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 1000);
+        JS_FreeAtoms(ctx, a, b, b);
+    }
+    JS_FreeValue(ctx, obj);
+
+    /* own accessors and the length of arrays */
+    obj = eval_str(ctx, "({ get s4_og() { return this.s4_d + 1 }, s4_d: 8 })");
+    v = JS_GetPropertyStrLen(ctx, obj, "s4_og", 5);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 9);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4_og", 5) == 1);
+    JS_FreeValue(ctx, obj);
+    obj = eval_str(ctx, "[4, 5, 6]");
+    v = JS_GetPropertyStrLen(ctx, obj, "length", 6);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 3);
+    v = JS_GetPropertyStrLen(ctx, obj, "2", 1);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 6);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "length", 6) == 1);
+    JS_FreeValue(ctx, obj);
+    obj = JS_GetGlobalObject(ctx);
+    v = JS_GetPropertyStrLen(ctx, obj, "Math", 4);
+    CHECK(JS_IsObject(v));
+    JS_FreeValue(ctx, v);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "JSON", 4) == 1);
+    JS_FreeValue(ctx, obj);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+/* JS_GetOwnPropertyCount() returns the JS_GetOwnPropertyNames() count */
+static void check_own_count(JSContext *ctx, const char *src, int flags,
+                            uint32_t expected)
+{
+    JSValue obj = eval_str(ctx, src);
+    JSPropertyEnum *tab;
+    uint32_t len, count;
+
+    CHECK(JS_GetOwnPropertyNames(ctx, &tab, &len, obj, flags) == 0);
+    JS_FreePropertyEnum(ctx, tab, len);
+    CHECK(JS_GetOwnPropertyCount(ctx, &count, obj, flags) == 0);
+    CHECK(count == len && count == expected);
+    JS_FreeValue(ctx, obj);
+}
+
+static void test_own_property_count(JSContext *ctx)
+{
+    const int str_enum = JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY;
+    const int all = JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK;
+    const char *obj = "var s4o = { a: 1, b: 2, 1: 3, [Symbol()]: 4 };"
+        "Object.defineProperty(s4o, 'h', { value: 5 }); delete s4o.b; s4o";
+    uint32_t count;
+
+    check_own_count(ctx, "({})", str_enum, 0);
+    check_own_count(ctx, obj, str_enum, 2);
+    check_own_count(ctx, obj, JS_GPN_STRING_MASK, 3);
+    check_own_count(ctx, obj, JS_GPN_SYMBOL_MASK, 1);
+    check_own_count(ctx, obj, all, 4);
+    check_own_count(ctx, "[1, 2, 3]", str_enum, 3);
+    check_own_count(ctx, "[1, 2, 3]", JS_GPN_STRING_MASK, 4);
+    check_own_count(ctx, "new String('ab')", str_enum, 2);
+    check_own_count(ctx, "new Uint8Array(5)", str_enum, 5);
+    check_own_count(ctx, "(function (a, b) { return arguments })(1, 2)", str_enum, 2);
+    /* Proxy traps are called as by JS_GetOwnPropertyNames() */
+    CHECK(eval_bool(ctx, "var s4n = 0; var s4q = new Proxy({ a: 1, b: 2 }, {"
+                    "ownKeys(t) { s4n++; return Reflect.ownKeys(t) },"
+                    "getOwnPropertyDescriptor(t, k) { s4n++;"
+                    "  return Reflect.getOwnPropertyDescriptor(t, k) } }); true"));
+    check_own_count(ctx, "s4q", str_enum, 2);
+    CHECK(eval_bool(ctx, "s4n === 6"));
+    CHECK(JS_GetOwnPropertyCount(ctx, &count, JS_NewInt32(ctx, 1), str_enum) == -1);
+    check_exception(ctx, "TypeError");
+    CHECK(eval_bool(ctx, "var s4t = new Proxy({}, { ownKeys() { throw new RangeError() } }); true"));
+    {
+        JSValue t = eval_str(ctx, "s4t");
+        CHECK(JS_GetOwnPropertyCount(ctx, &count, t, str_enum) == -1);
+        check_exception(ctx, "RangeError");
+        JS_FreeValue(ctx, t);
+    }
+}
+
+static int job_runs;
+
+static JSValue count_job(JSContext *ctx, int argc, JSValueConst *argv)
+{
+    job_runs++;
+    return JS_UNDEFINED;
+}
+
+static JSValue throw_job(JSContext *ctx, int argc, JSValueConst *argv)
+{
+    job_runs++;
+    return JS_ThrowTypeError(ctx, "job %d", job_runs);
+}
+
+static JSValue throw_int_job(JSContext *ctx, int argc, JSValueConst *argv)
+{
+    return JS_Throw(ctx, JS_NewInt32(ctx, 42));
+}
+
+/* JS_ExecutePendingJobs(): count, limit, jobs enqueued by jobs, stop at
+   the first job which throws and its context */
+static void test_pending_jobs(void)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSContext *ctx2 = JS_NewContext(rt);
+    JSContext *c;
+    JSValue v;
+
+    c = ctx;
+    CHECK(JS_ExecutePendingJobs(rt, -1, &c) == 0);
+    CHECK(c == NULL);
+
+    /* the first reaction enqueues the third one */
+    v = eval_str(ctx, "globalThis.log = [];"
+                 "Promise.resolve().then(() => { log.push(1);"
+                 "  Promise.resolve().then(() => log.push(3)); });"
+                 "Promise.resolve().then(() => log.push(2));");
+    CHECK(!JS_IsException(v));
+    JS_FreeValue(ctx, v);
+    CHECK(JS_ExecutePendingJobs(rt, 0, NULL) == 0);
+    c = ctx;
+    CHECK(JS_ExecutePendingJobs(rt, 1, &c) == 1);
+    CHECK(c == NULL);
+    CHECK(eval_bool(ctx, "log.join() === '1'"));
+    CHECK(JS_ExecutePendingJobs(rt, -1, &c) == 2);
+    CHECK(c == NULL);
+    CHECK(!JS_IsJobPending(rt));
+    CHECK(eval_bool(ctx, "log.join() === '1,2,3'"));
+
+    /* stop at the job which throws, with its context */
+    job_runs = 0;
+    CHECK(JS_EnqueueJob(ctx, count_job, 0, NULL) == 0);
+    CHECK(JS_EnqueueJob(ctx2, throw_job, 0, NULL) == 0);
+    CHECK(JS_EnqueueJob(ctx, count_job, 0, NULL) == 0);
+    CHECK(JS_ExecutePendingJobs(rt, -1, &c) == -1);
+    CHECK(c == ctx2);
+    CHECK(job_runs == 2);
+    CHECK(JS_HasException(ctx2));
+    v = JS_GetException(ctx2);
+    CHECK(JS_IsError(ctx2, v));
+    JS_FreeValue(ctx2, v);
+    CHECK(JS_IsJobPending(rt));
+    CHECK(JS_ExecutePendingJobs(rt, -1, NULL) == 1);
+    CHECK(job_runs == 3);
+
+    /* the first job throws, with a limit */
+    CHECK(JS_EnqueueJob(ctx, throw_int_job, 0, NULL) == 0);
+    c = NULL;
+    CHECK(JS_ExecutePendingJobs(rt, 5, &c) == -1);
+    CHECK(c == ctx);
+    v = JS_GetException(ctx);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 42);
+    CHECK(!JS_IsJobPending(rt));
+
+    JS_FreeContext(ctx2);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static void test_std_array_prototype(void)
+{
+    static const char *const changes[] = {
+        "Object.defineProperty(Array.prototype, '0', { set(v) {}, configurable: true })",
+        "Object.defineProperty(Array.prototype, '1', { value: 1, writable: false })",
+        "Object.defineProperty(Object.prototype, '0', { get() { return 1 } })",
+        "Object.prototype[2] = 1",
+        "Array.prototype[3] = 1",
+        "Object.setPrototypeOf(Array.prototype, null)",
+    };
+    static const char *const cross[] = {
+        "Object.defineProperty(other.Array.prototype, '0', { set(v) {} })",
+        "other.Object.prototype[0] = 1",
+        "Object.setPrototypeOf(other.Array.prototype, {})",
+    };
+    JSRuntime *rt;
+    JSContext *ctx, *ctx2;
+    JSValue v, global;
+    const int *flag, *flag2;
+    size_t i;
+
+    rt = JS_NewRuntime();
+    for (i = 0; i < countof(changes); i++) {
+        ctx = JS_NewContext(rt);
+        ctx2 = JS_NewContext(rt);
+        flag = JS_GetStdArrayPrototypeFlag(ctx);
+        flag2 = JS_GetStdArrayPrototypeFlag(ctx2);
+        CHECK(flag != NULL && flag2 != NULL && flag != flag2);
+        CHECK(*flag);
+        /* non-index properties and dense data elements can't intercept a set */
+        v = eval_str(ctx, "Array.prototype.x = 1; Object.prototype.y = 2; Array.prototype.push(0)");
+        JS_FreeValue(ctx, v);
+        CHECK(*flag);
+        v = eval_str(ctx, changes[i]);
+        JS_FreeValue(ctx, v);
+        CHECK(!*flag);
+        /* stays 0, other contexts are not affected */
+        v = eval_str(ctx, "delete Array.prototype[0]; delete Object.prototype[0]");
+        JS_FreeValue(ctx, v);
+        CHECK(!*flag && JS_GetStdArrayPrototypeFlag(ctx) == flag);
+        CHECK(*flag2);
+        CHECK(!JS_HasException(ctx));
+        JS_FreeContext(ctx2);
+        JS_FreeContext(ctx);
+    }
+
+    /* the prototypes of a context changed from another one */
+    for (i = 0; i < countof(cross); i++) {
+        ctx = JS_NewContext(rt);
+        ctx2 = JS_NewContext(rt);
+        global = JS_GetGlobalObject(ctx);
+        JS_SetPropertyStr(ctx, global, "other", JS_GetGlobalObject(ctx2));
+        JS_FreeValue(ctx, global);
+        v = eval_str(ctx, cross[i]);
+        JS_FreeValue(ctx, v);
+        CHECK(*JS_GetStdArrayPrototypeFlag(ctx));
+        CHECK(!*JS_GetStdArrayPrototypeFlag(ctx2));
+        JS_FreeContext(ctx2);
+        JS_FreeContext(ctx);
+    }
+
+    /* the basic objects of a raw context include Array.prototype */
+    ctx = JS_NewContextRaw(rt);
+    CHECK(*JS_GetStdArrayPrototypeFlag(ctx));
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     JSRuntime *rt;
@@ -1673,9 +3220,21 @@ int main(void)
     test_eval2();
     test_write_strip();
     test_read_object2();
+    test_growable_sab();
     test_runtime();
     test_normalize2();
     test_calloc();
+    test_context_refcount();
+    test_weak_map_ephemeron();
+    test_trigger_interrupt();
+    test_bigint_pow_leak();
+    test_interrupt_polls();
+    test_find_atom();
+    test_property_str_len();
+    test_property_str_lookup();
+    test_object_from();
+    test_pending_jobs();
+    test_std_array_prototype();
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);
@@ -1687,22 +3246,33 @@ int main(void)
     test_errors(ctx);
     test_cstring(ctx);
     test_utf16_strings(ctx);
+    test_string_data(ctx);
+    test_new_string_utf8(ctx);
     test_new_errors(ctx);
+    test_error_len(ctx);
     test_integrity(ctx);
     test_class_names(ctx);
     test_is_module(ctx);
     test_property_values(ctx);
     test_set_length(ctx);
+    test_fast_array(ctx);
     test_conversions(ctx);
     test_uint8_arrays(ctx);
+    test_typed_array_data(ctx);
     test_free_macros(ctx);
     test_function_list_flags(ctx);
     test_promises(ctx);
+    test_own_property_count(ctx);
+    test_atom_string_data(ctx);
+    test_set_property_str_len(ctx);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 
     test_promise_hooks();
     test_with_resolvers_oom();
+    test_autoinit_oom();
+    test_json_parse_oom();
+    test_parser_oom();
     test_detect_module();
     printf("test_api: OK\n");
     return 0;

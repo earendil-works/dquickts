@@ -401,6 +401,16 @@ function test_date_parse_spaces()
     }
 }
 
+/* bellard/quickjs#449: shortest round-trip string for powers of two */
+function test_issue_449()
+{
+    assert(String(7.120236347223045e-307), "7.120236347223045e-307");
+    assert(String(2 ** -1007), "7.291122019556398e-304");
+    assert(String(2 ** -957), "8.209073602596753e-289");
+    assert(String(2 ** -1074), "5e-324");
+    assert(String(2 ** 1023), "8.98846567431158e+307");
+}
+
 /* ng 6b3bed1: Array.isArray() walks a proxy chain of any depth */
 function test_proxy_is_array()
 {
@@ -424,6 +434,45 @@ function test_proxy_is_array()
     r = new Proxy(rev.proxy, {});
     rev.revoke();
     assertThrows(TypeError, () => Array.isArray(r));
+}
+
+/* bellard/quickjs#563: an exception thrown by PromiseResolve() in 'await'
+   (here by the 'constructor' getter) is thrown at the await point */
+async function test_issue_563()
+{
+    var log = [], e, n, i;
+    function poisoned() {
+        var p = Promise.resolve(1);
+        Object.defineProperty(p, "constructor", {
+            get() { throw new Error("boom"); } });
+        return p;
+    }
+    try {
+        await poisoned();
+    } catch (ex) {
+        e = ex;
+    } finally {
+        log.push("finally");
+    }
+    assert(e.message, "boom");
+    assert(log.join(), "finally");
+    n = 0;
+    for(i = 0; i < 3; i++) {
+        try {
+            await poisoned();
+        } catch (ex) {
+            n++;
+        }
+    }
+    assert(n, 3);
+    assert(await 2, 2);
+    /* uncaught: the promise of the async function is rejected */
+    e = await (async function() {
+        await poisoned();
+        log.push("not reached");
+    })().then(() => null, ex => ex);
+    assert(e.message, "boom");
+    assert(log.join(), "finally");
 }
 
 /* ng #1577, #1580: for-await does not call return() on normal completion
@@ -528,6 +577,32 @@ async function test_modules()
     assert(typeof import.meta.url, "string");
 }
 
+/* bellard/quickjs#546 (F-003): the Math.sumPrecise int64 limbs overflowed
+   when more than 127 values were added between two renormalizations */
+function test_issue_546()
+{
+    /* all values are multiples of 2^-64: the exact sum is computed with
+       BigInt and Number() rounds it correctly */
+    function exact(tab) {
+        var s = 0n;
+        for(var v of tab)
+            s += BigInt(v * 2 ** 64);
+        return Number(s) * 2 ** -64;
+    }
+    function check(tab) {
+        assert(Math.sumPrecise(tab), exact(tab));
+    }
+    var x = (2 - 2 ** -52) * 2 ** -11, y = x / 2, n, tab;
+    for(n of [127, 128, 129, 200, 1000]) {
+        check(Array(n).fill(x));
+        check(Array(n).fill(-x));
+    }
+    tab = [];
+    for(n = 0; n < 1000; n++)
+        tab.push(n % 4 == 3 ? -y : x);
+    check(tab);
+}
+
 test_iterator_proto_constructor();
 test_iterator_proto_tostringtag();
 test_regexp();
@@ -544,5 +619,8 @@ test_template_tostring_order();
 test_syntax_error_column();
 test_date_parse_spaces();
 test_proxy_is_array();
+test_issue_449();
+test_issue_546();
+await test_issue_563();
 await test_for_await_close();
 await test_modules();

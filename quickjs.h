@@ -478,8 +478,26 @@ void JS_RunGC(JSRuntime *rt);
 JS_BOOL JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
 
 JSContext *JS_NewContext(JSRuntime *rt);
-void JS_FreeContext(JSContext *s);
-JSContext *JS_DupContext(JSContext *ctx);
+void __JS_FreeContext(JSContext *ctx);
+
+/* The context reference count is stored in the memory block header
+   right before the JSContext, at the same place as the reference
+   count of the reference counted values. */
+static inline JSContext *JS_DupContext(JSContext *ctx)
+{
+    ((JSRefCountHeader *)((uint32_t *)ctx - 1))->ref_count++;
+    return ctx;
+}
+
+/* release a reference to the context; it is freed (with its intrinsic
+   objects) when the last reference is released */
+static inline void JS_FreeContext(JSContext *ctx)
+{
+    JSRefCountHeader *p = (JSRefCountHeader *)((uint32_t *)ctx - 1);
+    if (--p->ref_count <= 0) {
+        __JS_FreeContext(ctx);
+    }
+}
 void *JS_GetContextOpaque(JSContext *ctx);
 void JS_SetContextOpaque(JSContext *ctx, void *opaque);
 JSRuntime *JS_GetRuntime(JSContext *ctx);
@@ -582,6 +600,11 @@ void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt);
 
 JSAtom JS_NewAtomLen(JSContext *ctx, const char *str, size_t len);
 JSAtom JS_NewAtom(JSContext *ctx, const char *str);
+/* Return the atom JS_NewAtomLen() would return for the UTF-8 string
+   'str' if it already exists, JS_ATOM_NULL otherwise. Never creates an
+   atom, allocates memory or raises an exception. A non null result
+   must be freed with JS_FreeAtom(). */
+JSAtom JS_FindAtomLen(JSContext *ctx, const char *str, size_t len);
 JSAtom JS_NewAtomUInt32(JSContext *ctx, uint32_t n);
 JSAtom JS_DupAtom(JSContext *ctx, JSAtom v);
 JSAtom JS_DupAtomRT(JSRuntime *rt, JSAtom v);
@@ -597,6 +620,15 @@ static inline const char *JS_AtomToCString(JSContext *ctx, JSAtom atom)
 {
     return JS_AtomToCStringLen(ctx, NULL, atom);
 }
+/* size of the 'buf' argument of JS_AtomGetStringData() */
+#define JS_ATOM_DATA_BUF_SIZE 16
+/* Borrowed view of JS_AtomToString(ctx, atom) as JS_GetStringData()
+   returns it, without allocation: the decimal digits of an integer
+   atom are written to 'buf' (JS_ATOM_DATA_BUF_SIZE bytes) and
+   returned, the contents of other atoms (the description of a symbol)
+   remain valid while the atom is alive. */
+const void *JS_AtomGetStringData(JSContext *ctx, JSAtom atom, size_t *plen,
+                                 JS_BOOL *pwide, char *buf);
 JSAtom JS_ValueToAtom(JSContext *ctx, JSValueConst val);
 
 /* object class support */
@@ -829,6 +861,30 @@ JSValue JS_GetException(JSContext *ctx);
 JS_BOOL JS_HasException(JSContext *ctx);
 JS_BOOL JS_IsError(JSContext *ctx, JSValueConst val);
 JSValue JS_NewError(JSContext *ctx);
+/* error kinds of JS_NewErrorLen() and JS_ThrowErrorLen() */
+typedef enum JSErrorEnum {
+    JS_EVAL_ERROR,
+    JS_RANGE_ERROR,
+    JS_REFERENCE_ERROR,
+    JS_SYNTAX_ERROR,
+    JS_TYPE_ERROR,
+    JS_URI_ERROR,
+    JS_INTERNAL_ERROR,
+    JS_AGGREGATE_ERROR,
+    JS_SUPPRESSED_ERROR,
+
+    JS_NATIVE_ERROR_COUNT, /* number of different NativeError objects */
+    JS_PLAIN_ERROR = JS_NATIVE_ERROR_COUNT, /* 'Error' */
+} JSErrorEnum;
+/* new error object of kind 'error_num' whose message is the UTF-8
+   string 'msg' of 'len' bytes (no formatting and no length limit,
+   unlike the printf like functions below). Return JS_EXCEPTION if out
+   of memory. */
+JSValue JS_NewErrorLen(JSContext *ctx, JSErrorEnum error_num,
+                       const char *msg, size_t len);
+/* same as JS_NewErrorLen() but throw the error. Return JS_EXCEPTION. */
+JSValue JS_ThrowErrorLen(JSContext *ctx, JSErrorEnum error_num,
+                         const char *msg, size_t len);
 /* same as the JS_Throw*Error() functions but return the error object
    (or JS_EXCEPTION) without throwing it */
 JSValue __js_printf_like(2, 3) JS_NewSyntaxError(JSContext *ctx, const char *fmt, ...);
@@ -940,6 +996,8 @@ static inline JSValue JS_NewString(JSContext *ctx, const char *str)
 }
 /* copy 'len' UTF-16 code units; unpaired surrogates are kept */
 JSValue JS_NewStringUTF16(JSContext *ctx, const uint16_t *buf, size_t len);
+/* Latin-1 (ISO-8859-1) bytes: one code unit per byte, no UTF-8 decoding */
+JSValue JS_NewStringLatin1Len(JSContext *ctx, const uint8_t *buf, size_t len);
 JSValue JS_NewAtomString(JSContext *ctx, const char *str);
 JSValue JS_ToString(JSContext *ctx, JSValueConst val);
 JSValue JS_ToPropertyKey(JSContext *ctx, JSValueConst val);
@@ -961,6 +1019,15 @@ static inline const uint16_t *JS_ToCStringUTF16(JSContext *ctx, JSValueConst val
 {
     return JS_ToCStringLenUTF16(ctx, NULL, val1);
 }
+/* Borrowed view of the contents of a string (JS_IsString(val)): *plen
+   Latin-1 bytes if *pwide is false, *plen UTF-16 code units in native
+   endianness otherwise. Not zero terminated. Nothing is copied or
+   freed: a rope is flattened in place and the pointer remains valid
+   while the caller holds a reference to val. Return NULL (and *plen =
+   0) with a pending exception if val is not a string or on memory
+   error. */
+const void *JS_GetStringData(JSContext *ctx, JSValueConst val, size_t *plen,
+                             JS_BOOL *pwide);
 void JS_FreeCString(JSContext *ctx, const char *ptr);
 void JS_FreeCStringRT(JSRuntime *rt, const char *ptr);
 void JS_FreeCStringUTF16(JSContext *ctx, const uint16_t *ptr);
@@ -978,9 +1045,17 @@ JSValue JS_NewObjectClass(JSContext *ctx, int class_id);
 JSValue JS_NewObjectProto(JSContext *ctx, JSValueConst proto);
 JSValue JS_NewObject(JSContext *ctx);
 /* new object with the 'count' enumerable properties props[i] = values[i].
-   The values are freed, even in case of exception. */
+   The values are freed, even in case of exception. The properties are
+   defined, as with JS_DefinePropertyValue(JS_PROP_C_W_E), on an object
+   of JS_NewObject(): the last value of a repeated property is kept. */
 JSValue JS_NewObjectFrom(JSContext *ctx, int count, const JSAtom *props,
                          const JSValue *values);
+/* Return TRUE if JS_SetProperty() of 'prop' on an object of
+   JS_NewObject() which doesn't have it yet only defines it as
+   JS_NewObjectFrom() does: no object of the prototype chain has an
+   exotic behavior, a setter or a read-only property 'prop' (e.g. FALSE
+   for '__proto__'). The answer holds until Object.prototype changes. */
+JS_BOOL JS_NewObjectSetIsDefine(JSContext *ctx, JSAtom prop);
 /* same as JS_NewObjectFrom() with property names as UTF-8 strings */
 JSValue JS_NewObjectFromStr(JSContext *ctx, int count, const char **props,
                             const JSValue *values);
@@ -997,6 +1072,31 @@ int JS_IsArray(JSContext *ctx, JSValueConst val);
 /* new array with the 'count' elements values[]. The values are freed,
    even in case of exception. */
 JSValue JS_NewArrayFrom(JSContext *ctx, int count, const JSValue *values);
+/* Return a pointer to a flag of 'ctx', valid as long as 'ctx', which is
+   non zero while setting the elements of a new array of 'ctx' in index
+   order (JS_SetPropertyUint32() on JS_NewArray()) only defines them
+   as own data properties, as JS_NewArrayFrom() does: no object of the
+   prototype chain of the arrays can intercept the sets (Array.prototype
+   and Object.prototype have no index property other than writable data
+   elements of Array.prototype, and the prototype of Array.prototype was
+   not changed). Conservative: once 0, it stays 0. Only the engine
+   changes it, so reading it is enough after any operation which may
+   run JS. */
+const int *JS_GetStdArrayPrototypeFlag(JSContext *ctx);
+/* If 'obj' is an Array whose elements are stored contiguously (a
+   "fast array"), return TRUE and set *pvalues to its element storage
+   and *plen to the number of stored elements. Otherwise (array with
+   holes or non-index properties, Proxy, typed array, non-object...)
+   return FALSE. Never throws.
+   The indexes 0 to *plen - 1 are own writable data properties.
+   *plen can be smaller than 'length': the indexes from *plen to
+   length - 1 are holes. The values are borrowed (use JS_DupValue() to
+   keep one) and must not be modified. The pointer is only valid until
+   the array is modified or freed, i.e. until any JS code, getter,
+   setter, Proxy trap, finalizer or garbage collection may run: check
+   again after such operations. */
+JS_BOOL JS_GetFastArray(JSContext *ctx, JSValueConst obj,
+                        JSValue **pvalues, uint32_t *plen);
 /* ToLength(obj.length): return -1 if exception */
 int JS_GetLength(JSContext *ctx, JSValueConst obj, int64_t *pres);
 /* obj.length = len (throwing on failure): return -1 if exception */
@@ -1023,6 +1123,12 @@ static js_force_inline JSValue JS_GetProperty(JSContext *ctx, JSValueConst this_
 }
 JSValue JS_GetPropertyStr(JSContext *ctx, JSValueConst this_obj,
                           const char *prop);
+/* this_obj[prop] where 'prop' is a UTF-8 string of 'len' bytes (not
+   necessarily zero terminated). No atom is created when the key is not
+   already an atom and the lookup cannot observe it (no exotic object
+   such as a Proxy in the prototype chain). */
+JSValue JS_GetPropertyStrLen(JSContext *ctx, JSValueConst this_obj,
+                             const char *prop, size_t len);
 JSValue JS_GetPropertyUint32(JSContext *ctx, JSValueConst this_obj,
                              uint32_t idx);
 JSValue JS_GetPropertyInt64(JSContext *ctx, JSValueConst this_obj,
@@ -1045,11 +1151,19 @@ int JS_SetPropertyInt64(JSContext *ctx, JSValueConst this_obj,
                         int64_t idx, JSValue val);
 int JS_SetPropertyStr(JSContext *ctx, JSValueConst this_obj,
                       const char *prop, JSValue val);
+/* same as JS_SetPropertyStr() with a UTF-8 key of 'len' bytes (not
+   necessarily zero terminated) */
+int JS_SetPropertyStrLen(JSContext *ctx, JSValueConst this_obj,
+                         const char *prop, size_t len, JSValue val);
 /* this_obj[prop] = val. 'prop' and 'val' are freed. 'flags' can be
    JS_PROP_THROW or JS_PROP_THROW_STRICT */
 int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                         JSValue prop, JSValue val, int flags);
 int JS_HasProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop);
+/* same as JS_HasProperty() with a UTF-8 key of 'len' bytes, creating no
+   atom in the same cases as JS_GetPropertyStrLen() */
+int JS_HasPropertyStrLen(JSContext *ctx, JSValueConst this_obj,
+                         const char *prop, size_t len);
 int JS_IsExtensible(JSContext *ctx, JSValueConst obj);
 int JS_PreventExtensions(JSContext *ctx, JSValueConst obj);
 /* Object.seal() / Object.freeze(): return -1 if exception. Non objects
@@ -1070,6 +1184,11 @@ JSValue JS_GetPrototype(JSContext *ctx, JSValueConst val);
 
 int JS_GetOwnPropertyNames(JSContext *ctx, JSPropertyEnum **ptab,
                            uint32_t *plen, JSValueConst obj, int flags);
+/* set '*plen' to the number of properties JS_GetOwnPropertyNames()
+   would return, without building the list for ordinary objects. Return
+   -1 if exception. */
+int JS_GetOwnPropertyCount(JSContext *ctx, uint32_t *plen, JSValueConst obj,
+                           int flags);
 void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab,
                          uint32_t len);
 int JS_GetOwnProperty(JSContext *ctx, JSPropertyDescriptor *desc,
@@ -1180,6 +1299,23 @@ JSValue JS_NewUint8ArrayCopy(JSContext *ctx, const uint8_t *buf, size_t len);
    Return NULL if exception. WARNING: any JS call can detach or resize
    the buffer and render the returned pointer invalid */
 uint8_t *JS_GetUint8Array(JSContext *ctx, size_t *psize, JSValueConst obj);
+/* data of a typed array view of any element type (the start of the view,
+   not of its buffer), its current byte length (which follows the buffer
+   for a length-tracking view), its byte offset in the buffer and its
+   element size. pbyte_offset, pbyte_length or pbytes_per_element can be
+   NULL. Unlike JS_GetTypedArrayBuffer(), the buffer object is not
+   referenced and no exception is raised: return NULL if 'obj' is not a
+   typed array (see JS_GetTypedArrayType()) or if the view is out of
+   bounds or its buffer is detached. WARNING: any JS call can detach or
+   resize the buffer and render the returned pointer invalid */
+uint8_t *JS_GetTypedArrayData(JSContext *ctx, JSValueConst obj,
+                              size_t *pbyte_offset,
+                              size_t *pbyte_length,
+                              size_t *pbytes_per_element);
+/* sab_free(), sab_dup() and the SharedArrayBuffer memory returned by
+   JS_WriteObject2()/JS_ReadObject2() use the pointer returned by
+   sab_alloc(). For a growable SharedArrayBuffer, the engine stores the
+   byte length shared by its clones at the start of this memory. */
 typedef struct {
     void *(*sab_alloc)(void *opaque, size_t size);
     void (*sab_free)(void *opaque, void *ptr);
@@ -1240,6 +1376,11 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
    opaque in '*popaque' if 'popaque' is not NULL. Used to chain
    handlers. */
 JSInterruptHandler *JS_GetInterruptHandler(JSRuntime *rt, void **popaque);
+/* Call the interrupt handler at the next poll of the code running in
+   'ctx' instead of at the end of the current polling period (every
+   10000 bytecode instructions). Must be called from the thread running
+   'ctx', e.g. in a native function. */
+void JS_TriggerInterruptHandler(JSContext *ctx);
 
 /* Suspension
 
@@ -1253,7 +1394,8 @@ JSInterruptHandler *JS_GetInterruptHandler(JSRuntime *rt, void **popaque);
      JS_Call(), JS_CallConstructor(), JS_CallConstructor2(), JS_Invoke()
      or the script run by JS_Eval()/JS_EvalThis()/JS_EvalFunction(),
      with no JS or native code running (in particular not from a C
-     function, a class call handler or JS_ExecutePendingJob()),
+     function, a class call handler, JS_ExecutePendingJob() or
+     JS_ExecutePendingJobs()),
    - every other frame was called by the previous one through a plain
      call, method call, 'new', spread call or tail call, possibly
      through bound functions.
@@ -1382,6 +1524,18 @@ JS_BOOL JS_IsJobPending(JSRuntime *rt);
 /* the realm of the next pending job, NULL if none */
 JSContext *JS_GetPendingJobContext(JSRuntime *rt);
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
+/* Execute the pending jobs in order, including the jobs enqueued
+   meanwhile, until none is left or 'max_jobs' were executed (no limit
+   if 'max_jobs' < 0). Return the number of executed jobs and set
+   '*pctx' (if pctx != NULL) to NULL. If a job throws, stop there and
+   return -1 with '*pctx' set to its context, in which the exception is
+   pending (NULL if the job destroyed it), like JS_ExecutePendingJob().
+   Same as calling JS_ExecutePendingJob() in a loop, without the host
+   regaining control between the jobs: jobs are never suspendable, and
+   a suspension requested meanwhile (JS_RequestSuspend()) stays pending
+   for the next host call as with the loop. Use 'max_jobs' to bound the
+   work done in one call. */
+int JS_ExecutePendingJobs(JSRuntime *rt, int max_jobs, JSContext **pctx);
 
 /* Object Writer/Reader (currently only used to handle precompiled code) */
 #define JS_WRITE_OBJ_BYTECODE  (1 << 0) /* allow function/module */
@@ -1421,6 +1575,19 @@ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
 /* load the dependencies of the module 'obj'. Useful when JS_ReadObject()
    returns a module. */
 int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
+/* Called by JS_EnumCodeNames() for each name; 'name' is only valid
+   during the call. */
+typedef void JSCodeNameFunc(JSContext *ctx, JSAtom name, void *opaque);
+/* Call 'func' for each name that the code 'obj' (a script or module
+   compiled with JS_EVAL_FLAG_COMPILE_ONLY) may look up at run time:
+   variable and property names, string constants and module imports, and
+   the global needed by a construct: "Promise" for modules and async
+   functions, "RegExp" for regexp literals and "import" for import().
+   A name can be given several times. Names computed at run time are not
+   seen. qjsc uses it to omit the unused built-ins (-fno-unused). Return
+   -1 if out of memory. */
+int JS_EnumCodeNames(JSContext *ctx, JSValueConst obj,
+                     JSCodeNameFunc *func, void *opaque);
 
 /* Heap snapshots
 
@@ -1744,6 +1911,11 @@ int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
 /* associate a JSValue to a C module */
 int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val);
 JSValue JS_GetModulePrivateValue(JSContext *ctx, JSModuleDef *m);
+/* set the import attributes (object or undefined) of a module created
+   before being imported (e.g. a JSON module embedded by qjsc): the
+   imports find a loaded module by name and attributes. 'attributes' is
+   freed by the function. */
+int JS_SetModuleAttributes(JSContext *ctx, JSModuleDef *m, JSValue attributes);
                         
 /* locale specific callbacks to override the default functions */
 typedef struct JSLocaleCallbacks {

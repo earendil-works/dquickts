@@ -31,6 +31,21 @@ int ti_bigint_to_timespec(JSContext *ctx, JSValueConst val, JSTimeSpec *ts);
 
 int ti_is_partial_temporal_object(JSContext *ctx, JSValueConst obj);
 
+/* register the class unless it already is (the classes are shared by
+   the contexts of a runtime). Return -1 with an exception if error. */
+static inline int ti_new_class(JSContext *ctx, JSClassID *pclass_id,
+                               const JSClassDef *class_def)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JS_NewClassID(pclass_id);
+    if (!JS_IsRegisteredClass(rt, *pclass_id) &&
+        JS_NewClass(rt, *pclass_id, class_def) < 0) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    return 0;
+}
+
 
 
 static inline int ti_validate_options_object(JSContext *ctx, JSValueConst v)

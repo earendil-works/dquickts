@@ -482,8 +482,8 @@ static const JSCFunctionListEntry js_pluralrules_static_funcs[] = {
 
 int js_add_pluralrules(JSContext *ctx, JSValue intl_obj)
 {
-    JS_NewClassID(&js_pluralrules_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_pluralrules_class_id, &js_pluralrules_class);
+    if (js_intl_new_class(ctx, &js_pluralrules_class_id, &js_pluralrules_class))
+        return -1;
 
     if (JS_IsException(js_intl_new_constructor(ctx, intl_obj,
                                                 -1,

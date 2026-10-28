@@ -114,10 +114,9 @@ impl Future for DriveFuture {
             lock.runtime.get_opaque().listen(cx.waker().clone());
 
             loop {
+                // Run all the pending jobs, or up to the first one which throws.
                 // TODO: Handle error.
-                if let Ok(true) = lock.runtime.execute_pending_job() {
-                    continue;
-                }
+                let _ = lock.runtime.execute_pending_jobs(None);
 
                 // TODO: Handle error.
                 match lock.runtime.get_opaque().poll(cx) {

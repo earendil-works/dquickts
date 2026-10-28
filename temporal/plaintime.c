@@ -992,8 +992,8 @@ int js_add_plaintime(JSContext *ctx, JSValue temporal_obj)
 {
     JSValue ctor;
     
-    JS_NewClassID(&js_plaintime_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_plaintime_class_id, &js_plaintime_class);
+    if (ti_new_class(ctx, &js_plaintime_class_id, &js_plaintime_class))
+        return -1;
     
     ctor = JS_NewCConstructor(ctx, (int)js_plaintime_class_id, "PlainTime",
                                (JSCFunction *)js_plaintime_constructor, 0,

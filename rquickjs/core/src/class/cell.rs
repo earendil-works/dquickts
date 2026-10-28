@@ -1,10 +1,11 @@
-use super::{Class, JsClass};
+use super::{ffi::ClassCell, Class, JsClass};
 use crate::{result::BorrowError, Ctx, Error, FromJs, IntoJs, Value};
 use core::{
     cell::{Cell, UnsafeCell},
     marker::PhantomData,
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
+    ptr::NonNull,
 };
 
 /// A trait to allow classes to choose there borrowing implementation.
@@ -294,8 +295,29 @@ impl<'a, 'js, T: JsClass<'js>> DerefMut for BorrowMut<'a, 'js, T> {
     }
 }
 
+/// The cell of a class object, resolved once by an owned borrow.
+///
+/// Type erased so that the owned borrows keep the auto traits of [`Class`] (the cell is only a
+/// shortcut to its data).
+struct CellPtr(NonNull<ClassCell<()>>);
+
+impl CellPtr {
+    /// # Safety
+    /// `T` must be the class of the cell, and the cell must be alive for `'a`.
+    unsafe fn get<'a, 'js, T: JsClass<'js>>(&self) -> &'a JsCell<'js, T> {
+        &self.0.cast::<ClassCell<JsCell<'js, T>>>().as_ref().data
+    }
+}
+
 /// An owned borrow of a class object which keeps the borrow alive for the duration of the objects lifetime.
-pub struct OwnedBorrow<'js, T: JsClass<'js> + 'js>(ManuallyDrop<Class<'js, T>>);
+pub struct OwnedBorrow<'js, T: JsClass<'js> + 'js> {
+    class: ManuallyDrop<Class<'js, T>>,
+    /// The cell of `class`, which keeps it alive at the same place.
+    cell: CellPtr,
+}
+
+// SAFETY: `cell` only points to the data of `class`.
+unsafe impl<'js, T: JsClass<'js> + 'js> Send for OwnedBorrow<'js, T> where Class<'js, T>: Send {}
 
 impl<'js, T: JsClass<'js> + 'js> OwnedBorrow<'js, T> {
     /// Borrow a class owned.
@@ -308,16 +330,32 @@ impl<'js, T: JsClass<'js> + 'js> OwnedBorrow<'js, T> {
 
     /// Try to borrow a class owned.
     pub fn try_from_class(class: Class<'js, T>) -> Result<Self, BorrowError> {
-        unsafe {
-            <T::Mutable as Mutability>::borrow(&class.get_cell().cell)?;
-        }
-        Ok(OwnedBorrow(ManuallyDrop::new(class)))
+        let cell = class.get_class_ptr();
+        unsafe { Self::new(class, cell) }
+    }
+
+    /// # Safety
+    /// `cell` must be the cell of `class`.
+    unsafe fn new(
+        class: Class<'js, T>,
+        cell: NonNull<ClassCell<JsCell<'js, T>>>,
+    ) -> Result<Self, BorrowError> {
+        <T::Mutable as Mutability>::borrow(&cell.as_ref().data.cell)?;
+        Ok(OwnedBorrow {
+            class: ManuallyDrop::new(class),
+            cell: CellPtr(cell.cast()),
+        })
+    }
+
+    fn cell(&self) -> &JsCell<'js, T> {
+        // SAFETY: the cell of the class, which `self` keeps alive
+        unsafe { self.cell.get() }
     }
 
     /// Turn the owned borrow back into the class releasing the borrow.
     pub fn into_inner(mut self) -> Class<'js, T> {
-        unsafe { <T::Mutable as Mutability>::unborrow(&self.0.get_cell().cell) };
-        let res = unsafe { ManuallyDrop::take(&mut self.0) };
+        unsafe { <T::Mutable as Mutability>::unborrow(&self.cell().cell) };
+        let res = unsafe { ManuallyDrop::take(&mut self.class) };
         core::mem::forget(self);
         res
     }
@@ -326,8 +364,8 @@ impl<'js, T: JsClass<'js> + 'js> OwnedBorrow<'js, T> {
 impl<'js, T: JsClass<'js> + 'js> Drop for OwnedBorrow<'js, T> {
     fn drop(&mut self) {
         unsafe {
-            <T::Mutable as Mutability>::unborrow(&self.0.get_cell().cell);
-            ManuallyDrop::drop(&mut self.0)
+            <T::Mutable as Mutability>::unborrow(&self.cell().cell);
+            ManuallyDrop::drop(&mut self.class)
         }
     }
 }
@@ -335,14 +373,14 @@ impl<'js, T: JsClass<'js> + 'js> Drop for OwnedBorrow<'js, T> {
 impl<'js, T: JsClass<'js> + 'js> Deref for OwnedBorrow<'js, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
-        unsafe { <T::Mutable as Mutability>::deref(&self.0.get_cell().cell) }
+        unsafe { <T::Mutable as Mutability>::deref(&self.cell().cell) }
     }
 }
 
 impl<'js, T: JsClass<'js>> FromJs<'js> for OwnedBorrow<'js, T> {
-    fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self, Error> {
-        let cls = Class::from_js(ctx, value)?;
-        OwnedBorrow::try_from_class(cls).map_err(Error::ClassBorrow)
+    fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self, Error> {
+        let (class, cell) = Class::from_value_with_cell(value)?;
+        unsafe { OwnedBorrow::new(class, cell) }.map_err(Error::ClassBorrow)
     }
 }
 
@@ -353,7 +391,14 @@ impl<'js, T: JsClass<'js>> IntoJs<'js> for OwnedBorrow<'js, T> {
 }
 
 /// An owned mutable borrow of a class object which keeps the borrow alive for the duration of the objects lifetime.
-pub struct OwnedBorrowMut<'js, T: JsClass<'js> + 'js>(ManuallyDrop<Class<'js, T>>);
+pub struct OwnedBorrowMut<'js, T: JsClass<'js> + 'js> {
+    class: ManuallyDrop<Class<'js, T>>,
+    /// The cell of `class`, which keeps it alive at the same place.
+    cell: CellPtr,
+}
+
+// SAFETY: `cell` only points to the data of `class`.
+unsafe impl<'js, T: JsClass<'js> + 'js> Send for OwnedBorrowMut<'js, T> where Class<'js, T>: Send {}
 
 impl<'js, T: JsClass<'js> + 'js> OwnedBorrowMut<'js, T> {
     /// Borrow a class mutably owned.
@@ -366,16 +411,32 @@ impl<'js, T: JsClass<'js> + 'js> OwnedBorrowMut<'js, T> {
 
     /// Try to borrow a class mutably owned.
     pub fn try_from_class(class: Class<'js, T>) -> Result<Self, BorrowError> {
-        unsafe {
-            <T::Mutable as Mutability>::borrow_mut(&class.get_cell().cell)?;
-        }
-        Ok(OwnedBorrowMut(ManuallyDrop::new(class)))
+        let cell = class.get_class_ptr();
+        unsafe { Self::new(class, cell) }
+    }
+
+    /// # Safety
+    /// `cell` must be the cell of `class`.
+    unsafe fn new(
+        class: Class<'js, T>,
+        cell: NonNull<ClassCell<JsCell<'js, T>>>,
+    ) -> Result<Self, BorrowError> {
+        <T::Mutable as Mutability>::borrow_mut(&cell.as_ref().data.cell)?;
+        Ok(OwnedBorrowMut {
+            class: ManuallyDrop::new(class),
+            cell: CellPtr(cell.cast()),
+        })
+    }
+
+    fn cell(&self) -> &JsCell<'js, T> {
+        // SAFETY: the cell of the class, which `self` keeps alive
+        unsafe { self.cell.get() }
     }
 
     /// Turn the owned borrow back into the class releasing the borrow.
     pub fn into_inner(mut self) -> Class<'js, T> {
-        unsafe { <T::Mutable as Mutability>::unborrow_mut(&self.0.get_cell().cell) };
-        let res = unsafe { ManuallyDrop::take(&mut self.0) };
+        unsafe { <T::Mutable as Mutability>::unborrow_mut(&self.cell().cell) };
+        let res = unsafe { ManuallyDrop::take(&mut self.class) };
         core::mem::forget(self);
         res
     }
@@ -384,8 +445,8 @@ impl<'js, T: JsClass<'js> + 'js> OwnedBorrowMut<'js, T> {
 impl<'js, T: JsClass<'js> + 'js> Drop for OwnedBorrowMut<'js, T> {
     fn drop(&mut self) {
         unsafe {
-            <T::Mutable as Mutability>::unborrow_mut(&self.0.get_cell().cell);
-            ManuallyDrop::drop(&mut self.0)
+            <T::Mutable as Mutability>::unborrow_mut(&self.cell().cell);
+            ManuallyDrop::drop(&mut self.class)
         }
     }
 }
@@ -393,20 +454,20 @@ impl<'js, T: JsClass<'js> + 'js> Drop for OwnedBorrowMut<'js, T> {
 impl<'js, T: JsClass<'js> + 'js> Deref for OwnedBorrowMut<'js, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
-        unsafe { <T::Mutable as Mutability>::deref(&self.0.get_cell().cell) }
+        unsafe { <T::Mutable as Mutability>::deref(&self.cell().cell) }
     }
 }
 
 impl<'js, T: JsClass<'js> + 'js> DerefMut for OwnedBorrowMut<'js, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { <T::Mutable as Mutability>::deref_mut(&self.0.get_cell().cell) }
+        unsafe { <T::Mutable as Mutability>::deref_mut(&self.cell().cell) }
     }
 }
 
 impl<'js, T: JsClass<'js>> FromJs<'js> for OwnedBorrowMut<'js, T> {
-    fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self, Error> {
-        let cls = Class::from_js(ctx, value)?;
-        OwnedBorrowMut::try_from_class(cls).map_err(Error::ClassBorrow)
+    fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self, Error> {
+        let (class, cell) = Class::from_value_with_cell(value)?;
+        unsafe { OwnedBorrowMut::new(class, cell) }.map_err(Error::ClassBorrow)
     }
 }
 

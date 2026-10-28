@@ -210,9 +210,7 @@ int js_add_now(JSContext *ctx, JSValue temporal_obj)
         return -1;
     }
     if (JS_DefinePropertyValueStr(ctx, temporal_obj, "Now", now_obj,
-                                   JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0) {
-        JS_FreeValue(ctx, now_obj);
+                                   JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0)
         return -1;
-    }
     return 0;
 }

@@ -195,6 +195,7 @@ pub const JS_DUMP_MODULE_EXEC: u32 = 2097152;
 pub const JS_DUMP_CLOSURE: u32 = 4194304;
 pub const JS_DUMP_ROPE_REBALANCE: u32 = 8388608;
 pub const JS_ATOM_NULL: u32 = 0;
+pub const JS_ATOM_DATA_BUF_SIZE: u32 = 16;
 pub const JS_CALL_FLAG_CONSTRUCTOR: u32 = 1;
 pub const JS_INVALID_CLASS_ID: u32 = 0;
 pub const JS_HINT_STRING: u32 = 0;
@@ -509,10 +510,7 @@ unsafe extern "C" {
     pub fn JS_NewContext(rt: *mut JSRuntime) -> *mut JSContext;
 }
 unsafe extern "C" {
-    pub fn JS_FreeContext(s: *mut JSContext);
-}
-unsafe extern "C" {
-    pub fn JS_DupContext(ctx: *mut JSContext) -> *mut JSContext;
+    pub fn __JS_FreeContext(ctx: *mut JSContext);
 }
 unsafe extern "C" {
     pub fn JS_GetContextOpaque(ctx: *mut JSContext) -> *mut ::core::ffi::c_void;
@@ -782,6 +780,13 @@ unsafe extern "C" {
     pub fn JS_NewAtom(ctx: *mut JSContext, str_: *const ::core::ffi::c_char) -> JSAtom;
 }
 unsafe extern "C" {
+    pub fn JS_FindAtomLen(
+        ctx: *mut JSContext,
+        str_: *const ::core::ffi::c_char,
+        len: size_t,
+    ) -> JSAtom;
+}
+unsafe extern "C" {
     pub fn JS_NewAtomUInt32(ctx: *mut JSContext, n: u32) -> JSAtom;
 }
 unsafe extern "C" {
@@ -808,6 +813,15 @@ unsafe extern "C" {
         plen: *mut size_t,
         atom: JSAtom,
     ) -> *const ::core::ffi::c_char;
+}
+unsafe extern "C" {
+    pub fn JS_AtomGetStringData(
+        ctx: *mut JSContext,
+        atom: JSAtom,
+        plen: *mut size_t,
+        pwide: *mut ::core::ffi::c_int,
+        buf: *mut ::core::ffi::c_char,
+    ) -> *const ::core::ffi::c_void;
 }
 unsafe extern "C" {
     pub fn JS_ValueToAtom(ctx: *mut JSContext, val: JSValue) -> JSAtom;
@@ -1028,6 +1042,34 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn JS_NewError(ctx: *mut JSContext) -> JSValue;
 }
+pub const JSErrorEnum_JS_EVAL_ERROR: JSErrorEnum = 0;
+pub const JSErrorEnum_JS_RANGE_ERROR: JSErrorEnum = 1;
+pub const JSErrorEnum_JS_REFERENCE_ERROR: JSErrorEnum = 2;
+pub const JSErrorEnum_JS_SYNTAX_ERROR: JSErrorEnum = 3;
+pub const JSErrorEnum_JS_TYPE_ERROR: JSErrorEnum = 4;
+pub const JSErrorEnum_JS_URI_ERROR: JSErrorEnum = 5;
+pub const JSErrorEnum_JS_INTERNAL_ERROR: JSErrorEnum = 6;
+pub const JSErrorEnum_JS_AGGREGATE_ERROR: JSErrorEnum = 7;
+pub const JSErrorEnum_JS_SUPPRESSED_ERROR: JSErrorEnum = 8;
+pub const JSErrorEnum_JS_NATIVE_ERROR_COUNT: JSErrorEnum = 9;
+pub const JSErrorEnum_JS_PLAIN_ERROR: JSErrorEnum = 9;
+pub type JSErrorEnum = ::core::ffi::c_uint;
+unsafe extern "C" {
+    pub fn JS_NewErrorLen(
+        ctx: *mut JSContext,
+        error_num: JSErrorEnum,
+        msg: *const ::core::ffi::c_char,
+        len: size_t,
+    ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_ThrowErrorLen(
+        ctx: *mut JSContext,
+        error_num: JSErrorEnum,
+        msg: *const ::core::ffi::c_char,
+        len: size_t,
+    ) -> JSValue;
+}
 unsafe extern "C" {
     pub fn JS_NewSyntaxError(ctx: *mut JSContext, fmt: *const ::core::ffi::c_char, ...) -> JSValue;
 }
@@ -1188,6 +1230,9 @@ unsafe extern "C" {
     pub fn JS_NewStringUTF16(ctx: *mut JSContext, buf: *const u16, len: size_t) -> JSValue;
 }
 unsafe extern "C" {
+    pub fn JS_NewStringLatin1Len(ctx: *mut JSContext, buf: *const u8, len: size_t) -> JSValue;
+}
+unsafe extern "C" {
     pub fn JS_NewAtomString(ctx: *mut JSContext, str_: *const ::core::ffi::c_char) -> JSValue;
 }
 unsafe extern "C" {
@@ -1213,6 +1258,14 @@ unsafe extern "C" {
         plen: *mut size_t,
         val1: JSValue,
     ) -> *const u16;
+}
+unsafe extern "C" {
+    pub fn JS_GetStringData(
+        ctx: *mut JSContext,
+        val: JSValue,
+        plen: *mut size_t,
+        pwide: *mut ::core::ffi::c_int,
+    ) -> *const ::core::ffi::c_void;
 }
 unsafe extern "C" {
     pub fn JS_FreeCString(ctx: *mut JSContext, ptr: *const ::core::ffi::c_char);
@@ -1271,6 +1324,9 @@ unsafe extern "C" {
     ) -> JSValue;
 }
 unsafe extern "C" {
+    pub fn JS_NewObjectSetIsDefine(ctx: *mut JSContext, prop: JSAtom) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn JS_NewObjectFromStr(
         ctx: *mut JSContext,
         count: ::core::ffi::c_int,
@@ -1313,6 +1369,17 @@ unsafe extern "C" {
         count: ::core::ffi::c_int,
         values: *const JSValue,
     ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_GetStdArrayPrototypeFlag(ctx: *mut JSContext) -> *const ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn JS_GetFastArray(
+        ctx: *mut JSContext,
+        obj: JSValue,
+        pvalues: *mut *mut JSValue,
+        plen: *mut u32,
+    ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
     pub fn JS_GetLength(ctx: *mut JSContext, obj: JSValue, pres: *mut i64) -> ::core::ffi::c_int;
@@ -1371,6 +1438,14 @@ unsafe extern "C" {
     ) -> JSValue;
 }
 unsafe extern "C" {
+    pub fn JS_GetPropertyStrLen(
+        ctx: *mut JSContext,
+        this_obj: JSValue,
+        prop: *const ::core::ffi::c_char,
+        len: size_t,
+    ) -> JSValue;
+}
+unsafe extern "C" {
     pub fn JS_GetPropertyUint32(ctx: *mut JSContext, this_obj: JSValue, idx: u32) -> JSValue;
 }
 unsafe extern "C" {
@@ -1414,6 +1489,15 @@ unsafe extern "C" {
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    pub fn JS_SetPropertyStrLen(
+        ctx: *mut JSContext,
+        this_obj: JSValue,
+        prop: *const ::core::ffi::c_char,
+        len: size_t,
+        val: JSValue,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn JS_SetPropertyValue(
         ctx: *mut JSContext,
         this_obj: JSValue,
@@ -1427,6 +1511,14 @@ unsafe extern "C" {
         ctx: *mut JSContext,
         this_obj: JSValue,
         prop: JSAtom,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn JS_HasPropertyStrLen(
+        ctx: *mut JSContext,
+        this_obj: JSValue,
+        prop: *const ::core::ffi::c_char,
+        len: size_t,
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
@@ -1463,6 +1555,14 @@ unsafe extern "C" {
     pub fn JS_GetOwnPropertyNames(
         ctx: *mut JSContext,
         ptab: *mut *mut JSPropertyEnum,
+        plen: *mut u32,
+        obj: JSValue,
+        flags: ::core::ffi::c_int,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn JS_GetOwnPropertyCount(
+        ctx: *mut JSContext,
         plen: *mut u32,
         obj: JSValue,
         flags: ::core::ffi::c_int,
@@ -1748,6 +1848,15 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn JS_GetUint8Array(ctx: *mut JSContext, psize: *mut size_t, obj: JSValue) -> *mut u8;
 }
+unsafe extern "C" {
+    pub fn JS_GetTypedArrayData(
+        ctx: *mut JSContext,
+        obj: JSValue,
+        pbyte_offset: *mut size_t,
+        pbyte_length: *mut size_t,
+        pbytes_per_element: *mut size_t,
+    ) -> *mut u8;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct JSSharedArrayBufferFunctions {
@@ -1875,6 +1984,9 @@ unsafe extern "C" {
         rt: *mut JSRuntime,
         popaque: *mut *mut ::core::ffi::c_void,
     ) -> JSInterruptHandler;
+}
+unsafe extern "C" {
+    pub fn JS_TriggerInterruptHandler(ctx: *mut JSContext);
 }
 unsafe extern "C" {
     pub fn JS_RequestSuspend(rt: *mut JSRuntime);
@@ -2011,6 +2123,13 @@ unsafe extern "C" {
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    pub fn JS_ExecutePendingJobs(
+        rt: *mut JSRuntime,
+        max_jobs: ::core::ffi::c_int,
+        pctx: *mut *mut JSContext,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn JS_WriteObject(
         ctx: *mut JSContext,
         psize: *mut size_t,
@@ -2051,6 +2170,17 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn JS_ResolveModule(ctx: *mut JSContext, obj: JSValue) -> ::core::ffi::c_int;
+}
+pub type JSCodeNameFunc = ::core::option::Option<
+    unsafe extern "C" fn(ctx: *mut JSContext, name: JSAtom, opaque: *mut ::core::ffi::c_void),
+>;
+unsafe extern "C" {
+    pub fn JS_EnumCodeNames(
+        ctx: *mut JSContext,
+        obj: JSValue,
+        func: JSCodeNameFunc,
+        opaque: *mut ::core::ffi::c_void,
+    ) -> ::core::ffi::c_int;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -2572,6 +2702,13 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn JS_GetModulePrivateValue(ctx: *mut JSContext, m: *mut JSModuleDef) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_SetModuleAttributes(
+        ctx: *mut JSContext,
+        m: *mut JSModuleDef,
+        attributes: JSValue,
+    ) -> ::core::ffi::c_int;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]

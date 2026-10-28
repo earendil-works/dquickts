@@ -58,7 +58,13 @@ int lre_parse_escape(const uint8_t **pp, int allow_utf16);
 
 /* must be provided by the user, return non zero if overflow */
 int lre_check_stack_overflow(void *opaque, size_t alloca_size);
-/* must be provided by the user, return non zero if time out */
+/* must be provided by the user: return the step counter shared with
+   the user. It is decremented at the backtracking points of
+   lre_exec() and lre_check_timeout() is called when it reaches zero. */
+int *lre_get_interrupt_counter(void *opaque);
+/* must be provided by the user, return non zero if time out. It must
+   reset the counter returned by lre_get_interrupt_counter() to a
+   positive value. */
 int lre_check_timeout(void *opaque);
 void *lre_realloc(void *opaque, void *ptr, size_t size);
 

@@ -1,6 +1,7 @@
 use super::{FromParams, IntoJsFunc, ParamRequirement, Params};
 use crate::{
     function::types::{MutFn, OnceFn},
+    qjs,
     result::{BorrowError, Error},
     IntoJs, Result, Value,
 };
@@ -9,6 +10,18 @@ use crate::{
 use crate::{function::types::Async, promise::Promised};
 #[cfg(feature = "futures")]
 use core::future::Future;
+
+/// [`IntoJsFunc::call`] through [`IntoJsFunc::call_raw`], which the impls implement.
+#[inline]
+fn call_value<'js, P, F>(f: &F, params: Params<'_, 'js>) -> Result<Value<'js>>
+where
+    F: IntoJsFunc<'js, P>,
+{
+    let ctx = params.ctx().clone();
+    let value = <F as IntoJsFunc<'js, P>>::call_raw(f, params)?;
+    // SAFETY: an owned value of the context of the call
+    Ok(unsafe { Value::from_js_value(ctx, value) })
+}
 
 macro_rules! impl_to_js_function {
     ($($t:ident),*$(,)?) => {
@@ -19,16 +32,22 @@ macro_rules! impl_to_js_function {
             R: IntoJs<'js> + 'js,
         {
 
+            #[inline]
             fn param_requirements() -> ParamRequirement {
                 <($($t,)*)>::param_requirements()
             }
 
-            #[allow(non_snake_case)]
             fn call(&self, params: Params<'_, 'js>) -> Result<Value<'js>> {
-                let ctx = params.ctx().clone();
-                let ($($t,)*) = <($($t,)*)>::from_params(&mut params.access())?;
+                call_value::<($($t,)*), Self>(self, params)
+            }
+
+            #[allow(non_snake_case)]
+            #[inline]
+            fn call_raw(&self, params: Params<'_, 'js>) -> Result<qjs::JSValue> {
+                let mut params = params.access();
+                let ($($t,)*) = <($($t,)*)>::from_params(&mut params)?;
                 let r = (self)($($t),*);
-                r.into_js(&ctx)
+                r.into_js_raw(params.ctx())
             }
         }
 
@@ -41,16 +60,22 @@ macro_rules! impl_to_js_function {
             R: IntoJs<'js> + 'js,
         {
 
+            #[inline]
             fn param_requirements() -> ParamRequirement {
                 <($($t,)*)>::param_requirements()
             }
 
-            #[allow(non_snake_case)]
             fn call(&self, params: Params<'_, 'js>) -> Result<Value<'js>> {
-                let ctx = params.ctx().clone();
-                let ($($t,)*) = <($($t,)*)>::from_params(&mut params.access())?;
+                call_value::<($($t,)*), Self>(self, params)
+            }
+
+            #[allow(non_snake_case)]
+            #[inline]
+            fn call_raw(&self, params: Params<'_, 'js>) -> Result<qjs::JSValue> {
+                let mut params = params.access();
+                let ($($t,)*) = <($($t,)*)>::from_params(&mut params)?;
                 let fut = (self.0)($($t),*);
-                Promised(fut).into_js(&ctx)
+                Promised(fut).into_js_raw(params.ctx())
             }
         }
 
@@ -62,17 +87,23 @@ macro_rules! impl_to_js_function {
             R: IntoJs<'js> + 'js,
         {
 
+            #[inline]
             fn param_requirements() -> ParamRequirement {
                 <($($t,)*)>::param_requirements()
             }
 
-            #[allow(non_snake_case)]
             fn call(&self, params: Params<'_, 'js>) -> Result<Value<'js>> {
-                let ctx = params.ctx().clone();
-                let ($($t,)*) = <($($t,)*)>::from_params(&mut params.access())?;
+                call_value::<($($t,)*), Self>(self, params)
+            }
+
+            #[allow(non_snake_case)]
+            #[inline]
+            fn call_raw(&self, params: Params<'_, 'js>) -> Result<qjs::JSValue> {
+                let mut params = params.access();
+                let ($($t,)*) = <($($t,)*)>::from_params(&mut params)?;
                 let mut lock = self.0.try_borrow_mut().map_err(|_| Error::FunctionBorrow(BorrowError::AlreadyBorrowed))?;
                 let r = (lock)($($t),*);
-                r.into_js(&ctx)
+                r.into_js_raw(params.ctx())
             }
         }
 
@@ -85,17 +116,23 @@ macro_rules! impl_to_js_function {
             R: IntoJs<'js> + 'js,
         {
 
+            #[inline]
             fn param_requirements() -> ParamRequirement {
                 <($($t,)*)>::param_requirements()
             }
 
-            #[allow(non_snake_case)]
             fn call(&self, params: Params<'_, 'js>) -> Result<Value<'js>> {
-                let ctx = params.ctx().clone();
-                let ($($t,)*) = <($($t,)*)>::from_params(&mut params.access())?;
+                call_value::<($($t,)*), Self>(self, params)
+            }
+
+            #[allow(non_snake_case)]
+            #[inline]
+            fn call_raw(&self, params: Params<'_, 'js>) -> Result<qjs::JSValue> {
+                let mut params = params.access();
+                let ($($t,)*) = <($($t,)*)>::from_params(&mut params)?;
                 let mut lock = self.0.0.try_borrow_mut().map_err(|_| Error::FunctionBorrow(BorrowError::AlreadyBorrowed))?;
                 let fut = (lock)($($t),*);
-                Promised(fut).into_js(&ctx)
+                Promised(fut).into_js_raw(params.ctx())
             }
         }
 
@@ -106,17 +143,23 @@ macro_rules! impl_to_js_function {
             R: IntoJs<'js> + 'js,
         {
 
+            #[inline]
             fn param_requirements() -> ParamRequirement {
                 <($($t,)*)>::param_requirements()
             }
 
-            #[allow(non_snake_case)]
             fn call(&self, params: Params<'_, 'js>) -> Result<Value<'js>> {
-                let ctx = params.ctx().clone();
-                let ($($t,)*) = <($($t,)*)>::from_params(&mut params.access())?;
+                call_value::<($($t,)*), Self>(self, params)
+            }
+
+            #[allow(non_snake_case)]
+            #[inline]
+            fn call_raw(&self, params: Params<'_, 'js>) -> Result<qjs::JSValue> {
+                let mut params = params.access();
+                let ($($t,)*) = <($($t,)*)>::from_params(&mut params)?;
                 let lock = self.0.take().ok_or(Error::FunctionBorrow(BorrowError::AlreadyUsed))?;
                 let r = (lock)($($t),*);
-                r.into_js(&ctx)
+                r.into_js_raw(params.ctx())
             }
         }
 
@@ -129,17 +172,23 @@ macro_rules! impl_to_js_function {
             R: IntoJs<'js> + 'js,
         {
 
+            #[inline]
             fn param_requirements() -> ParamRequirement {
                 <($($t,)*)>::param_requirements()
             }
 
-            #[allow(non_snake_case)]
             fn call(&self, params: Params<'_, 'js>) -> Result<Value<'js>> {
-                let ctx = params.ctx().clone();
-                let ($($t,)*) = <($($t,)*)>::from_params(&mut params.access())?;
+                call_value::<($($t,)*), Self>(self, params)
+            }
+
+            #[allow(non_snake_case)]
+            #[inline]
+            fn call_raw(&self, params: Params<'_, 'js>) -> Result<qjs::JSValue> {
+                let mut params = params.access();
+                let ($($t,)*) = <($($t,)*)>::from_params(&mut params)?;
                 let lock = self.0.0.take().ok_or(Error::FunctionBorrow(BorrowError::AlreadyUsed))?;
                 let fut = (lock)($($t),*);
-                Promised(fut).into_js(&ctx)
+                Promised(fut).into_js_raw(params.ctx())
             }
         }
     };

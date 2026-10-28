@@ -324,31 +324,28 @@ impl AsyncRuntime {
 
         let f = ManualPoll::new(|cx| {
             loop {
-                let pending = lock.runtime.execute_pending_job().map_err(|e| {
+                // Run all the pending jobs in one call, stopping at a job which throws: the
+                // scheduler is polled after the batch or the error, as with one job at a time.
+                let res = lock.runtime.execute_pending_jobs(None).map_err(|e| {
                     let ptr = NonNull::new(e)
                         .expect("executing pending job returned a null context on error");
-                    // JS_ExecutePendingJob returns a borrowed context pointer;
+                    // JS_ExecutePendingJobs returns a borrowed context pointer;
                     // dup it so AsyncContext can own a reference.
                     unsafe { qjs::JS_DupContext(ptr.as_ptr()) };
                     AsyncJobException(unsafe { AsyncContext::from_raw(ptr, self.clone()) })
                 });
-                match pending {
-                    Err(e) => {
-                        // SAFETY: Runtime is already locked so creating a context is safe.
-                        let ctx = unsafe { Ctx::from_ptr(e.0 .0.ctx().as_ptr()) };
-                        let err = ctx.catch();
-                        if let Some(_x) = err.clone().into_object().and_then(Exception::from_object)
-                        {
-                            // TODO do something better with errors.
-                            #[cfg(feature = "std")]
-                            println!("error executing job: {}", _x);
-                        } else {
-                            #[cfg(feature = "std")]
-                            println!("error executing job: {:?}", err);
-                        }
+                if let Err(e) = res {
+                    // SAFETY: Runtime is already locked so creating a context is safe.
+                    let ctx = unsafe { Ctx::from_ptr(e.0 .0.ctx().as_ptr()) };
+                    let err = ctx.catch();
+                    if let Some(_x) = err.clone().into_object().and_then(Exception::from_object) {
+                        // TODO do something better with errors.
+                        #[cfg(feature = "std")]
+                        println!("error executing job: {}", _x);
+                    } else {
+                        #[cfg(feature = "std")]
+                        println!("error executing job: {:?}", err);
                     }
-                    Ok(true) => continue,
-                    Ok(false) => {}
                 }
 
                 match lock.runtime.get_opaque().poll(cx) {
@@ -441,6 +438,30 @@ mod test {
             *a_ref += 1;
         }).await;
         assert_eq!(a,2);
+    });
+
+    async_test_case!(idle_stops_at_job_error => (rt,ctx){
+        ctx.async_with(async |ctx|{
+            ctx.eval::<(), _>("globalThis.ran = 0; globalThis.f = () => { ran++ };").unwrap();
+            let f: Function = ctx.globals().get("f").unwrap();
+            let thrower: Function = ctx.eval("() => { throw new Error('boom') }").unwrap();
+            f.defer(()).unwrap();
+            thrower.defer(()).unwrap();
+            f.defer(()).unwrap();
+        }).await;
+        assert!(rt.is_job_pending().await);
+        // idle() reports the error of the second job and returns, as the scheduler is empty:
+        // the third job stays pending
+        rt.idle().await;
+        assert!(rt.is_job_pending().await);
+        ctx.async_with(async |ctx|{
+            assert_eq!(ctx.globals().get::<_, i32>("ran").unwrap(), 1);
+        }).await;
+        rt.idle().await;
+        assert!(!rt.is_job_pending().await);
+        ctx.async_with(async |ctx|{
+            assert_eq!(ctx.globals().get::<_, i32>("ran").unwrap(), 2);
+        }).await;
     });
 
     async_test_case!(drive => (rt,ctx){

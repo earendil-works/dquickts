@@ -1439,8 +1439,8 @@ static const JSCFunctionListEntry js_durationformat_static_funcs[] = {
 
 int js_add_durationformat(JSContext *ctx, JSValue intl_obj)
 {
-    JS_NewClassID(&js_durationformat_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_durationformat_class_id, &js_durationformat_class);
+    if (js_intl_new_class(ctx, &js_durationformat_class_id, &js_durationformat_class))
+        return -1;
 
     if (JS_IsException(js_intl_new_constructor(ctx, intl_obj,
                                                 JS_INTL_CTOR_DURATIONFORMAT,

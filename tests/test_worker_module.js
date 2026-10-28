@@ -17,6 +17,12 @@ function handle_msg(e) {
         ev.buf[2] = 10;
         parent.postMessage({ type: "sab_done", buf: ev.buf });
         break;
+    case "grow_sab":
+        /* grow the SharedArrayBuffer shared with the parent */
+        ev.sab.grow(8);
+        new Uint8Array(ev.sab)[7] = 7;
+        parent.postMessage({ type: "grow_sab_done" });
+        break;
     }
 }
 

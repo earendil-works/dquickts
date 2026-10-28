@@ -75,7 +75,12 @@ int ti_parse_temporal_timezone_string(const char *str, int64_t *offset_ns)
                     break;
                 }
             }
-            if (valid_iana && inner_len > 0) {
+            if (valid_iana && inner_len < TI_TIMEZONE_BUF_SIZE) {
+                char name[TI_TIMEZONE_BUF_SIZE];
+                memcpy(name, bracket_open + 1, inner_len);
+                name[inner_len] = '\0';
+                if (ti_tz_find_id(name) < 0)
+                    return -1;
                 *offset_ns = 0;
             } else {
                 return -1;
@@ -242,7 +247,7 @@ int ti_parse_temporal_timezone_string(const char *str, int64_t *offset_ns)
                 break;
             }
         }
-        if (valid_iana && len > 0) {
+        if (valid_iana && len > 0 && ti_tz_find_id(str) >= 0) {
             *offset_ns = 0;
             return 0;
         }
@@ -251,14 +256,34 @@ int ti_parse_temporal_timezone_string(const char *str, int64_t *offset_ns)
     return -1;
 }
 
-/* Return the default time zone identifier from the TZ environment variable.
-   Returns a newly allocated string, or NULL if not set or empty. */
+/* Set 'buf' to the zone name of a TZ value or of a zoneinfo file path if
+   it is an available time zone */
+static BOOL ti_set_default_timezone_name(char *buf, size_t buf_size,
+                                         const char *name)
+{
+    const char *p;
+    if (name[0] == ':')
+        name++;
+    p = strstr(name, "/zoneinfo/");
+    if (p)
+        name = p + 10;
+    if (ti_tz_find_id(name) < 0)
+        return FALSE;
+    pstrcpy(buf, buf_size, name);
+    return TRUE;
+}
+
+/* Return the default time zone identifier: the TZ environment variable
+   if it names an available zone, then the system zone, otherwise an
+   offset zone computed from the current local time. */
 void ti_get_default_timezone(char *buf, size_t buf_size)
 {
     const char *tz = getenv("TZ");
     if (tz && tz[0]) {
-        pstrcpy(buf, buf_size, tz);
-        return;
+        if (ti_set_default_timezone_name(buf, buf_size, tz))
+            return;
+        /* POSIX TZ rule string: use the current offset */
+        goto offset_fallback;
     }
 #if !defined(_WIN32)
     {
@@ -268,30 +293,27 @@ void ti_get_default_timezone(char *buf, size_t buf_size)
             const char *p;
             linkbuf[len] = '\0';
             p = strstr(linkbuf, "/zoneinfo/");
-            if (p) {
-                pstrcpy(buf, buf_size, p + 10);
+            if (p && ti_set_default_timezone_name(buf, buf_size, p))
                 return;
-            }
         }
     }
     {
         FILE *f = fopen("/etc/timezone", "r");
         if (f) {
             char line[256];
-            if (fgets(line, sizeof(line), f)) {
+            BOOL ok = fgets(line, sizeof(line), f) != NULL;
+            fclose(f);
+            if (ok) {
                 size_t len = strlen(line);
                 if (len > 0 && line[len - 1] == '\n')
                     line[len - 1] = '\0';
-                fclose(f);
-                if (line[0]) {
-                    pstrcpy(buf, buf_size, line);
+                if (line[0] && ti_set_default_timezone_name(buf, buf_size, line))
                     return;
-                }
             }
-            fclose(f);
         }
     }
-#endif    
+#endif
+ offset_fallback:
     /* fallback: compute offset from localtime */
     {
         time_t t = time(NULL);
@@ -3506,6 +3528,7 @@ int JS_AddIntrinsicTemporal(JSContext *ctx)
     
     ret = JS_DefinePropertyValueStr(ctx, global_obj, "Temporal", temporal_obj,
                                     JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    temporal_obj = JS_UNDEFINED;
     if (ret < 0)
         goto fail;
     
@@ -3521,9 +3544,16 @@ int JS_AddIntrinsicTemporal(JSContext *ctx)
             }
             if (!JS_IsUndefined(date_proto)) {
                 JSValue func = JS_NewCFunction(ctx, js_date_toTemporalInstant, "toTemporalInstant", 0);
-                JS_DefinePropertyValueStr(ctx, date_proto, "toTemporalInstant", func,
-                                          JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+                if (JS_IsException(func))
+                    ret = -1;
+                else
+                    ret = JS_DefinePropertyValueStr(ctx, date_proto, "toTemporalInstant", func,
+                                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
                 JS_FreeValue(ctx, date_proto);
+                if (ret < 0) {
+                    JS_FreeValue(ctx, date_ctor);
+                    goto fail;
+                }
             }
             JS_FreeValue(ctx, date_ctor);
         }
@@ -3710,7 +3740,7 @@ int ti_canonicalize_timezone_identifier(const char *str, int64_t offset_ns, char
                     break;
                 }
             }
-            if (is_iana) {
+            if (is_iana && ti_tz_find_id(str) >= 0) {
                 pstrcpy(out, (int)out_size, str);
                 return 0;
             }
@@ -3856,6 +3886,10 @@ int ti_validate_timezone_identifier(JSContext *ctx, JSValueConst v, const char *
             JS_FreeCString(ctx, str);
             return JS_ThrowRangeError(ctx, "invalid time zone"), -1;
         }
+    }
+    if (str[0] != '+' && str[0] != '-' && ti_tz_find_id(str) < 0) {
+        JS_FreeCString(ctx, str);
+        return JS_ThrowRangeError(ctx, "invalid time zone"), -1;
     }
     *out_str = str;
     return 1;

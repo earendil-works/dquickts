@@ -1,115 +1,135 @@
 use crate::{
+    class::{Borrow, BorrowMut, JsCell, JsClass},
     function::{Exhaustive, Flat, FuncArg, Opt, Rest, This},
-    qjs, Ctx, FromJs, Result, Value,
+    qjs, Ctx, Error, FromJs, Result, Value,
 };
-use alloc::{borrow::Cow, vec::Vec};
-use core::{mem::size_of, slice};
+use alloc::vec::Vec;
+use core::{marker::PhantomData, mem::ManuallyDrop};
 
 /// A struct which contains the values a callback is called with.
 ///
 /// Arguments retrieved from the JavaScript side for calling Rust functions.
 pub struct Params<'a, 'js> {
-    ctx: Ctx<'js>,
-    function: qjs::JSValue,
-    this: qjs::JSValue,
-    args: Cow<'a, [qjs::JSValue]>,
+    /// The context of the call, uncounted: the engine keeps it alive during the call, which
+    /// the params can't outlive (they are only lent to the callbacks for an unnamed `'a`).
+    ctx: ManuallyDrop<Ctx<'js>>,
+    function: qjs::JSValueConst,
+    this: qjs::JSValueConst,
+    /// The arguments, read with `read_unaligned`: QuickJS only guarantees four-byte alignment
+    /// of `argv` on 32-bit MSVC.
+    argv: *const qjs::JSValue,
+    argc: usize,
     is_constructor: bool,
+    /// The arguments and the values borrowed from the caller for the call, which outlives the
+    /// params (and the context).
+    _marker: PhantomData<&'a [Ctx<'js>]>,
 }
 
 impl<'a, 'js> Params<'a, 'js> {
     /// Create params from the arguments returned by the class callback.
+    ///
+    /// # Safety
+    /// The arguments must be the ones of a call of the context `ctx`, which keeps them and the
+    /// context alive for `'a`.
+    #[inline]
     pub(crate) unsafe fn from_ffi_class(
         ctx: *mut qjs::JSContext,
-        function: qjs::JSValue,
-        this: qjs::JSValue,
+        function: qjs::JSValueConst,
+        this: qjs::JSValueConst,
         argc: qjs::c_int,
-        argv: *mut qjs::JSValue,
+        argv: *const qjs::JSValue,
         flags: qjs::c_int,
     ) -> Self {
-        let args: Cow<'a, [qjs::JSValue]> = if argv.is_null() {
+        let argc = if argv.is_null() {
             assert_eq!(
                 argc, 0,
                 "got a null pointer from quickjs for a non-zero number of args"
             );
-            Cow::Borrowed(&[])
+            0
         } else {
-            let argc = usize::try_from(argc).expect("invalid argument number");
-            if argv.is_aligned() {
-                Cow::Borrowed(slice::from_raw_parts(argv, argc))
-            } else {
-                // QuickJS only guarantees four-byte alignment here on 32-bit MSVC.
-                let bytes = argv.cast::<u8>();
-                Cow::Owned(
-                    (0..argc)
-                        .map(|index| {
-                            bytes
-                                .add(index * size_of::<qjs::JSValue>())
-                                .cast::<qjs::JSValue>()
-                                .read_unaligned()
-                        })
-                        .collect(),
-                )
-            }
+            usize::try_from(argc).expect("invalid argument number")
         };
 
         let is_constructor = (flags & qjs::JS_CALL_FLAG_CONSTRUCTOR as qjs::c_int) != 0;
 
         Self {
-            ctx: Ctx::from_ptr(ctx),
+            ctx: Ctx::from_ptr_uncounted(ctx),
             function,
             this,
-            args,
+            argv,
+            argc,
             is_constructor,
+            _marker: PhantomData,
         }
     }
 
+    /// The argument at `index`, which must be smaller than the number of arguments.
+    #[inline]
+    unsafe fn raw_arg(&self, index: usize) -> qjs::JSValueConst {
+        debug_assert!(index < self.argc);
+        self.argv.add(index).read_unaligned()
+    }
+
     /// Checks if the parameters fit the param num requirements.
+    #[inline]
     pub fn check_params(&self, num: ParamRequirement) -> Result<()> {
-        if self.args.len() < num.min {
-            return Err(crate::Error::MissingArgs {
-                expected: num.min,
-                given: self.args.len(),
-            });
-        }
-        if num.exhaustive && self.args.len() > num.max {
-            return Err(crate::Error::TooManyArgs {
-                expected: num.max,
-                given: self.args.len(),
-            });
+        let given = self.argc;
+        if given < num.min || (num.exhaustive && given > num.max) {
+            return Err(Self::param_error(num, given));
         }
         Ok(())
     }
 
+    #[cold]
+    fn param_error(num: ParamRequirement, given: usize) -> crate::Error {
+        if given < num.min {
+            crate::Error::MissingArgs {
+                expected: num.min,
+                given,
+            }
+        } else {
+            crate::Error::TooManyArgs {
+                expected: num.max,
+                given,
+            }
+        }
+    }
+
     /// Returns the context associated with call.
+    #[inline]
     pub fn ctx(&self) -> &Ctx<'js> {
         &self.ctx
     }
 
     /// Returns the value on which this function called. i.e. in `bla.foo()` the `foo` value.
     pub fn function(&self) -> Value<'js> {
-        unsafe { Value::from_js_value_const(self.ctx.clone(), self.function) }
+        unsafe { Value::from_js_value_const(self.ctx().clone(), self.function) }
     }
 
     /// Returns the this on which this function called. i.e. in `bla.foo()` the `bla` value.
     pub fn this(&self) -> Value<'js> {
-        unsafe { Value::from_js_value_const(self.ctx.clone(), self.this) }
+        unsafe { Value::from_js_value_const(self.ctx().clone(), self.this) }
     }
 
     /// Returns the argument at a given index..
     pub fn arg(&self, index: usize) -> Option<Value<'js>> {
-        self.args
-            .get(index)
-            .map(|arg| unsafe { Value::from_js_value_const(self.ctx.clone(), *arg) })
+        if index < self.argc {
+            let arg = unsafe { self.raw_arg(index) };
+            Some(unsafe { Value::from_js_value_const(self.ctx().clone(), arg) })
+        } else {
+            None
+        }
     }
 
     /// Returns the number of arguments.
+    #[inline]
     pub fn len(&self) -> usize {
-        self.args.len()
+        self.argc
     }
 
     /// Returns if there are no arguments
     pub fn is_empty(&self) -> bool {
-        self.args.is_empty()
+        self.argc == 0
     }
 
     /// Returns if the function is called as a constructor.
@@ -120,6 +140,7 @@ impl<'a, 'js> Params<'a, 'js> {
     }
 
     /// Turns the params into an accessor object for extracting the arguments.
+    #[inline]
     pub fn access(self) -> ParamsAccessor<'a, 'js> {
         ParamsAccessor {
             params: self,
@@ -136,6 +157,7 @@ pub struct ParamsAccessor<'a, 'js> {
 
 impl<'a, 'js> ParamsAccessor<'a, 'js> {
     /// Returns the context associated with the params.
+    #[inline]
     pub fn ctx(&self) -> &Ctx<'js> {
         self.params.ctx()
     }
@@ -150,30 +172,160 @@ impl<'a, 'js> ParamsAccessor<'a, 'js> {
         self.params.function()
     }
 
+    /// Returns the next argument, borrowed from the caller.
+    ///
+    /// # Panic
+    /// This function panics if it is called more times then there are arguments.
+    #[inline]
+    fn next_raw(&mut self) -> qjs::JSValueConst {
+        assert!(self.offset < self.params.argc, "arg called too many times");
+        let res = unsafe { self.params.raw_arg(self.offset) };
+        self.offset += 1;
+        res
+    }
+
     /// Returns the next arguments.
     ///
     /// Each call to this function returns a different argument
     ///
     /// # Panic
     /// This function panics if it is called more times then there are arguments.
+    #[inline]
     pub fn arg(&mut self) -> Value<'js> {
-        assert!(
-            self.offset < self.params.args.len(),
-            "arg called too many times"
-        );
-        let res = self.params.args[self.offset];
-        self.offset += 1;
-        // TODO: figure out ownership
-        unsafe { Value::from_js_value_const(self.params.ctx.clone(), res) }
+        let res = self.next_raw();
+        unsafe { Value::from_js_value_const(self.params.ctx().clone(), res) }
+    }
+
+    /// Returns the next argument together with the context of the call.
+    ///
+    /// Same as [`ParamsAccessor::arg`], but the context is borrowed alongside the argument so it
+    /// can be passed to [`FromJs::from_js`] without cloning it.
+    ///
+    /// # Panic
+    /// This function panics if it is called more times then there are arguments.
+    #[inline]
+    pub fn ctx_and_arg(&mut self) -> (&Ctx<'js>, Value<'js>) {
+        let arg = self.arg();
+        (self.params.ctx(), arg)
+    }
+
+    /// Converts the next argument with [`FromJs`].
+    ///
+    /// # Panic
+    /// This function panics if it is called more times then there are arguments.
+    #[inline]
+    pub fn arg_from_js<T: FromJs<'js>>(&mut self) -> Result<T> {
+        let arg = self.next_raw();
+        // SAFETY: an argument of the call, alive during it
+        unsafe { T::from_js_raw(self.params.ctx(), arg) }
+    }
+
+    /// Borrows the instance of the class `C` which the function is called on.
+    ///
+    /// Used by the `#[methods]` macro for `&self`: unlike `This<OwnedBorrow<C>>` the borrow
+    /// doesn't hold a reference to the object, which the caller keeps alive during the call.
+    #[doc(hidden)]
+    #[inline]
+    pub fn this_borrow<C>(&self) -> Result<Borrow<'a, 'js, C>>
+    where
+        C: JsClass<'js> + 'a,
+    {
+        // SAFETY: `this` is kept alive by the caller during the call, which outlives `'a`
+        let cell = unsafe { call_value_cell::<C>(self.params.ctx(), self.params.this)? };
+        cell.try_borrow().map_err(Error::ClassBorrow)
+    }
+
+    /// Borrows the instance of the class `C` which the function is called on mutably.
+    ///
+    /// Used by the `#[methods]` macro for `&mut self`, see [`ParamsAccessor::this_borrow`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn this_borrow_mut<C>(&self) -> Result<BorrowMut<'a, 'js, C>>
+    where
+        C: JsClass<'js> + 'a,
+    {
+        // SAFETY: `this` is kept alive by the caller during the call, which outlives `'a`
+        let cell = unsafe { call_value_cell::<C>(self.params.ctx(), self.params.this)? };
+        cell.try_borrow_mut().map_err(Error::ClassBorrow)
+    }
+
+    /// Borrows the next argument, an instance of the class `C`.
+    ///
+    /// Used by the `#[function]` and `#[methods]` macros for `&C` parameters, see
+    /// [`ParamsAccessor::this_borrow`].
+    ///
+    /// # Panic
+    /// This function panics if it is called more times then there are arguments.
+    #[doc(hidden)]
+    #[inline]
+    pub fn arg_borrow<C>(&mut self) -> Result<Borrow<'a, 'js, C>>
+    where
+        C: JsClass<'js> + 'a,
+    {
+        let arg = self.next_raw();
+        // SAFETY: the arguments are kept alive by the caller during the call, which outlives `'a`
+        let cell = unsafe { call_value_cell::<C>(self.params.ctx(), arg)? };
+        cell.try_borrow().map_err(Error::ClassBorrow)
+    }
+
+    /// Borrows the next argument, an instance of the class `C`, mutably.
+    ///
+    /// Used by the `#[function]` and `#[methods]` macros for `&mut C` parameters, see
+    /// [`ParamsAccessor::this_borrow`].
+    ///
+    /// # Panic
+    /// This function panics if it is called more times then there are arguments.
+    #[doc(hidden)]
+    #[inline]
+    pub fn arg_borrow_mut<C>(&mut self) -> Result<BorrowMut<'a, 'js, C>>
+    where
+        C: JsClass<'js> + 'a,
+    {
+        let arg = self.next_raw();
+        // SAFETY: the arguments are kept alive by the caller during the call, which outlives `'a`
+        let cell = unsafe { call_value_cell::<C>(self.params.ctx(), arg)? };
+        cell.try_borrow_mut().map_err(Error::ClassBorrow)
     }
 
     /// returns the number of arguments remaining
+    #[inline]
     pub fn len(&self) -> usize {
-        self.params.args.len() - self.offset
+        self.params.argc - self.offset
     }
     /// returns whether there are any arguments remaining.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// The cell of `value`, a value of a call alive for `'a`, if it is an instance of the class `C`.
+///
+/// # Safety
+/// `value` must be kept alive for `'a`.
+#[inline]
+unsafe fn call_value_cell<'a, 'js, C>(
+    ctx: &Ctx<'js>,
+    value: qjs::JSValueConst,
+) -> Result<&'a JsCell<'js, C>>
+where
+    C: JsClass<'js> + 'a,
+{
+    match crate::class::class_cell_of::<C>(value) {
+        // SAFETY: the cell lives as long as `value`
+        Some(cell) => Ok(&cell.as_ref().data),
+        None => Err(not_an_instance::<C>(ctx, value)),
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn not_an_instance<'js, C: JsClass<'js>>(ctx: &Ctx<'js>, value: qjs::JSValueConst) -> Error {
+    let value = Value::from_js_value_const(ctx.clone(), value);
+    Error::FromJs {
+        from: value.type_name(),
+        to: C::NAME,
+        message: None,
     }
 }
 
@@ -186,6 +338,7 @@ pub struct ParamRequirement {
 
 impl ParamRequirement {
     /// Returns the requirement of a single required parameter
+    #[inline]
     pub const fn single() -> Self {
         ParamRequirement {
             min: 1,
@@ -196,6 +349,7 @@ impl ParamRequirement {
 
     /// Makes the requirements exhaustive i.e. the parameter set requires that the function is
     /// called with no arguments than parameters
+    #[inline]
     pub const fn exhaustive() -> Self {
         ParamRequirement {
             min: 0,
@@ -205,6 +359,7 @@ impl ParamRequirement {
     }
 
     /// Returns the requirements for a single optional parameter
+    #[inline]
     pub const fn optional() -> Self {
         ParamRequirement {
             min: 0,
@@ -214,6 +369,7 @@ impl ParamRequirement {
     }
 
     /// Returns the requirements for a any number of parameters
+    #[inline]
     pub const fn any() -> Self {
         ParamRequirement {
             min: 0,
@@ -223,6 +379,7 @@ impl ParamRequirement {
     }
 
     /// Returns the requirements for no parameters
+    #[inline]
     pub const fn none() -> Self {
         ParamRequirement {
             min: 0,
@@ -232,6 +389,7 @@ impl ParamRequirement {
     }
 
     /// Combine to requirements into one which covers both.
+    #[inline]
     pub const fn combine(self, other: Self) -> ParamRequirement {
         Self {
             min: self.min.saturating_add(other.min),
@@ -241,19 +399,22 @@ impl ParamRequirement {
     }
 
     /// Returns the minimum number of arguments for this requirement
-    pub fn min(&self) -> usize {
+    #[inline]
+    pub const fn min(&self) -> usize {
         self.min
     }
 
     /// Returns the maximum number of arguments for this requirement
-    pub fn max(&self) -> usize {
+    #[inline]
+    pub const fn max(&self) -> usize {
         self.max
     }
 
     /// Returns whether this function is required to be exhaustive called
     ///
     /// i.e. there can be no more arguments then parameters.
-    pub fn is_exhaustive(&self) -> bool {
+    #[inline]
+    pub const fn is_exhaustive(&self) -> bool {
         self.exhaustive
     }
 }
@@ -268,35 +429,39 @@ pub trait FromParam<'js>: Sized {
 }
 
 impl<'js, T: FromJs<'js>> FromParam<'js> for T {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::single()
     }
 
+    #[inline]
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
-        let ctx = params.ctx().clone();
-        T::from_js(&ctx, params.arg())
+        params.arg_from_js()
     }
 }
 
 impl<'js> FromParam<'js> for Ctx<'js> {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::none()
     }
 
+    #[inline]
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
         Ok(params.ctx().clone())
     }
 }
 
 impl<'js, T: FromJs<'js>> FromParam<'js> for Opt<T> {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::optional()
     }
 
+    #[inline]
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
         if !params.is_empty() {
-            let ctx = params.ctx().clone();
-            Ok(Opt(Some(T::from_js(&ctx, params.arg())?)))
+            Ok(Opt(Some(params.arg_from_js()?)))
         } else {
             Ok(Opt(None))
         }
@@ -304,26 +469,33 @@ impl<'js, T: FromJs<'js>> FromParam<'js> for Opt<T> {
 }
 
 impl<'js, T: FromJs<'js>> FromParam<'js> for This<T> {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::any()
     }
 
+    #[inline]
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
-        T::from_js(params.ctx(), params.this()).map(This)
+        // SAFETY: `this` is kept alive by the caller during the call
+        unsafe { T::from_js_raw(params.ctx(), params.params.this) }.map(This)
     }
 }
 
 impl<'js, T: FromJs<'js>> FromParam<'js> for FuncArg<T> {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::any()
     }
 
+    #[inline]
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
-        T::from_js(params.ctx(), params.function()).map(FuncArg)
+        // SAFETY: the function is kept alive by the caller during the call
+        unsafe { T::from_js_raw(params.ctx(), params.params.function) }.map(FuncArg)
     }
 }
 
 impl<'js, T: FromJs<'js>> FromParam<'js> for Rest<T> {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::any()
     }
@@ -331,28 +503,31 @@ impl<'js, T: FromJs<'js>> FromParam<'js> for Rest<T> {
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
         let mut res = Vec::with_capacity(params.len());
         for _ in 0..params.len() {
-            let p = params.arg();
-            res.push(T::from_js(params.ctx(), p)?);
+            res.push(params.arg_from_js()?);
         }
         Ok(Rest(res))
     }
 }
 
 impl<'js, T: FromParams<'js>> FromParam<'js> for Flat<T> {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         T::param_requirements()
     }
 
+    #[inline]
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
         T::from_params(params).map(Flat)
     }
 }
 
 impl<'js> FromParam<'js> for Exhaustive {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::exhaustive()
     }
 
+    #[inline]
     fn from_param<'a>(_params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
         Ok(Exhaustive)
     }
@@ -375,11 +550,13 @@ macro_rules! impl_from_params{
             $($t : FromParam<'js>,)*
         {
 
+            #[inline]
             fn param_requirements() -> ParamRequirement{
                 ParamRequirement::none()
                     $(.combine($t::param_requirement()))*
             }
 
+            #[inline]
             fn from_params<'a>(_args: &mut ParamsAccessor<'a,'js>) -> Result<Self>{
                 Ok((
                     $($t::from_param(_args)?,)*
@@ -439,8 +616,12 @@ mod tests {
                 )
             };
 
-            assert_eq!(unsafe { qjs::JS_VALUE_GET_INT(params.args[0]) }, 17);
-            assert_eq!(unsafe { qjs::JS_VALUE_GET_INT(params.args[1]) }, 42);
+            assert_eq!(params.len(), 2);
+            assert_eq!(params.arg(0).and_then(|v| v.as_int()), Some(17));
+            assert_eq!(params.arg(1).and_then(|v| v.as_int()), Some(42));
+            let mut params = params.access();
+            assert_eq!(params.arg_from_js::<i32>().unwrap(), 17);
+            assert_eq!(params.arg_from_js::<i32>().unwrap(), 42);
         });
     }
 

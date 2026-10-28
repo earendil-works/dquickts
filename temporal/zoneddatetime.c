@@ -970,6 +970,9 @@ static JSValue js_zoneddatetime_getTimeZoneTransition(JSContext *ctx, JSValueCon
         return JS_NULL;
     ts.secs = trans_sec;
     ts.nsecs = 0;
+    /* the rule of a system zone gives transitions after the last instant */
+    if (!is_valid_epoch_timespec(&ts))
+        return JS_NULL;
     return js_create_zoneddatetime(ctx, &ts, s->timeZone, s->calendar);
 }
 
@@ -3472,8 +3475,8 @@ int js_add_zoneddatetime(JSContext *ctx, JSValue temporal_obj)
 {
     JSValue ctor;
     
-    JS_NewClassID(&js_zoneddatetime_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_zoneddatetime_class_id, &js_zoneddatetime_class);
+    if (ti_new_class(ctx, &js_zoneddatetime_class_id, &js_zoneddatetime_class))
+        return -1;
     
     ctor = JS_NewCConstructor(ctx, (int)js_zoneddatetime_class_id, "ZonedDateTime",
                                (JSCFunction *)js_zoneddatetime_constructor, 2,

@@ -1,13 +1,16 @@
 use crate::{
     convert::{IteratorJs, List},
-    value::Constructor,
+    qjs,
+    value::{
+        array::{ArrayBuilder, TupleElements},
+        Constructor,
+    },
     Array, CString, Ctx, Error, IntoAtom, IntoJs, Object, Result, StdResult, StdString, String,
     Value,
 };
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, BTreeSet, LinkedList, VecDeque},
-    string::ToString as _,
     vec::Vec,
 };
 use core::cell::{Cell, RefCell};
@@ -58,19 +61,20 @@ impl<'js> IntoJs<'js> for &str {
 
 impl<'js> IntoJs<'js> for char {
     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        String::from_str(ctx.clone(), self.to_string().as_str()).map(|String(value)| value)
+        String::from_str(ctx.clone(), self.encode_utf8(&mut [0; 4])).map(|String(value)| value)
     }
 }
 
 impl<'js> IntoJs<'js> for CString<'js> {
-    fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        String::from_str(ctx.clone(), self.as_str()).map(|String(value)| value)
+    fn into_js(self, _: &Ctx<'js>) -> Result<Value<'js>> {
+        // the source string has the same contents
+        Ok(self.string.0.clone())
     }
 }
 
 impl<'js> IntoJs<'js> for &CString<'js> {
-    fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        String::from_str(ctx.clone(), self.as_str()).map(|String(value)| value)
+    fn into_js(self, _: &Ctx<'js>) -> Result<Value<'js>> {
+        Ok(self.string.0.clone())
     }
 }
 
@@ -86,14 +90,26 @@ where
 }
 
 impl<'js> IntoJs<'js> for () {
+    #[inline]
     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         Ok(Value::new_undefined(ctx.clone()))
+    }
+
+    #[inline]
+    fn into_js_raw(self, _ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+        Ok(qjs::JS_UNDEFINED)
     }
 }
 
 impl<'js> IntoJs<'js> for &() {
+    #[inline]
     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         Ok(Value::new_undefined(ctx.clone()))
+    }
+
+    #[inline]
+    fn into_js_raw(self, _ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+        Ok(qjs::JS_UNDEFINED)
     }
 }
 
@@ -126,9 +142,16 @@ where
     T: IntoJs<'js>,
     Error: From<E>,
 {
+    #[inline]
     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.map_err(Error::from)
             .and_then(|value| value.into_js(ctx))
+    }
+
+    #[inline]
+    fn into_js_raw(self, ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+        self.map_err(Error::from)
+            .and_then(|value| value.into_js_raw(ctx))
     }
 }
 
@@ -281,9 +304,14 @@ macro_rules! into_js_impls {
                 #[allow(non_snake_case)]
                 fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
                     let ($($type,)*) = self.0;
-                    let array = Array::new(ctx.clone())?;
-                    $(array.set(into_js_impls!(@idx $type), $type)?;)*
-                    Ok(array.into_value())
+                    const LEN: usize = 0 $(+ into_js_impls!(@one $type))*;
+                    let mut array = ArrayBuilder::new(ctx, TupleElements::<LEN>::new());
+                    $(
+                        let value = $type.into_js_raw(ctx)?;
+                        // an owned value of `ctx`
+                        unsafe { array.push(value) }?;
+                    )*
+                    Ok(array.finish()?.into_value())
                 }
             }
         )*
@@ -354,14 +382,26 @@ macro_rules! into_js_impls {
         $(
             $(
                 impl<'js> IntoJs<'js> for $type {
+                    #[inline]
                     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
                         Ok(Value::$new(ctx.clone(), self as _))
+                    }
+
+                    #[inline]
+                    fn into_js_raw(self, _ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+                        Ok(raw::$new(self as _))
                     }
                 }
 
                 impl<'js> IntoJs<'js> for &$type {
+                    #[inline]
                     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
                         (*self).into_js(ctx)
+                    }
+
+                    #[inline]
+                    fn into_js_raw(self, ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+                        (*self).into_js_raw(ctx)
                     }
                 }
             )*
@@ -374,6 +414,7 @@ macro_rules! into_js_impls {
         $(
             $(
                 impl<'js> IntoJs<'js> for $type {
+                    #[inline]
                     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
                         let val = self as $alt1;
                         if val as $type == self {
@@ -382,33 +423,34 @@ macro_rules! into_js_impls {
                             (self as $alt2).into_js(ctx)
                         }
                     }
+
+                    #[inline]
+                    fn into_js_raw(self, ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+                        let val = self as $alt1;
+                        if val as $type == self {
+                            val.into_js_raw(ctx)
+                        } else {
+                            (self as $alt2).into_js_raw(ctx)
+                        }
+                    }
                 }
 
                 impl<'js> IntoJs<'js> for &$type {
+                    #[inline]
                     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
                         (*self).into_js(ctx)
+                    }
+
+                    #[inline]
+                    fn into_js_raw(self, ctx: &Ctx<'js>) -> Result<qjs::JSValue> {
+                        (*self).into_js_raw(ctx)
                     }
                 }
             )*
         )*
     };
 
-    (@idx A) => { 0 };
-    (@idx B) => { 1 };
-    (@idx C) => { 2 };
-    (@idx D) => { 3 };
-    (@idx E) => { 4 };
-    (@idx F) => { 5 };
-    (@idx G) => { 6 };
-    (@idx H) => { 7 };
-    (@idx I) => { 8 };
-    (@idx J) => { 9 };
-    (@idx K) => { 10 };
-    (@idx L) => { 11 };
-    (@idx M) => { 12 };
-    (@idx N) => { 13 };
-    (@idx O) => { 14 };
-    (@idx P) => { 15 };
+    (@one $($t:tt)*) => { 1 };
 }
 
 into_js_impls! {
@@ -483,6 +525,30 @@ into_js_impls! {
 into_js_impls! {
     val:
     i32 f64 => i64 u32 u64 usize isize,
+}
+
+/// The raw constructors of the primitive values, named after the `Value` constructors.
+mod raw {
+    use crate::qjs;
+
+    #[inline]
+    pub fn new_bool(value: bool) -> qjs::JSValue {
+        if value {
+            qjs::JS_TRUE
+        } else {
+            qjs::JS_FALSE
+        }
+    }
+
+    #[inline]
+    pub fn new_int(value: i32) -> qjs::JSValue {
+        qjs::JS_MKVAL(qjs::JS_TAG_INT, value)
+    }
+
+    #[inline]
+    pub fn new_float(value: f64) -> qjs::JSValue {
+        qjs::JS_NewFloat64(value)
+    }
 }
 
 #[allow(dead_code)]

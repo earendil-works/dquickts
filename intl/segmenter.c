@@ -620,31 +620,28 @@ int js_add_segmenter(JSContext *ctx, JSValue intl_obj)
 {
     JSValue segments_proto, segiter_proto;
 
-    JS_NewClassID(&js_segmenter_class_id);
-    JS_NewClassID(&js_segments_class_id);
-    JS_NewClassID(&js_segment_iterator_class_id);
-
-    JS_NewClass(JS_GetRuntime(ctx), js_segmenter_class_id, &js_segmenter_class);
-    JS_NewClass(JS_GetRuntime(ctx), js_segments_class_id, &js_segments_class);
-    JS_NewClass(JS_GetRuntime(ctx), js_segment_iterator_class_id, &js_segment_iterator_class);
+    if (js_intl_new_class(ctx, &js_segmenter_class_id, &js_segmenter_class) ||
+        js_intl_new_class(ctx, &js_segments_class_id, &js_segments_class) ||
+        js_intl_new_class(ctx, &js_segment_iterator_class_id, &js_segment_iterator_class))
+        return -1;
 
     /* Segments prototype */
     segments_proto = JS_NewObject(ctx);
     if (JS_IsException(segments_proto))
         return -1;
-    JS_SetPropertyFunctionList(ctx, segments_proto, js_segments_proto_funcs,
-                               countof(js_segments_proto_funcs));
     JS_SetClassProto(ctx, js_segments_class_id, segments_proto);
+    if (JS_SetPropertyFunctionList(ctx, segments_proto, js_segments_proto_funcs,
+                                   countof(js_segments_proto_funcs)))
+        return -1;
 
     /* SegmentIterator prototype */
     segiter_proto = JS_NewObject(ctx);
-    if (JS_IsException(segiter_proto)) {
-        JS_FreeValue(ctx, segments_proto);
+    if (JS_IsException(segiter_proto))
         return -1;
-    }
-    JS_SetPropertyFunctionList(ctx, segiter_proto, js_segment_iterator_proto_funcs,
-                               countof(js_segment_iterator_proto_funcs));
     JS_SetClassProto(ctx, js_segment_iterator_class_id, segiter_proto);
+    if (JS_SetPropertyFunctionList(ctx, segiter_proto, js_segment_iterator_proto_funcs,
+                                   countof(js_segment_iterator_proto_funcs)))
+        return -1;
 
     if (JS_IsException(js_intl_new_constructor(ctx, intl_obj,
                                                 -1,

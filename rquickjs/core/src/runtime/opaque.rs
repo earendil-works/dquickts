@@ -1,6 +1,6 @@
 use crate::{
-    class::{self, ffi::VTable, JsClass},
-    qjs, Ctx, Error, JsLifetime, Object, Value,
+    class::{self, JsClass},
+    qjs, Atom, Ctx, Error, JsLifetime, Object, Value,
 };
 
 use super::{
@@ -10,20 +10,21 @@ use super::{
 };
 use super::{Decorators, Suspender};
 use crate::snapshot::{BuiltinRequest, SnapshotHost};
-use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::{
     any::{Any, TypeId},
     cell::{Cell, UnsafeCell},
+    hash::{BuildHasherDefault, Hasher},
     marker::PhantomData,
     ptr,
 };
 
 #[cfg(feature = "std")]
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashMap;
 
 #[cfg(not(feature = "std"))]
-use hashbrown::{hash_map::Entry, HashMap};
+use hashbrown::HashMap;
 
 #[cfg(feature = "futures")]
 use super::{schedular::SchedularPoll, spawner::Spawner};
@@ -33,6 +34,69 @@ use core::{
     future::Future,
     task::{Context, Waker},
 };
+
+/// The class ids of the Rust classes.
+///
+/// Class ids are process wide in QuickJS: they are allocated once, by the first runtime, and every
+/// runtime registers its classes under the same ids. So they are read without looking up the
+/// runtime. `JS_NewClassID()` writes an id under a lock before any runtime registers it, which
+/// orders the write before every read.
+static CLASS_ID: AtomicU32 = AtomicU32::new(0);
+static CALLABLE_CLASS_ID: AtomicU32 = AtomicU32::new(0);
+static EXOTIC_CLASS_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Hasher of the [`TypeId`] keys of the class prototypes. A [`TypeId`] is already a hash, which
+/// its `Hash` implementation writes as an `u64`, so it is used as is instead of being hashed
+/// again with SipHash.
+#[derive(Default)]
+struct TypeIdHasher(u64);
+
+impl Hasher for TypeIdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // not used by the `TypeId` of the current Rust versions, still correct for others
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.0 = self.0.rotate_left(32) ^ i;
+    }
+}
+
+type PrototypeMap<'js> = HashMap<TypeId, Option<Object<'js>>, BuildHasherDefault<TypeIdHasher>>;
+
+/// Hasher of the addresses of static data.
+#[derive(Default)]
+struct AddrHasher(u64);
+
+impl Hasher for AddrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        // spreads the address bits to the high bits used by the hash table
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+}
+
+/// The atoms of static property names, by the address and length of the names.
+type StaticAtomMap = HashMap<(usize, usize), Box<[qjs::JSAtom]>, BuildHasherDefault<AddrHasher>>;
 
 /// Opaque book keeping data for Rust.
 pub(crate) struct Opaque<'js> {
@@ -65,14 +129,12 @@ pub(crate) struct Opaque<'js> {
     /// How TypeScript sources compile decorators.
     decorators: Cell<Decorators>,
 
-    /// The class id for rust classes.
-    class_id: qjs::JSClassID,
-    /// The class id for rust classes which can be called.
-    callable_class_id: qjs::JSClassID,
-    /// The class id for exotic classes
-    exotic_class_id: qjs::JSClassID,
+    /// The prototypes of the Rust classes, by the [`TypeId`] of the class.
+    prototypes: UnsafeCell<PrototypeMap<'js>>,
 
-    prototypes: UnsafeCell<HashMap<TypeId, Option<Object<'js>>>>,
+    /// The atoms of the static property names of
+    /// [`StaticObjectBuilder`](crate::object::StaticObjectBuilder), freed with the runtime.
+    static_atoms: UnsafeCell<StaticAtomMap>,
 
     userdata: UserDataMap,
 
@@ -105,11 +167,9 @@ impl<'js> Opaque<'js> {
 
             decorators: Cell::new(Decorators::Standard),
 
-            class_id: qjs::JS_INVALID_CLASS_ID,
-            callable_class_id: qjs::JS_INVALID_CLASS_ID,
-            exotic_class_id: qjs::JS_INVALID_CLASS_ID,
+            prototypes: UnsafeCell::new(PrototypeMap::default()),
 
-            prototypes: UnsafeCell::new(HashMap::new()),
+            static_atoms: UnsafeCell::new(StaticAtomMap::default()),
 
             userdata: UserDataMap::default(),
 
@@ -133,12 +193,9 @@ impl<'js> Opaque<'js> {
         // Class ids are process wide in QuickJS: allocate them once so that
         // every runtime uses the same ids (JS_NewClassID() is serialized and
         // keeps an already allocated id).
-        static mut CLASS_ID: qjs::JSClassID = 0;
-        static mut CALLABLE_CLASS_ID: qjs::JSClassID = 0;
-        static mut EXOTIC_CLASS_ID: qjs::JSClassID = 0;
-        self.class_id = qjs::JS_NewClassID(&raw mut CLASS_ID);
-        self.callable_class_id = qjs::JS_NewClassID(&raw mut CALLABLE_CLASS_ID);
-        self.exotic_class_id = qjs::JS_NewClassID(&raw mut EXOTIC_CLASS_ID);
+        let class_id = qjs::JS_NewClassID(CLASS_ID.as_ptr());
+        let callable_class_id = qjs::JS_NewClassID(CALLABLE_CLASS_ID.as_ptr());
+        let exotic_class_id = qjs::JS_NewClassID(EXOTIC_CLASS_ID.as_ptr());
 
         let class_def = qjs::JSClassDef {
             class_name: c"RustClass".as_ptr().cast(),
@@ -148,7 +205,7 @@ impl<'js> Opaque<'js> {
             exotic: ptr::null_mut(),
         };
 
-        if 0 != qjs::JS_NewClass(rt, self.class_id, &class_def) {
+        if 0 != qjs::JS_NewClass(rt, class_id, &class_def) {
             return Err(Error::Unknown);
         }
 
@@ -160,7 +217,7 @@ impl<'js> Opaque<'js> {
             exotic: ptr::null_mut(),
         };
 
-        if 0 != qjs::JS_NewClass(rt, self.callable_class_id, &class_def) {
+        if 0 != qjs::JS_NewClass(rt, callable_class_id, &class_def) {
             return Err(Error::Unknown);
         }
 
@@ -172,7 +229,7 @@ impl<'js> Opaque<'js> {
             exotic: self.exotic_methods.as_ptr(),
         };
 
-        if 0 != qjs::JS_NewClass(rt, self.exotic_class_id, &class_def) {
+        if 0 != qjs::JS_NewClass(rt, exotic_class_id, &class_def) {
             return Err(Error::Unknown);
         }
 
@@ -349,40 +406,106 @@ impl<'js> Opaque<'js> {
         self.panic.take()
     }
 
-    pub fn get_class_id(&self) -> qjs::JSClassID {
-        self.class_id
+    /// The class id of the Rust classes.
+    #[inline]
+    pub fn class_id() -> qjs::JSClassID {
+        CLASS_ID.load(Ordering::Relaxed)
     }
 
-    pub fn get_callable_id(&self) -> qjs::JSClassID {
-        self.callable_class_id
+    /// The class id of the Rust classes which can be called.
+    #[inline]
+    pub fn callable_id() -> qjs::JSClassID {
+        CALLABLE_CLASS_ID.load(Ordering::Relaxed)
     }
 
-    pub fn get_exotic_id(&self) -> qjs::JSClassID {
-        self.exotic_class_id
+    /// The class id of the exotic Rust classes.
+    #[inline]
+    pub fn exotic_id() -> qjs::JSClassID {
+        EXOTIC_CLASS_ID.load(Ordering::Relaxed)
+    }
+
+    /// Returns the prototype of the class `C`, created with [`JsClass::prototype`] on first use.
+    ///
+    /// # Safety
+    /// The returned reference points into the cache: it must be dropped before the cache can
+    /// change, i.e. before running any code which could create a class prototype.
+    unsafe fn prototype_ref<C: JsClass<'js>>(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<&Option<Object<'js>>, Error> {
+        let id = TypeId::of::<C::Changed<'static>>();
+        if let Some(proto) = (*self.prototypes.get()).get(&id) {
+            return Ok(proto);
+        }
+        // the cache isn't borrowed while the prototype is created: creating it can create the
+        // prototypes of other classes (e.g. the one of the Rust functions for its methods)
+        let proto = C::prototype(ctx)?;
+        Ok(&*(*self.prototypes.get()).entry(id).or_insert(proto))
     }
 
     pub fn get_or_insert_prototype<C: JsClass<'js>>(
         &self,
         ctx: &Ctx<'js>,
     ) -> Result<Option<Object<'js>>, Error> {
+        unsafe { self.prototype_ref::<C>(ctx).cloned() }
+    }
+
+    /// Returns the prototype of the class `C` (`JS_NULL` if it has none) like
+    /// [`Self::get_or_insert_prototype`], without a new reference: the cache keeps it alive
+    /// until the prototypes are reset.
+    pub fn get_or_insert_prototype_raw<C: JsClass<'js>>(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<qjs::JSValueConst, Error> {
         unsafe {
-            let vtable = VTable::get::<C>();
-            let id = vtable.id();
-            match (*self.prototypes.get()).entry(id) {
-                Entry::Occupied(x) => Ok(x.get().clone()),
-                Entry::Vacant(x) => {
-                    let proto = C::prototype(ctx)?;
-                    Ok(x.insert(proto).clone())
+            self.prototype_ref::<C>(ctx)
+                .map(|proto| proto.as_ref().map_or(qjs::JS_NULL, Object::as_js_value))
+        }
+    }
+
+    /// Returns the atoms of the static `names`, created on first use and kept until the runtime
+    /// is dropped.
+    ///
+    /// # Safety
+    /// The atoms must not be used after the runtime is dropped.
+    pub unsafe fn static_atoms(
+        &self,
+        ctx: &Ctx<'js>,
+        names: &'static [&'static str],
+    ) -> Result<*const [qjs::JSAtom], Error> {
+        // static data lives at its address for the whole program, which identifies the names
+        let key = (names.as_ptr() as usize, names.len());
+        if let Some(atoms) = (*self.static_atoms.get()).get(&key) {
+            return Ok(&**atoms as *const _);
+        }
+        let mut atoms = Vec::with_capacity(names.len());
+        for name in names {
+            match Atom::from_str(ctx.clone(), name) {
+                Ok(atom) => atoms.push(atom.into_atom_val()),
+                Err(error) => {
+                    for atom in atoms {
+                        qjs::JS_FreeAtom(ctx.as_ptr(), atom);
+                    }
+                    return Err(error);
                 }
             }
         }
+        let atoms = (*self.static_atoms.get())
+            .entry(key)
+            .or_insert(atoms.into_boxed_slice());
+        Ok(&**atoms as *const _)
     }
 
     /// Cleans up all the internal state.
     ///
-    /// Called before dropping the runtime to ensure that we drop everything before freeing the
-    /// runtime.
-    pub fn clear(&mut self) {
+    /// Called before dropping the runtime `rt` to ensure that we drop everything before freeing
+    /// the runtime.
+    pub fn clear(&mut self, rt: *mut qjs::JSRuntime) {
+        for (_, atoms) in self.static_atoms.get_mut().drain() {
+            for &atom in atoms.iter() {
+                unsafe { qjs::JS_FreeAtomRT(rt, atom) };
+            }
+        }
         self.rejection_tracker.get_mut().take();
         self.interrupt_handler.get_mut().take();
         self.panic.take();

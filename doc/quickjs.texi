@@ -216,7 +216,12 @@ find the name of the dynamically loaded modules.
 
 @item -M module_name[,cname]
 Add initialization code for an external C module. See the
-@code{c_module} example.
+@code{c_module} example. The external C modules and the @code{std},
+@code{os} and @code{bjson} modules are initialized when they are
+statically imported. They are all initialized if the code may import
+modules at run time (@code{import()}, @code{eval}, @code{Function},
+@code{std.evalScript}, @code{std.loadScript} or @code{os.Worker}) so
+that a dynamic import finds them.
 
 @item -x
 Byte swapped output (only used for cross compilation).
@@ -226,8 +231,24 @@ Use link time optimization. The compilation is slower but the
 executable is smaller and faster. This option is automatically set
 when the @code{-fno-x} options are used.
 
-@item -fno-[eval|string-normalize|regexp|json|proxy|map|typedarray|promise|bigint]
+@item -fno-[date|eval|string-normalize|regexp|json|proxy|map|typedarray|promise|module-loader|weakref|domexception|atob|performance]
 Disable selected language features to produce a smaller executable file.
+
+@item -fno-unused
+Disable the features that the compiled code does not reference. A
+feature is kept when the code names one of its globals or methods
+(e.g. @code{Map}, @code{match} or @code{normalize}), uses a construct
+needing it (regexp literals, async functions, modules,
+@code{import()}) or imports a @code{std}, @code{os} or @code{bjson}
+module whose functions need it (e.g. typed arrays for @code{std}). An
+external C module (@code{-M}) keeps every feature, and so does any use
+of @code{eval}, @code{Function}, @code{std.evalScript},
+@code{std.loadScript}, @code{import()} or @code{os.Worker} because the
+code compiled at run time is unknown. Names built at run time (e.g.
+@code{globalThis["Ma" +
+"p"]}) are not seen: such a feature is missing at run time. With
+@code{--experimental}, Temporal and Intl are kept only if
+@code{Temporal}, @code{Intl} or a locale method is referenced.
 
 @end table
 
@@ -344,6 +365,16 @@ not keep the immutability: a read ArrayBuffer is always mutable.
 
 ECMA402 (Internationalization API) is not supported.
 
+The experimental Temporal and Intl implementation (@code{qjs
+--experimental}) embeds a subset of the IANA time zone database. The
+other time zones are loaded on first use from the system time zone
+database: the directory given by the @code{TZDIR} environment variable,
+@file{/usr/share/zoneinfo}, @file{/var/db/timezone/zoneinfo} or
+@file{/usr/share/lib/zoneinfo}. @code{Intl.supportedValuesOf('timeZone')}
+also lists the zones of its @file{tzdata.zi} file. Without a system time
+zone database (e.g. on Windows), only the embedded time zones are
+available.
+
 @subsection Stack traces
 
 The stack trace of an error is captured when the error object is
@@ -351,7 +382,10 @@ created (or, for the errors raised by bytecode operations, when it is
 thrown). @code{Error.prototype.stack} is an accessor (Error stack
 accessor proposal) returning the captured stack trace: it is not an
 own property of the errors. By default it is a string with one
-@code{    at function (file:line:column)} line per call level.
+@code{    at function (file:line:column)} line per call level. The
+default string is built when the stack is first read, with the call
+levels and function names captured at creation time, so that creating
+and throwing errors is fast when their stack is not used.
 
 The V8 stack trace API is supported:
 
@@ -1142,7 +1176,9 @@ The worker instances have the following properties:
   Send a message to the corresponding worker. @code{msg} is cloned in
   the destination worker using an algorithm similar to the @code{HTML}
   structured clone algorithm. @code{SharedArrayBuffer} are shared
-  between workers.
+  between workers. The byte length of a growable
+  @code{SharedArrayBuffer} is also shared: @code{grow()} in a worker
+  is visible from the others.
 
   Current limitations: @code{Map} and @code{Set} are not supported
   yet.
@@ -1227,18 +1263,50 @@ or atoms in a single call.
 Strings can be exchanged as UTF-16 code units with
 @code{JS_NewStringUTF16()} and @code{JS_ToCStringLenUTF16()} (released
 with @code{JS_FreeCStringUTF16()}). Unlike the UTF-8 functions, they
-preserve unpaired surrogates.
+preserve unpaired surrogates. @code{JS_NewStringLatin1Len()} creates a
+string from Latin-1 bytes. @code{JS_GetStringData()} returns the
+contents of a string without copying or encoding them: Latin-1 bytes or
+UTF-16 code units depending on the internal representation. A rope is
+flattened in place and the pointer is valid while the string value is
+held.
 
 @code{JS_NewUint8Array()} and @code{JS_NewUint8ArrayCopy()} create a
 @code{Uint8Array} over a new @code{ArrayBuffer};
 @code{JS_GetUint8Array()} returns the bytes viewed by a
 @code{Uint8Array}, taking its offset into account.
+@code{JS_GetTypedArrayData()} returns the bytes viewed by a typed array
+of any element type with their byte length, byte offset and element
+size. It does not reference the @code{ArrayBuffer} and does not raise
+an exception: it returns @code{NULL} if the value is not a typed array
+(see @code{JS_GetTypedArrayType()}), or if the view is out of bounds or
+its buffer is detached.
 
 @code{JS_GetPropertyValue()} and @code{JS_SetPropertyValue()} access a
 property whose key is an arbitrary @code{JSValue} (freed by the
 call). @code{JS_SetLength()} assigns the @code{length} property, and
 @code{JS_SealObject()}/@code{JS_FreezeObject()} behave like
 @code{Object.seal()}/@code{Object.freeze()}.
+
+@code{JS_FindAtomLen()} returns the atom of a UTF-8 string only if it
+already exists (@code{JS_ATOM_NULL} otherwise) and never allocates
+memory. @code{JS_GetPropertyStrLen()} and @code{JS_HasPropertyStrLen()}
+take a UTF-8 property name with an explicit length; like
+@code{JS_GetPropertyStr()}, they do not create a temporary atom when
+the name is not an atom yet and no exotic object (such as a
+@code{Proxy}) in the prototype chain can observe it.
+
+@code{JS_GetOwnPropertyCount()} returns the number of properties
+@code{JS_GetOwnPropertyNames()} would return with the same flags,
+without building the list for ordinary objects.
+
+@code{JS_NewArrayFrom()} creates an array from a C array of values
+(taking ownership of them). @code{JS_GetFastArray()} gives direct read
+access to the elements of an array without holes: the returned pointer
+is borrowed and only valid until the array is modified or any
+Javascript code (getter, setter, Proxy trap, finalizer...) may run, so
+the elements should be duplicated with @code{JS_DupValue()} before
+doing anything else. Proxies, typed arrays and arrays with holes are
+not handled: use @code{JS_GetPropertyUint32()} for them.
 
 @subsection C functions
 
@@ -1279,6 +1347,14 @@ occurred. The actual exception object is stored in the
 @code{JS_NewTypeError()}, @code{JS_NewRangeError()} and the other
 @code{JS_New*Error()} functions build the same error objects as their
 @code{JS_Throw*Error()} counterparts but return them without throwing.
+Their message is formatted with @code{printf()} semantics and is not
+truncated.
+
+@code{JS_NewErrorLen()} and @code{JS_ThrowErrorLen()} take the kind
+of error (@code{JSErrorEnum}, e.g. @code{JS_TYPE_ERROR} or
+@code{JS_PLAIN_ERROR} for @code{Error}) and a UTF-8 message with its
+length: no formatting is done and the message may contain any
+character.
 
 @subsection Script evaluation
 
@@ -1387,7 +1463,8 @@ for(;;) @{
 @item js_std_set_worker_new_runtime_func(func)
 @item js_std_set_worker_new_context_func(func)
 Set the functions creating the runtime (@code{JS_NewRuntime()} by
-default) and the context of the new workers.
+default) and the context of the new workers. Without context function,
+the @code{os.Worker} constructor throws a @code{TypeError}.
 @end table
 
 The module name normalizer set with @code{JS_SetModuleLoaderFunc()} or
@@ -1423,11 +1500,31 @@ are only compiled if @code{ENABLE_DUMPS} is defined (Makefile:
 @code{JS_GetDumpFlags()} returns 0. @code{JS_ABORT_ON_LEAKS} makes
 @code{JS_FreeRuntime()} abort on leaked objects, strings or atoms.
 
+@subsection Pending jobs
+
+Promise reactions and other jobs are queued in the runtime and run by
+the host. @code{JS_ExecutePendingJob(rt, &ctx)} runs the oldest one and
+returns 1, 0 if there was none, or -1 if it threw: @code{ctx} is then
+the context of the job, where the exception is pending (NULL if the
+job destroyed it). @code{JS_ExecutePendingJobs(rt, max_jobs, &ctx)}
+does the same in a loop, in one call: it runs the jobs in order,
+including the jobs they enqueue, until none is left or
+@code{max_jobs} were run (no limit if @code{max_jobs} is negative), and
+returns their number with @code{ctx} set to NULL, or stops at the
+first job which throws and returns -1 with @code{ctx} set as
+above. Jobs cannot be suspended (see @code{JS_RequestSuspend()}), so
+the batch does not change when a suspension can happen; a host which
+must regain control regularly bounds the batch with @code{max_jobs}.
+
 @subsection Execution timeout and interrupts
 
 Use @code{JS_SetInterruptHandler()} to set a callback which is
 regularly called by the engine when it is executing code. This
-callback can be used to implement an execution timeout.
+callback can be used to implement an execution timeout. It is also
+called during the long BigInt operations (multiplication, division,
+power, conversions from and to strings) and regular expression
+matching so that they can be interrupted. Nothing can stop them
+without an interrupt handler.
 
 It is used by the command line interpreter to implement a
 @code{Ctrl-C} handler.
@@ -1586,8 +1683,12 @@ modules.
 Javascript code can be mixed with C modules.
 
 In order to have smaller executables, specific Javascript features can
-be disabled, in particular @code{eval} or the regular expressions. The
-code removal relies on the Link Time Optimization of the system
+be disabled, in particular @code{eval} or the regular expressions, or
+@code{-fno-unused} disables the ones the compiled code does not
+reference (@code{JS_EnumCodeNames()} gives the names it uses). The
+code removal relies on the linker dropping the unreferenced functions
+(the library is compiled with @code{-ffunction-sections
+-fdata-sections}) or on the Link Time Optimization of the system
 compiler.
 
 @subsection Binary JSON
@@ -1642,7 +1743,9 @@ line number tables. Unlike @code{JS_SetStripInfo()}, which strips at
 compile time, they only change the written bytecode.
 @code{JS_ReadObject2()} returns the memory of the SharedArrayBuffers
 read, like @code{JS_WriteObject2()} for the written ones, so that the
-host can adjust its reference counts.
+host can adjust its reference counts. These are the pointers returned
+by the @code{sab_alloc} function set with
+@code{JS_SetSharedArrayBufferFunctions()}.
 
 @section Runtime
 

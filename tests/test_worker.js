@@ -23,7 +23,7 @@ var worker;
 
 function test_worker()
 {
-    var counter;
+    var counter, gsab, gbuf;
 
     worker = new os.Worker("./test_worker_module.js");
 
@@ -47,6 +47,27 @@ function test_worker()
                 let buf = ev.buf;
                 /* check that the SharedArrayBuffer was modified */
                 assert(buf[2], 10);
+                /* test growable SharedArrayBuffer */
+                gsab = new SharedArrayBuffer(1, { maxByteLength: 16 });
+                gbuf = new Uint8Array(gsab); /* length-tracking */
+                worker.postMessage({ type: "grow_sab", sab: gsab });
+            }
+            break;
+        case "grow_sab_done":
+            {
+                let err;
+                /* the byte length is shared with the worker */
+                assert(gbuf[7], 7);
+                assert(gbuf.length, 8);
+                assert(gsab.byteLength, 8);
+                try {
+                    gsab.grow(4);
+                } catch(e) {
+                    err = e;
+                }
+                assert(err instanceof RangeError, true, "grow to a smaller size");
+                gsab.grow(8);
+                assert(gsab.byteLength, 8);
                 worker.postMessage({ type: "abort" });
             }
             break;

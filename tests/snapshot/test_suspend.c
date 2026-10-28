@@ -24,7 +24,7 @@
 #include <stdarg.h>
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
-#elif defined(__linux__) || defined(__GLIBC__)
+#elif defined(__linux__) || defined(__GLIBC__) || defined(__CYGWIN__)
 #include <malloc.h>
 #endif
 
@@ -58,7 +58,7 @@ static size_t t_usable_size(const void *ptr)
 {
 #if defined(__APPLE__)
     return malloc_size(ptr);
-#elif defined(__linux__) || defined(__GLIBC__)
+#elif defined(__linux__) || defined(__GLIBC__) || defined(__CYGWIN__)
     return malloc_usable_size((void *)ptr);
 #else
     return 0;
