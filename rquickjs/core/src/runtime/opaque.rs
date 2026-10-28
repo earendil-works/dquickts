@@ -1,5 +1,5 @@
 use crate::{
-    class::{self, ffi::VTable, JsClass},
+    class::{self, JsClass},
     qjs, Ctx, Error, JsLifetime, Object, Value,
 };
 
@@ -15,15 +15,16 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::{
     any::{Any, TypeId},
     cell::{Cell, UnsafeCell},
+    hash::{BuildHasherDefault, Hasher},
     marker::PhantomData,
     ptr,
 };
 
 #[cfg(feature = "std")]
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashMap;
 
 #[cfg(not(feature = "std"))]
-use hashbrown::{hash_map::Entry, HashMap};
+use hashbrown::HashMap;
 
 #[cfg(feature = "futures")]
 use super::{schedular::SchedularPoll, spawner::Spawner};
@@ -43,6 +44,31 @@ use core::{
 static CLASS_ID: AtomicU32 = AtomicU32::new(0);
 static CALLABLE_CLASS_ID: AtomicU32 = AtomicU32::new(0);
 static EXOTIC_CLASS_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Hasher of the [`TypeId`] keys of the class prototypes. A [`TypeId`] is already a hash, which
+/// its `Hash` implementation writes as an `u64`, so it is used as is instead of being hashed
+/// again with SipHash.
+#[derive(Default)]
+struct TypeIdHasher(u64);
+
+impl Hasher for TypeIdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // not used by the `TypeId` of the current Rust versions, still correct for others
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.0 = self.0.rotate_left(32) ^ i;
+    }
+}
+
+type PrototypeMap<'js> = HashMap<TypeId, Option<Object<'js>>, BuildHasherDefault<TypeIdHasher>>;
 
 /// Opaque book keeping data for Rust.
 pub(crate) struct Opaque<'js> {
@@ -75,7 +101,8 @@ pub(crate) struct Opaque<'js> {
     /// How TypeScript sources compile decorators.
     decorators: Cell<Decorators>,
 
-    prototypes: UnsafeCell<HashMap<TypeId, Option<Object<'js>>>>,
+    /// The prototypes of the Rust classes, by the [`TypeId`] of the class.
+    prototypes: UnsafeCell<PrototypeMap<'js>>,
 
     userdata: UserDataMap,
 
@@ -108,7 +135,7 @@ impl<'js> Opaque<'js> {
 
             decorators: Cell::new(Decorators::Standard),
 
-            prototypes: UnsafeCell::new(HashMap::new()),
+            prototypes: UnsafeCell::new(PrototypeMap::default()),
 
             userdata: UserDataMap::default(),
 
@@ -363,20 +390,42 @@ impl<'js> Opaque<'js> {
         EXOTIC_CLASS_ID.load(Ordering::Relaxed)
     }
 
+    /// Returns the prototype of the class `C`, created with [`JsClass::prototype`] on first use.
+    ///
+    /// # Safety
+    /// The returned reference points into the cache: it must be dropped before the cache can
+    /// change, i.e. before running any code which could create a class prototype.
+    unsafe fn prototype_ref<C: JsClass<'js>>(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<&Option<Object<'js>>, Error> {
+        let id = TypeId::of::<C::Changed<'static>>();
+        if let Some(proto) = (*self.prototypes.get()).get(&id) {
+            return Ok(proto);
+        }
+        // the cache isn't borrowed while the prototype is created: creating it can create the
+        // prototypes of other classes (e.g. the one of the Rust functions for its methods)
+        let proto = C::prototype(ctx)?;
+        Ok(&*(*self.prototypes.get()).entry(id).or_insert(proto))
+    }
+
     pub fn get_or_insert_prototype<C: JsClass<'js>>(
         &self,
         ctx: &Ctx<'js>,
     ) -> Result<Option<Object<'js>>, Error> {
+        unsafe { self.prototype_ref::<C>(ctx).cloned() }
+    }
+
+    /// Returns the prototype of the class `C` (`JS_NULL` if it has none) like
+    /// [`Self::get_or_insert_prototype`], without a new reference: the cache keeps it alive
+    /// until the prototypes are reset.
+    pub fn get_or_insert_prototype_raw<C: JsClass<'js>>(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<qjs::JSValueConst, Error> {
         unsafe {
-            let vtable = VTable::get::<C>();
-            let id = vtable.id();
-            match (*self.prototypes.get()).entry(id) {
-                Entry::Occupied(x) => Ok(x.get().clone()),
-                Entry::Vacant(x) => {
-                    let proto = C::prototype(ctx)?;
-                    Ok(x.insert(proto).clone())
-                }
-            }
+            self.prototype_ref::<C>(ctx)
+                .map(|proto| proto.as_ref().map_or(qjs::JS_NULL, Object::as_js_value))
         }
     }
 

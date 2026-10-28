@@ -224,9 +224,8 @@ impl<'js, C: JsClass<'js>> Class<'js, C> {
     pub fn instance(ctx: Ctx<'js>, value: C) -> Result<Class<'js, C>> {
         let id = class_id::<C>();
 
-        let prototype = Self::prototype(&ctx)?;
-
-        let prototype = prototype.map(|x| x.as_js_value()).unwrap_or(qjs::JS_NULL);
+        // borrowed from the cache, which keeps it alive while the object is created
+        let prototype = unsafe { ctx.get_opaque().get_or_insert_prototype_raw::<C>(&ctx)? };
         let val = unsafe {
             ctx.handle_exception(qjs::JS_NewObjectProtoClass(ctx.as_ptr(), prototype, id))?
         };
@@ -767,6 +766,41 @@ mod test {
             assert!(OwnedBorrowMut::<Vec3>::from_js(&ctx, int).is_err());
             assert_eq!(ctx.catch().as_int(), Some(42));
         })
+    }
+
+    #[test]
+    fn prototypes_per_runtime() {
+        let rt1 = Runtime::new().unwrap();
+        let ctx1 = Context::full(&rt1).unwrap();
+        let ctx1b = Context::full(&rt1).unwrap();
+        let rt2 = Runtime::new().unwrap();
+        let ctx2 = Context::full(&rt2).unwrap();
+
+        // creating the prototype of `Vec3` creates the one of the Rust functions for its method
+        for (ctx, mark) in [(&ctx1, 1), (&ctx2, 2)] {
+            ctx.with(|ctx| {
+                let vec = Vec3::new(1.0, 2.0, 3.0);
+                let v = Class::instance(ctx.clone(), vec).unwrap();
+                let proto = Class::<Vec3>::prototype(&ctx).unwrap().unwrap();
+                assert_eq!(v.get_prototype(), Some(proto.clone()));
+                assert!(proto.get::<_, Function>("add").is_ok());
+                proto.set("mark", mark).unwrap();
+            });
+        }
+
+        // the contexts of a runtime share the prototypes, the runtimes don't
+        for (ctx, mark) in [(&ctx1b, 1), (&ctx2, 2)] {
+            ctx.with(|ctx| {
+                let vec = Vec3::new(1.0, 2.0, 3.0);
+                let v = Class::instance(ctx.clone(), vec).unwrap();
+                assert_eq!(v.get::<_, i32>("mark").unwrap(), mark);
+                assert!(v.instance_of::<Vec3>());
+                assert!(!v.instance_of::<X>());
+                ctx.globals().set("v", v).unwrap();
+                let sum: Vec3 = ctx.eval("v.add(v)").catch(&ctx).unwrap();
+                approx::assert_abs_diff_eq!(sum.z, 6.0);
+            });
+        }
     }
 
     #[test]
