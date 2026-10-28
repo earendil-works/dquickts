@@ -12044,6 +12044,25 @@ JSValue JS_NewObjectFrom(JSContext *ctx, int count, const JSAtom *props,
     return JS_EXCEPTION;
 }
 
+JS_BOOL JS_NewObjectSetIsDefine(JSContext *ctx, JSAtom prop)
+{
+    JSObject *p;
+    JSShapeProperty *prs;
+
+    /* see the prototype chain lookup of JS_SetPropertyInternal() */
+    for(p = get_proto_obj(ctx->class_proto[JS_CLASS_OBJECT]); p != NULL;
+        p = p->shape->proto) {
+        if (p->is_exotic)
+            return FALSE;
+        prs = find_own_property1(p, prop);
+        if (prs) {
+            return (prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) ==
+                JS_PROP_WRITABLE;
+        }
+    }
+    return TRUE;
+}
+
 JSValue JS_NewObjectFromStr(JSContext *ctx, int count, const char **props,
                             const JSValue *values)
 {

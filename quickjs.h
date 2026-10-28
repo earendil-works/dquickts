@@ -1041,6 +1041,12 @@ JSValue JS_NewObject(JSContext *ctx);
    of JS_NewObject(): the last value of a repeated property is kept. */
 JSValue JS_NewObjectFrom(JSContext *ctx, int count, const JSAtom *props,
                          const JSValue *values);
+/* Return TRUE if JS_SetProperty() of 'prop' on an object of
+   JS_NewObject() which doesn't have it yet only defines it as
+   JS_NewObjectFrom() does: no object of the prototype chain has an
+   exotic behavior, a setter or a read-only property 'prop' (e.g. FALSE
+   for '__proto__'). The answer holds until Object.prototype changes. */
+JS_BOOL JS_NewObjectSetIsDefine(JSContext *ctx, JSAtom prop);
 /* same as JS_NewObjectFrom() with property names as UTF-8 strings */
 JSValue JS_NewObjectFromStr(JSContext *ctx, int count, const char **props,
                             const JSValue *values);

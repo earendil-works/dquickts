@@ -140,6 +140,7 @@ static void test_object_from(void)
     JSRuntime *rt;
     JSContext *ctx, *ctx2;
     JSValue obj;
+    JSAtom atom;
     char names[1024];
     int i, len;
 
@@ -196,6 +197,38 @@ static void test_object_from(void)
     }
     JS_RunGC(rt);
     CHECK(eval_bool(ctx, "JSON.stringify(o) === '{\"x10\":0,\"y\":1}'"));
+
+    /* JS_SetProperty() on a new object only defines the property */
+    atom = JS_NewAtom(ctx, "a");
+    CHECK(JS_NewObjectSetIsDefine(ctx, atom));
+    CHECK(eval_bool(ctx, "Object.defineProperty(Object.prototype, 'a', "
+                    "{ set(v) { globalThis.setter = v }, configurable: true }); true"));
+    CHECK(!JS_NewObjectSetIsDefine(ctx, atom));
+    /* JS_NewObjectFrom() defines the property, the setter isn't called */
+    set_global(ctx, "o", new_object_from(ctx, "a"));
+    CHECK(eval_bool(ctx, "Object.hasOwn(o, 'a') && !('setter' in globalThis)"));
+    CHECK(eval_bool(ctx, "Object.defineProperty(Object.prototype, 'a', "
+                    "{ value: 1, writable: false }); true"));
+    CHECK(!JS_NewObjectSetIsDefine(ctx, atom));
+    CHECK(eval_bool(ctx, "delete Object.prototype.a"));
+    CHECK(JS_NewObjectSetIsDefine(ctx, atom));
+    JS_FreeAtom(ctx, atom);
+    atom = JS_NewAtom(ctx, "__proto__");
+    CHECK(!JS_NewObjectSetIsDefine(ctx, atom));
+    JS_FreeAtom(ctx, atom);
+    /* a writable data property of the prototype is shadowed */
+    atom = JS_NewAtom(ctx, "w");
+    CHECK(eval_bool(ctx, "Object.prototype.w = 1; true"));
+    CHECK(JS_NewObjectSetIsDefine(ctx, atom));
+    CHECK(eval_bool(ctx, "delete Object.prototype.w"));
+    JS_FreeAtom(ctx, atom);
+    atom = JS_NewAtomUInt32(ctx, 7);
+    CHECK(JS_NewObjectSetIsDefine(ctx, atom));
+    CHECK(eval_bool(ctx, "Object.defineProperty(Object.prototype, 7, "
+                    "{ get() { return 0 }, configurable: true }); true"));
+    CHECK(!JS_NewObjectSetIsDefine(ctx, atom));
+    CHECK(eval_bool(ctx, "delete Object.prototype[7]"));
+    JS_FreeAtom(ctx, atom);
 
     /* the shapes kept by a context are freed with it */
     ctx2 = JS_NewContext(rt);

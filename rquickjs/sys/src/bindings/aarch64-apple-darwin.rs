@@ -1314,6 +1314,9 @@ unsafe extern "C" {
     ) -> JSValue;
 }
 unsafe extern "C" {
+    pub fn JS_NewObjectSetIsDefine(ctx: *mut JSContext, prop: JSAtom) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn JS_NewObjectFromStr(
         ctx: *mut JSContext,
         count: ::core::ffi::c_int,
