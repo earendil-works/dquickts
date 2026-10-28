@@ -799,8 +799,8 @@ static const JSCFunctionListEntry js_collator_static_funcs[] = {
 
 int js_add_collator(JSContext *ctx, JSValue intl_obj)
 {
-    JS_NewClassID(&js_collator_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_collator_class_id, &js_collator_class);
+    if (js_intl_new_class(ctx, &js_collator_class_id, &js_collator_class))
+        return -1;
 
     JSCFunctionType ft = { .constructor_or_func_flags = js_collator_constructor };
     

@@ -370,6 +370,97 @@ static void test_worker_gc_in_message(void)
     js_std_set_worker_new_runtime_func(JS_NewRuntime);
 }
 
+/* create a context with the std, os and bjson modules imported. Return
+   0 if a step failed (cleanly) because of the memory limit */
+static JS_BOOL init_std_context(JSRuntime *rt)
+{
+    static const char src[] =
+        "import * as std from 'std';"
+        "import * as os from 'os';"
+        "import * as bjson from 'bjson';"
+        "globalThis.ok = typeof std.out.puts === 'function' &&"
+        "  typeof os.setTimeout === 'function' &&"
+        "  typeof bjson.write === 'function' && typeof print === 'function';";
+    JSContext *ctx, *ctx1;
+    JSValue val;
+    JS_BOOL ok = 1;
+    int ret;
+
+    ctx = JS_NewContext(rt);
+    if (!ctx)
+        return 0;
+    js_std_add_helpers(ctx, 0, NULL);
+    if (JS_HasException(ctx)) {
+        ok = 0;
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    if (!js_init_module_std(ctx, "std") || !js_init_module_os(ctx, "os") ||
+        !js_init_module_bjson(ctx, "bjson")) {
+        ok = 0;
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    val = eval_str(ctx, src, JS_EVAL_TYPE_MODULE);
+    if (JS_IsException(val)) {
+        ok = 0;
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    } else {
+        while ((ret = JS_ExecutePendingJob(rt, &ctx1)) != 0) {
+            if (ret < 0)
+                JS_FreeValue(ctx1, JS_GetException(ctx1));
+        }
+        if (JS_PromiseState(ctx, val) != JS_PROMISE_FULFILLED)
+            ok = 0;
+        JS_FreeValue(ctx, val);
+    }
+#ifdef CONFIG_TEMPORAL_INTL
+    if (JS_AddIntrinsicTemporal(ctx) < 0 || JS_AddIntrinsicIntl(ctx) < 0) {
+        ok = 0;
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+#endif
+    if (ok) {
+        val = eval_str(ctx, "ok", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(val)) {
+            ok = 0;
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        } else {
+            check(JS_ToBool(ctx, val) == 1, "std/os/bjson not imported");
+        }
+        JS_FreeValue(ctx, val);
+    }
+    JS_FreeContext(ctx);
+    return ok;
+}
+
+/* regression test: the context and module initialization failures
+   under a memory limit were not all checked (upstream bellard/quickjs
+   issue 404: js_std_init() ignored a JS_NewClass() failure and
+   JS_SetClassProto() asserted) */
+static void test_init_oom(void)
+{
+    JSRuntime *rt;
+    JSMemoryUsage stats;
+    size_t limit;
+    int n_failed = 0;
+    JS_BOOL ok;
+
+    for(limit = 0;; limit += 64) {
+        check(limit < 16 << 20, "the initialization never succeeds");
+        rt = JS_NewRuntime();
+        check(rt != NULL, "cannot create the runtime");
+        js_std_init_handlers(rt);
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, stats.malloc_size + limit);
+        ok = init_std_context(rt);
+        js_std_free_handlers(rt);
+        JS_FreeRuntime(rt); /* asserts that no object is leaked */
+        if (ok)
+            break;
+        n_failed++;
+    }
+    check(n_failed > 0, "no allocation failure");
+}
+
 int main(int argc, char **argv)
 {
     test_eval_script_interrupt();
@@ -377,5 +468,6 @@ int main(int argc, char **argv)
     test_worker_new_runtime();
     test_worker_no_context_func();
     test_worker_gc_in_message();
+    test_init_oom();
     return 0;
 }

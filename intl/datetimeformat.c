@@ -3887,8 +3887,8 @@ static const JSCFunctionListEntry js_datetimeformat_static_funcs[] = {
 
 int js_add_datetimeformat(JSContext *ctx, JSValue intl_obj)
 {
-    JS_NewClassID(&js_datetimeformat_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_datetimeformat_class_id, &js_datetimeformat_class);
+    if (js_intl_new_class(ctx, &js_datetimeformat_class_id, &js_datetimeformat_class))
+        return -1;
 
     JSCFunctionType ft = { .constructor_or_func_flags = js_datetimeformat_constructor };
 

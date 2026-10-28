@@ -3475,8 +3475,8 @@ int js_add_zoneddatetime(JSContext *ctx, JSValue temporal_obj)
 {
     JSValue ctor;
     
-    JS_NewClassID(&js_zoneddatetime_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_zoneddatetime_class_id, &js_zoneddatetime_class);
+    if (ti_new_class(ctx, &js_zoneddatetime_class_id, &js_zoneddatetime_class))
+        return -1;
     
     ctor = JS_NewCConstructor(ctx, (int)js_zoneddatetime_class_id, "ZonedDateTime",
                                (JSCFunction *)js_zoneddatetime_constructor, 2,

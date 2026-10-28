@@ -832,8 +832,8 @@ int js_add_plainmonthday(JSContext *ctx, JSValue temporal_obj)
 {
     JSValue ctor;
     
-    JS_NewClassID(&js_plainmonthday_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_plainmonthday_class_id, &js_plainmonthday_class);
+    if (ti_new_class(ctx, &js_plainmonthday_class_id, &js_plainmonthday_class))
+        return -1;
     
     ctor = JS_NewCConstructor(ctx, (int)js_plainmonthday_class_id, "PlainMonthDay",
                                (JSCFunction *)js_plainmonthday_constructor, 2,

@@ -1768,8 +1768,8 @@ int js_add_plaindatetime(JSContext *ctx, JSValue temporal_obj)
 {
     JSValue ctor;
     
-    JS_NewClassID(&js_plaindatetime_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_plaindatetime_class_id, &js_plaindatetime_class);
+    if (ti_new_class(ctx, &js_plaindatetime_class_id, &js_plaindatetime_class))
+        return -1;
     
     ctor = JS_NewCConstructor(ctx, (int)js_plaindatetime_class_id, "PlainDateTime",
                                (JSCFunction *)js_plaindatetime_constructor, 3,

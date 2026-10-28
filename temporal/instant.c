@@ -1864,8 +1864,8 @@ int js_add_instant(JSContext *ctx, JSValue temporal_obj)
 {
     JSValue ctor;
     
-    JS_NewClassID(&js_instant_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_instant_class_id, &js_instant_class);
+    if (ti_new_class(ctx, &js_instant_class_id, &js_instant_class))
+        return -1;
     
     ctor = JS_NewCConstructor(ctx, (int)js_instant_class_id, "Instant",
                                (JSCFunction *)js_instant_constructor, 1,

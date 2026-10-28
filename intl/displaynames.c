@@ -426,8 +426,8 @@ static const JSCFunctionListEntry js_displaynames_static_funcs[] = {
 
 int js_add_displaynames(JSContext *ctx, JSValue intl_obj)
 {
-    JS_NewClassID(&js_displaynames_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_displaynames_class_id, &js_displaynames_class);
+    if (js_intl_new_class(ctx, &js_displaynames_class_id, &js_displaynames_class))
+        return -1;
 
     if (JS_IsException(js_intl_new_constructor(ctx, intl_obj,
                                                 -1,

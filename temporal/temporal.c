@@ -3528,6 +3528,7 @@ int JS_AddIntrinsicTemporal(JSContext *ctx)
     
     ret = JS_DefinePropertyValueStr(ctx, global_obj, "Temporal", temporal_obj,
                                     JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    temporal_obj = JS_UNDEFINED;
     if (ret < 0)
         goto fail;
     
@@ -3543,9 +3544,16 @@ int JS_AddIntrinsicTemporal(JSContext *ctx)
             }
             if (!JS_IsUndefined(date_proto)) {
                 JSValue func = JS_NewCFunction(ctx, js_date_toTemporalInstant, "toTemporalInstant", 0);
-                JS_DefinePropertyValueStr(ctx, date_proto, "toTemporalInstant", func,
-                                          JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+                if (JS_IsException(func))
+                    ret = -1;
+                else
+                    ret = JS_DefinePropertyValueStr(ctx, date_proto, "toTemporalInstant", func,
+                                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
                 JS_FreeValue(ctx, date_proto);
+                if (ret < 0) {
+                    JS_FreeValue(ctx, date_ctor);
+                    goto fail;
+                }
             }
             JS_FreeValue(ctx, date_ctor);
         }

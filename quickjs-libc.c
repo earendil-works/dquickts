@@ -2090,25 +2090,44 @@ static const JSCFunctionListEntry js_std_file_proto_funcs[] = {
     /* setvbuf, ...  */
 };
 
+/* create the class once per runtime. Return -1 with an exception if
+   error. */
+static int js_new_class_once(JSContext *ctx, JSClassID *pclass_id,
+                             const JSClassDef *class_def)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    /* the class ID is created once */
+    JS_NewClassID(pclass_id);
+    if (!JS_IsRegisteredClass(rt, *pclass_id) &&
+        JS_NewClass(rt, *pclass_id, class_def) < 0) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    return 0;
+}
+
 static int js_std_init(JSContext *ctx, JSModuleDef *m)
 {
     JSValue proto;
 
     /* FILE class */
-    /* the class ID is created once */
-    JS_NewClassID(&js_std_file_class_id);
-    /* the class is created once per runtime */
-    JS_NewClass(JS_GetRuntime(ctx), js_std_file_class_id, &js_std_file_class);
+    if (js_new_class_once(ctx, &js_std_file_class_id, &js_std_file_class))
+        return -1;
     proto = JS_NewObject(ctx);
-    JS_SetPropertyFunctionList(ctx, proto, js_std_file_proto_funcs,
-                               countof(js_std_file_proto_funcs));
+    if (JS_IsException(proto))
+        return -1;
     JS_SetClassProto(ctx, js_std_file_class_id, proto);
+    if (JS_SetPropertyFunctionList(ctx, proto, js_std_file_proto_funcs,
+                                   countof(js_std_file_proto_funcs)))
+        return -1;
 
-    JS_SetModuleExportList(ctx, m, js_std_funcs,
-                           countof(js_std_funcs));
-    JS_SetModuleExport(ctx, m, "in", js_new_std_file(ctx, stdin, FALSE));
-    JS_SetModuleExport(ctx, m, "out", js_new_std_file(ctx, stdout, FALSE));
-    JS_SetModuleExport(ctx, m, "err", js_new_std_file(ctx, stderr, FALSE));
+    if (JS_SetModuleExportList(ctx, m, js_std_funcs,
+                               countof(js_std_funcs)))
+        return -1;
+    if (JS_SetModuleExport(ctx, m, "in", js_new_std_file(ctx, stdin, FALSE)) ||
+        JS_SetModuleExport(ctx, m, "out", js_new_std_file(ctx, stdout, FALSE)) ||
+        JS_SetModuleExport(ctx, m, "err", js_new_std_file(ctx, stderr, FALSE)))
+        return -1;
     return 0;
 }
 
@@ -2118,10 +2137,11 @@ JSModuleDef *js_init_module_std(JSContext *ctx, const char *module_name)
     m = JS_NewCModule(ctx, module_name, js_std_init);
     if (!m)
         return NULL;
-    JS_AddModuleExportList(ctx, m, js_std_funcs, countof(js_std_funcs));
-    JS_AddModuleExport(ctx, m, "in");
-    JS_AddModuleExport(ctx, m, "out");
-    JS_AddModuleExport(ctx, m, "err");
+    if (JS_AddModuleExportList(ctx, m, js_std_funcs, countof(js_std_funcs)) ||
+        JS_AddModuleExport(ctx, m, "in") ||
+        JS_AddModuleExport(ctx, m, "out") ||
+        JS_AddModuleExport(ctx, m, "err"))
+        return NULL;
     return m;
 }
 
@@ -4649,27 +4669,39 @@ static int js_os_init(JSContext *ctx, JSModuleDef *m)
     {
         JSRuntime *rt = JS_GetRuntime(ctx);
         JSThreadState *ts = JS_GetRuntimeOpaque(rt);
-        JSValue proto, obj;
+        JSValue proto, obj, parent;
         /* Worker class */
-        JS_NewClassID(&js_worker_class_id);
-        JS_NewClass(JS_GetRuntime(ctx), js_worker_class_id, &js_worker_class);
+        if (js_new_class_once(ctx, &js_worker_class_id, &js_worker_class))
+            return -1;
         proto = JS_NewObject(ctx);
-        JS_SetPropertyFunctionList(ctx, proto, js_worker_proto_funcs, countof(js_worker_proto_funcs));
+        if (JS_IsException(proto))
+            return -1;
+        JS_SetClassProto(ctx, js_worker_class_id, proto);
+        if (JS_SetPropertyFunctionList(ctx, proto, js_worker_proto_funcs, countof(js_worker_proto_funcs)))
+            return -1;
 
         obj = JS_NewCFunction2(ctx, js_worker_ctor, "Worker", 1,
                                JS_CFUNC_constructor, 0);
-        JS_SetConstructor(ctx, obj, proto);
-
-        JS_SetClassProto(ctx, js_worker_class_id, proto);
+        if (JS_IsException(obj))
+            return -1;
+        if (JS_SetConstructor(ctx, obj, proto)) {
+            JS_FreeValue(ctx, obj);
+            return -1;
+        }
 
         /* set 'Worker.parent' if necessary */
         if (ts->recv_pipe && ts->send_pipe) {
-            JS_DefinePropertyValueStr(ctx, obj, "parent",
-                                      js_worker_ctor_internal(ctx, JS_UNDEFINED, ts->recv_pipe, ts->send_pipe),
-                                      JS_PROP_C_W_E);
+            parent = js_worker_ctor_internal(ctx, JS_UNDEFINED, ts->recv_pipe, ts->send_pipe);
+            if (JS_IsException(parent) ||
+                JS_DefinePropertyValueStr(ctx, obj, "parent", parent,
+                                          JS_PROP_C_W_E) < 0) {
+                JS_FreeValue(ctx, obj);
+                return -1;
+            }
         }
 
-        JS_SetModuleExport(ctx, m, "Worker", obj);
+        if (JS_SetModuleExport(ctx, m, "Worker", obj))
+            return -1;
     }
 #endif /* USE_WORKER */
 
@@ -4683,9 +4715,11 @@ JSModuleDef *js_init_module_os(JSContext *ctx, const char *module_name)
     m = JS_NewCModule(ctx, module_name, js_os_init);
     if (!m)
         return NULL;
-    JS_AddModuleExportList(ctx, m, js_os_funcs, countof(js_os_funcs));
+    if (JS_AddModuleExportList(ctx, m, js_os_funcs, countof(js_os_funcs)))
+        return NULL;
 #ifdef USE_WORKER
-    JS_AddModuleExport(ctx, m, "Worker");
+    if (JS_AddModuleExport(ctx, m, "Worker"))
+        return NULL;
 #endif
     return m;
 }
@@ -4762,7 +4796,8 @@ JSModuleDef *js_init_module_bjson(JSContext *ctx, const char *module_name)
     m = JS_NewCModule(ctx, module_name, js_bjson_init);
     if (!m)
         return NULL;
-    JS_AddModuleExportList(ctx, m, js_bjson_funcs, countof(js_bjson_funcs));
+    if (JS_AddModuleExportList(ctx, m, js_bjson_funcs, countof(js_bjson_funcs)))
+        return NULL;
     return m;
 }
 
@@ -4803,33 +4838,53 @@ JSValue js_std_console_log(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
+/* in case of error, the exception is left pending */
 void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
 {
-    JSValue global_obj, console, args;
+    JSValue global_obj, console, args, val;
     int i;
 
     /* XXX: should these global definitions be enumerable? */
     global_obj = JS_GetGlobalObject(ctx);
 
     console = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, console, "log",
-                      JS_NewCFunction(ctx, js_std_console_log, "log", 1));
-    JS_SetPropertyStr(ctx, global_obj, "console", console);
+    if (JS_IsException(console))
+        goto done;
+    val = JS_NewCFunction(ctx, js_std_console_log, "log", 1);
+    if (JS_IsException(val) ||
+        JS_SetPropertyStr(ctx, console, "log", val) < 0) {
+        JS_FreeValue(ctx, console);
+        goto done;
+    }
+    if (JS_SetPropertyStr(ctx, global_obj, "console", console) < 0)
+        goto done;
 
     /* same methods as the mozilla JS shell */
     if (argc >= 0) {
         args = JS_NewArray(ctx);
+        if (JS_IsException(args))
+            goto done;
         for(i = 0; i < argc; i++) {
-            JS_SetPropertyUint32(ctx, args, i, JS_NewString(ctx, argv[i]));
+            val = JS_NewString(ctx, argv[i]);
+            if (JS_IsException(val) ||
+                JS_SetPropertyUint32(ctx, args, i, val) < 0) {
+                JS_FreeValue(ctx, args);
+                goto done;
+            }
         }
-        JS_SetPropertyStr(ctx, global_obj, "scriptArgs", args);
+        if (JS_SetPropertyStr(ctx, global_obj, "scriptArgs", args) < 0)
+            goto done;
     }
 
-    JS_SetPropertyStr(ctx, global_obj, "print",
-                      JS_NewCFunction(ctx, js_std_print, "print", 1));
-    JS_SetPropertyStr(ctx, global_obj, "__loadScript",
-                      JS_NewCFunction(ctx, js_loadScript, "__loadScript", 1));
-
+    val = JS_NewCFunction(ctx, js_std_print, "print", 1);
+    if (JS_IsException(val) ||
+        JS_SetPropertyStr(ctx, global_obj, "print", val) < 0)
+        goto done;
+    val = JS_NewCFunction(ctx, js_loadScript, "__loadScript", 1);
+    if (JS_IsException(val))
+        goto done;
+    JS_SetPropertyStr(ctx, global_obj, "__loadScript", val);
+ done:
     JS_FreeValue(ctx, global_obj);
 }
 

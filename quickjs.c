@@ -2984,15 +2984,14 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx = js_mallocz_rt(rt, sizeof(JSContext));
     if (!ctx)
         return NULL;
-    js_rc(ctx)->ref_count = 1;
-    add_gc_object(rt, &ctx->header, JS_GC_OBJ_TYPE_JS_CONTEXT);
-
     ctx->class_proto = js_malloc_rt(rt, sizeof(ctx->class_proto[0]) *
                                     rt->class_count);
     if (!ctx->class_proto) {
         js_free_rt(rt, ctx);
         return NULL;
     }
+    js_rc(ctx)->ref_count = 1;
+    add_gc_object(rt, &ctx->header, JS_GC_OBJ_TYPE_JS_CONTEXT);
     ctx->rt = rt;
     list_add_tail(&ctx->link, &rt->context_list);
     for(i = 0; i < rt->class_count; i++)
@@ -6297,9 +6296,14 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
                     pr = &p->prop[0];
                 } else {
                     /* only used for the first array */
-                    /* cannot fail */
                     pr = add_property(ctx, p, JS_ATOM_length,
                                       JS_PROP_WRITABLE | JS_PROP_LENGTH);
+                    if (unlikely(!pr)) {
+                        js_free_shape(ctx->rt, p->shape);
+                        js_free(ctx, p->prop);
+                        js_free(ctx, p);
+                        return JS_EXCEPTION;
+                    }
                 }
                 pr->u.value = JS_NewInt32(ctx, 0);
             }
@@ -38109,6 +38113,8 @@ int JS_SetModuleExport(JSContext *ctx, JSModuleDef *m, const char *export_name,
 {
     JSExportEntry *me;
     JSAtom name;
+    if (JS_IsException(val))
+        return -1;
     name = JS_NewAtom(ctx, export_name);
     if (name == JS_ATOM_NULL)
         goto fail;
@@ -49950,7 +49956,8 @@ JSValue JS_NewCConstructor(JSContext *ctx, int class_id, const char *name,
                                       JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0)
             goto fail;
     }
-    JS_SetConstructor2(ctx, ctor, proto, proto_flags, ctor_flags);
+    if (JS_SetConstructor2(ctx, ctor, proto, proto_flags, ctor_flags))
+        goto fail;
 
     JS_FreeValue(ctx, proto);
     JS_FreeValue(ctx, parent_proto);
@@ -63543,15 +63550,14 @@ int JS_AddIntrinsicProxy(JSContext *ctx)
         return -1;
     JS_SetConstructorBit(ctx, obj1, TRUE);
     if (JS_SetPropertyFunctionList(ctx, obj1, js_proxy_funcs,
-                                   countof(js_proxy_funcs)))
-        goto fail;
+                                   countof(js_proxy_funcs))) {
+        JS_FreeValue(ctx, obj1);
+        return -1;
+    }
     if (JS_DefinePropertyValueStr(ctx, ctx->global_obj, "Proxy",
                                   obj1, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0)
-        goto fail;
+        return -1;
     return 0;
- fail:
-    JS_FreeValue(ctx, obj1);
-    return -1;
 }
 
 /* Symbol */
@@ -69683,6 +69689,8 @@ static int JS_AddIntrinsicBasicObjects(JSContext *ctx)
     {
         JSObject *p;
         obj = JS_NewObjectProtoClassAlloc(ctx, JS_NULL, JS_CLASS_OBJECT, 4);
+        if (JS_IsException(obj))
+            return -1;
         p = JS_VALUE_GET_OBJ(ctx->global_obj);
         p->u.global_object.uninitialized_vars = obj;
     }

@@ -3719,8 +3719,8 @@ static const JSCFunctionListEntry js_numberformat_static_funcs[] = {
 
 int js_add_numberformat(JSContext *ctx, JSValue intl_obj)
 {
-    JS_NewClassID(&js_numberformat_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), js_numberformat_class_id, &js_numberformat_class);
+    if (js_intl_new_class(ctx, &js_numberformat_class_id, &js_numberformat_class))
+        return -1;
 
     JSCFunctionType ft = { .constructor_or_func_flags = js_numberformat_constructor };
     

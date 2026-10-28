@@ -188,6 +188,20 @@ enum {
 extern const char *plural_category_names[PLURAL_COUNT];
 char *js_intl_extract_locale(JSContext *ctx, int argc, JSValueConst *argv);
 void js_intl_dbuf_init(JSContext *ctx, DynBuf *s);
+/* register the class unless it already is (the classes are shared by
+   the contexts of a runtime). Return -1 with an exception if error. */
+static inline int js_intl_new_class(JSContext *ctx, JSClassID *pclass_id,
+                                    const JSClassDef *class_def)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JS_NewClassID(pclass_id);
+    if (!JS_IsRegisteredClass(rt, *pclass_id) &&
+        JS_NewClass(rt, *pclass_id, class_def) < 0) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    return 0;
+}
 JSValue js_intl_new_constructor(JSContext *ctx, JSValue intl_obj,
                                  int intl_idx,
                                  JSClassID class_id,
