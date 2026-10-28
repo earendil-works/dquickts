@@ -1421,6 +1421,19 @@ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
 /* load the dependencies of the module 'obj'. Useful when JS_ReadObject()
    returns a module. */
 int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
+/* Called by JS_EnumCodeNames() for each name; 'name' is only valid
+   during the call. */
+typedef void JSCodeNameFunc(JSContext *ctx, JSAtom name, void *opaque);
+/* Call 'func' for each name that the code 'obj' (a script or module
+   compiled with JS_EVAL_FLAG_COMPILE_ONLY) may look up at run time:
+   variable and property names, string constants and module imports, and
+   the global needed by a construct: "Promise" for modules and async
+   functions, "RegExp" for regexp literals and "import" for import().
+   A name can be given several times. Names computed at run time are not
+   seen. qjsc uses it to omit the unused built-ins (-fno-unused). Return
+   -1 if out of memory. */
+int JS_EnumCodeNames(JSContext *ctx, JSValueConst obj,
+                     JSCodeNameFunc *func, void *opaque);
 
 /* Heap snapshots
 

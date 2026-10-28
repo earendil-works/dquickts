@@ -226,8 +226,24 @@ Use link time optimization. The compilation is slower but the
 executable is smaller and faster. This option is automatically set
 when the @code{-fno-x} options are used.
 
-@item -fno-[eval|string-normalize|regexp|json|proxy|map|typedarray|promise|bigint]
+@item -fno-[date|eval|string-normalize|regexp|json|proxy|map|typedarray|promise|module-loader|weakref|domexception|atob|performance]
 Disable selected language features to produce a smaller executable file.
+
+@item -fno-unused
+Disable the features that the compiled code does not reference. A
+feature is kept when the code names one of its globals or methods
+(e.g. @code{Map}, @code{match} or @code{normalize}), uses a construct
+needing it (regexp literals, async functions, modules,
+@code{import()}) or imports a @code{std}, @code{os} or @code{bjson}
+module whose functions need it (e.g. typed arrays for @code{std}). An
+external C module (@code{-M}) keeps every feature, and so does any use
+of @code{eval}, @code{Function}, @code{std.evalScript},
+@code{std.loadScript}, @code{import()} or @code{os.Worker} because the
+code compiled at run time is unknown. Names built at run time (e.g.
+@code{globalThis["Ma" +
+"p"]}) are not seen: such a feature is missing at run time. With
+@code{--experimental}, Temporal and Intl are kept only if
+@code{Temporal}, @code{Intl} or a locale method is referenced.
 
 @end table
 
@@ -1587,8 +1603,12 @@ modules.
 Javascript code can be mixed with C modules.
 
 In order to have smaller executables, specific Javascript features can
-be disabled, in particular @code{eval} or the regular expressions. The
-code removal relies on the Link Time Optimization of the system
+be disabled, in particular @code{eval} or the regular expressions, or
+@code{-fno-unused} disables the ones the compiled code does not
+reference (@code{JS_EnumCodeNames()} gives the names it uses). The
+code removal relies on the linker dropping the unreferenced functions
+(the library is compiled with @code{-ffunction-sections
+-fdata-sections}) or on the Link Time Optimization of the system
 compiler.
 
 @subsection Binary JSON

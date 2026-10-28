@@ -47353,6 +47353,73 @@ static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
     return -1;
 }
 
+int JS_EnumCodeNames(JSContext *ctx, JSValueConst obj,
+                     JSCodeNameFunc *func, void *opaque)
+{
+    switch(JS_VALUE_GET_TAG(obj)) {
+    case JS_TAG_MODULE:
+        {
+            JSModuleDef *m = JS_VALUE_GET_PTR(obj);
+            int i;
+
+            /* the evaluation of a module returns a promise */
+            func(ctx, JS_ATOM_Promise, opaque);
+            for(i = 0; i < m->import_entries_count; i++)
+                func(ctx, m->import_entries[i].import_name, opaque);
+            return JS_EnumCodeNames(ctx, m->func_obj, func, opaque);
+        }
+    case JS_TAG_FUNCTION_BYTECODE:
+        {
+            JSFunctionBytecode *b = JS_VALUE_GET_PTR(obj);
+            int pos, op, i;
+
+            if (b->func_kind & JS_FUNC_ASYNC)
+                func(ctx, JS_ATOM_Promise, opaque);
+            /* the global variables are closure variables */
+            for(i = 0; i < b->closure_var_count; i++)
+                func(ctx, b->closure_var[i].var_name, opaque);
+            for(pos = 0; pos < b->byte_code_len;
+                pos += short_opcode_info(op).size) {
+                op = b->byte_code_buf[pos];
+                if (op == OP_regexp) {
+                    func(ctx, JS_ATOM_RegExp, opaque);
+                } else if (op == OP_import) {
+                    func(ctx, JS_ATOM_import, opaque);
+                } else {
+                    switch(short_opcode_info(op).fmt) {
+                    case OP_FMT_atom:
+                    case OP_FMT_atom_u8:
+                    case OP_FMT_atom_u16:
+                    case OP_FMT_atom_label_u8:
+                    case OP_FMT_atom_label_u16:
+                        func(ctx, get_u32(b->byte_code_buf + pos + 1), opaque);
+                        break;
+                    default:
+                        break;
+                    }
+                }
+            }
+            for(i = 0; i < b->cpool_count; i++) {
+                if (JS_EnumCodeNames(ctx, b->cpool[i], func, opaque))
+                    return -1;
+            }
+        }
+        break;
+    case JS_TAG_STRING:
+        {
+            JSAtom atom = JS_ValueToAtom(ctx, obj);
+            if (atom == JS_ATOM_NULL)
+                return -1;
+            func(ctx, atom, opaque);
+            JS_FreeAtom(ctx, atom);
+        }
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+
 /* XXX: be compatible with the structured clone algorithm */
 static int JS_WriteArray(BCWriterState *s, JSValueConst obj)
 {

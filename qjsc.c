@@ -50,10 +50,16 @@ typedef struct namelist_t {
 
 typedef struct {
     const char *option_name;
-    const char *init_name;
+    const char *init_func; /* NULL if nothing is added to the context */
+    /* space separated names whose use keeps the feature with -fno-unused
+       (identifiers, property names and the C module names) */
+    const char *names;
 } FeatureEntry;
 
 static namelist_t cname_list;
+/* flags: CMODULE_SYSTEM for std, os and bjson, whose needs are given in
+   feature_list */
+#define CMODULE_SYSTEM 1
 static namelist_t cmodule_list;
 static namelist_t init_module_list;
 static uint64_t feature_bitmap;
@@ -68,19 +74,95 @@ static const char *c_ident_prefix = "qjsc_";
 #define FE_ALL (-1)
 
 static const FeatureEntry feature_list[] = {
-    { "date", "Date" },
-    { "eval", "Eval" },
-    { "string-normalize", "StringNormalize" },
-    { "regexp", "RegExp" },
-    { "json", "JSON" },
-    { "proxy", "Proxy" },
-    { "map", "MapSet" },
-    { "typedarray", "TypedArrays" },
-    { "promise", "Promise" },
+    { "date", "JS_AddIntrinsicDate", "Date bjson" },
+    /* the code compiled at run time can use any feature */
+#define FE_EVAL 1
+    { "eval", "JS_AddIntrinsicEval",
+      "eval Function evalScript loadScript __loadScript Worker import" },
+    { "string-normalize", "JS_AddIntrinsicStringNormalize", "normalize" },
+    { "regexp", "JS_AddIntrinsicRegExp",
+      "RegExp match matchAll search bjson" },
+    { "json", "JS_AddIntrinsicJSON", "JSON" },
+    { "proxy", "JS_AddIntrinsicProxy", "Proxy" },
+    { "map", "JS_AddIntrinsicMapSet", "Map Set WeakMap WeakSet bjson" },
+    { "typedarray", "JS_AddIntrinsicTypedArrays",
+      "ArrayBuffer SharedArrayBuffer DataView Atomics "
+      "Int8Array Uint8Array Uint8ClampedArray Int16Array Uint16Array "
+      "Int32Array Uint32Array BigInt64Array BigUint64Array "
+      "Float16Array Float32Array Float64Array std os bjson" },
+    { "promise", "JS_AddIntrinsicPromise",
+      "Promise fromAsync waitAsync import os" },
 #define FE_MODULE_LOADER 9
-    { "module-loader", NULL },
-    { "weakref", "WeakRef" },
+    { "module-loader", NULL, "import Worker" },
+    { "weakref", "JS_AddIntrinsicWeakRef", "WeakRef FinalizationRegistry" },
+    { "domexception", "JS_AddIntrinsicDOMException",
+      "DOMException atob btoa" },
+    { "atob", "JS_AddIntrinsicAToB", "atob btoa" },
+    { "performance", "JS_AddPerformance", "performance" },
 };
+
+#ifdef CONFIG_TEMPORAL_INTL
+/* names keeping Temporal and Intl (--experimental) with -fno-unused */
+static const char experimental_names[] =
+    "Temporal Intl toTemporalInstant toLocaleString toLocaleDateString "
+    "toLocaleTimeString toLocaleUpperCase toLocaleLowerCase localeCompare";
+#endif
+
+/* -fno-unused: omit the features not referenced by the compiled code */
+static BOOL no_unused;
+static uint64_t used_feature_bitmap;
+static BOOL used_experimental;
+
+/* return TRUE if 'name' is a word of the space separated list 'names' */
+static BOOL has_name(const char *names, const char *name)
+{
+    size_t len = strlen(name);
+    const char *p, *end;
+
+    for(p = names;; p = end + 1) {
+        end = strchr(p, ' ');
+        if (!end)
+            end = p + strlen(p);
+        if (end - p == len && !memcmp(p, name, len))
+            return TRUE;
+        if (*end == '\0')
+            return FALSE;
+    }
+}
+
+static void mark_all_used(void)
+{
+    used_feature_bitmap = FE_ALL;
+    used_experimental = TRUE;
+}
+
+static void mark_used_name(const char *name)
+{
+    int i;
+
+    for(i = 0; i < countof(feature_list); i++) {
+        if (has_name(feature_list[i].names, name))
+            used_feature_bitmap |= (uint64_t)1 << i;
+    }
+#ifdef CONFIG_TEMPORAL_INTL
+    if (has_name(experimental_names, name))
+        used_experimental = TRUE;
+#endif
+}
+
+static void mark_used_atom(JSContext *ctx, JSAtom name, void *opaque)
+{
+    const char *str;
+
+    str = JS_AtomToCString(ctx, name);
+    if (!str) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        mark_all_used();
+        return;
+    }
+    mark_used_name(str);
+    JS_FreeCString(ctx, str);
+}
 
 void namelist_add(namelist_t *lp, const char *name, const char *short_name,
                   int flags)
@@ -187,10 +269,15 @@ static void output_object_code(JSContext *ctx,
     size_t out_buf_len;
     int flags;
 
-    if (c_name_type == CNAME_TYPE_JSON_MODULE)
+    if (c_name_type == CNAME_TYPE_JSON_MODULE) {
         flags = 0;
-    else
+    } else {
         flags = JS_WRITE_OBJ_BYTECODE;
+        if (no_unused && JS_EnumCodeNames(ctx, obj, mark_used_atom, NULL)) {
+            js_std_dump_error(ctx);
+            exit(1);
+        }
+    }
     if (byte_swap)
         flags |= JS_WRITE_OBJ_BSWAP;
     out_buf = JS_WriteObject(ctx, &out_buf_len, obj, flags);
@@ -249,6 +336,10 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
     /* check if it is a declared C or system module */
     e = namelist_find(&cmodule_list, module_name);
     if (e) {
+        if (e->flags & CMODULE_SYSTEM)
+            mark_used_name(e->name);
+        else
+            mark_all_used(); /* unknown needs */
         /* add in the static init module list */
         namelist_add(&init_module_list, e->name, e->short_name, 0);
         /* create a dummy module */
@@ -260,6 +351,7 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
         /* the resulting executable will export its symbols for the
            dynamic library */
         dynamic_export = TRUE;
+        mark_all_used();
     } else {
         size_t buf_len;
         uint8_t *buf;
@@ -271,6 +363,12 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
             return NULL;
         if (type == JS_MODULE_TYPE_JS && has_suffix(module_name, ".json"))
             type = JS_MODULE_TYPE_JSON;
+        if (type == JS_MODULE_TYPE_BYTES)
+            mark_used_name("Uint8Array");
+        /* the module output below has no attributes, so an import with
+           attributes does not find it and loads the file at run time */
+        if (!JS_IsUndefined(attributes))
+            used_feature_bitmap |= (uint64_t)1 << FE_MODULE_LOADER;
         buf = js_load_file(ctx, &buf_len, module_name);
         if (!buf) {
             JS_ThrowReferenceError(ctx, "could not load module filename '%s'",
@@ -429,9 +527,10 @@ void help(void)
 #endif
            , JS_DEFAULT_STACK_SIZE);
 #ifdef CONFIG_LTO
+    printf("-flto       use link time optimization\n");
+#endif
     {
         int i;
-        printf("-flto       use link time optimization\n");
         printf("-fno-[");
         for(i = 0; i < countof(feature_list); i++) {
             if (i != 0)
@@ -439,9 +538,9 @@ void help(void)
             printf("%s", feature_list[i].option_name);
         }
         printf("]\n"
-               "            disable selected language features (smaller code size)\n");
+               "            disable selected language features (smaller code size)\n"
+               "-fno-unused disable the features the compiled code does not reference\n");
     }
-#endif
     exit(1);
 }
 
@@ -520,8 +619,17 @@ static int output_executable(const char *out_filename, const char *cfilename,
     *arg++ = inc_dir;
     *arg++ = "-o";
     *arg++ = out_filename;
-    if (dynamic_export)
+    if (dynamic_export) {
         *arg++ = "-rdynamic";
+    } else {
+        /* drop the code of the disabled features (the library is
+           compiled with -ffunction-sections -fdata-sections) */
+#if defined(__APPLE__)
+        *arg++ = "-Wl,-dead_strip";
+#else
+        *arg++ = "-Wl,--gc-sections";
+#endif
+    }
     *arg++ = cfilename;
     snprintf(libjsname, sizeof(libjsname), "%s/libquickjs%s%s.a",
              lib_dir, bn_suffix, lto_suffix);
@@ -625,9 +733,9 @@ int main(int argc, char **argv)
     memset(&dynamic_module_list, 0, sizeof(dynamic_module_list));
 
     /* add system modules */
-    namelist_add(&cmodule_list, "std", "std", 0);
-    namelist_add(&cmodule_list, "os", "os", 0);
-    namelist_add(&cmodule_list, "bjson", "bjson", 0);
+    namelist_add(&cmodule_list, "std", "std", CMODULE_SYSTEM);
+    namelist_add(&cmodule_list, "os", "os", CMODULE_SYSTEM);
+    namelist_add(&cmodule_list, "bjson", "bjson", CMODULE_SYSTEM);
 
     optind = 1;
     while (optind < argc && *argv[optind] == '-') {
@@ -675,6 +783,9 @@ int main(int argc, char **argv)
                 p = optarg;
                 if (!strcmp(p, "lto")) {
                     use_lto = TRUE;
+                } else if (!strcmp(p, "no-unused")) {
+                    use_lto = TRUE;
+                    no_unused = TRUE;
                 } else if (strstart(p, "no-", &p)) {
                     use_lto = TRUE;
                     for(i = 0; i < countof(feature_list); i++) {
@@ -830,18 +941,22 @@ int main(int argc, char **argv)
                 "  JSContext *ctx = JS_NewContextRaw(rt);\n"
                 "  if (!ctx)\n"
                 "    return NULL;\n");
+        if (no_unused) {
+            if (used_feature_bitmap & ((uint64_t)1 << FE_EVAL))
+                mark_all_used();
+            feature_bitmap &= used_feature_bitmap;
+        }
         /* add the basic objects */
         fprintf(fo, "  JS_AddIntrinsicBaseObjects(ctx);\n");
         for(i = 0; i < countof(feature_list); i++) {
             if ((feature_bitmap & ((uint64_t)1 << i)) &&
-                feature_list[i].init_name) {
-                fprintf(fo, "  JS_AddIntrinsic%s(ctx);\n",
-                        feature_list[i].init_name);
+                feature_list[i].init_func) {
+                fprintf(fo, "  %s(ctx);\n", feature_list[i].init_func);
             }
         }
-        
+
 #ifdef CONFIG_TEMPORAL_INTL
-        if (enable_experimental) {
+        if (enable_experimental && (!no_unused || used_experimental)) {
             fprintf(fo, "  JS_AddIntrinsicTemporal(ctx);\n");
             fprintf(fo, "  JS_AddIntrinsicIntl(ctx);\n");
         }
