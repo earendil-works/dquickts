@@ -1,7 +1,7 @@
 //! JavaScript array types.
 
 use crate::{atom::PredefinedAtom, qjs, Ctx, FromJs, IntoJs, Object, Result, Value};
-use core::{iter::FusedIterator, marker::PhantomData};
+use core::{iter::FusedIterator, marker::PhantomData, ptr};
 
 use super::convert::FromIteratorJs;
 
@@ -47,9 +47,20 @@ impl<'js> Array<'js> {
         let ctx = self.ctx();
         let obj = self.0.as_js_value();
         let val = unsafe {
-            let val = qjs::JS_GetPropertyUint32(ctx.as_ptr(), obj, idx as _);
-            let val = ctx.handle_exception(val)?;
-            Value::from_js_value(ctx.clone(), val)
+            let mut values: *mut qjs::JSValue = ptr::null_mut();
+            let mut count: u32 = 0;
+            // Elements stored in a fast array are own data properties: reading them
+            // directly is what JS_GetPropertyUint32() would do. The pointer is used
+            // before any JS code can run.
+            if qjs::JS_GetFastArray(ctx.as_ptr(), obj, &mut values, &mut count) != 0
+                && idx < count as usize
+            {
+                Value::from_js_value_const(ctx.clone(), *values.add(idx))
+            } else {
+                let val = qjs::JS_GetPropertyUint32(ctx.as_ptr(), obj, idx as _);
+                let val = ctx.handle_exception(val)?;
+                Value::from_js_value(ctx.clone(), val)
+            }
         };
         V::from_js(ctx, val)
     }
@@ -180,7 +191,7 @@ where
 #[cfg(test)]
 mod test {
 
-    use crate::*;
+    use crate::{convert::List, *};
     #[test]
     fn from_javascript() {
         test_with(|ctx| {
@@ -266,6 +277,98 @@ mod test {
             assert_eq!(i32::from_js(&ctx, array.get(0).unwrap()).unwrap(), 1);
             assert_eq!(i32::from_js(&ctx, array.get(1).unwrap()).unwrap(), 2);
             assert_eq!(i32::from_js(&ctx, array.get(2).unwrap()).unwrap(), 3);
+        })
+    }
+
+    #[test]
+    fn get_holes() {
+        test_with(|ctx| {
+            let val: Array = ctx
+                .eval(
+                    r#"
+                Array.prototype[3] = 'inherited';
+                let a = ['a', 'b'];
+                a.length = 5;
+                a
+                "#,
+                )
+                .unwrap();
+            assert_eq!(val.len(), 5);
+            assert_eq!(val.get::<StdString>(1).unwrap(), "b");
+            // trailing holes of a fast array go through the prototype chain
+            assert_eq!(val.get::<Option<i32>>(2).unwrap(), None);
+            assert_eq!(val.get::<StdString>(3).unwrap(), "inherited");
+            let elems: Vec<Option<StdString>> = val.iter().collect::<Result<_>>().unwrap();
+            assert_eq!(
+                elems,
+                [Some("a"), Some("b"), None, Some("inherited"), None]
+                    .map(|s| s.map(StdString::from))
+            );
+        })
+    }
+
+    #[test]
+    fn from_js_sparse() {
+        test_with(|ctx| {
+            let val: Vec<Option<i32>> = ctx.eval("let s = [1, , 3]; s[6] = 7; s").unwrap();
+            assert_eq!(val, [Some(1), None, Some(3), None, None, None, Some(7)]);
+            let val: Vec<Option<i32>> = ctx.eval("[]").unwrap();
+            assert!(val.is_empty());
+        })
+    }
+
+    #[test]
+    fn from_js_getters() {
+        test_with(|ctx| {
+            let val: Vec<i32> = ctx
+                .eval("Object.defineProperty([1, 2, 3], 1, { get() { return 42 } })")
+                .unwrap();
+            assert_eq!(val, [1, 42, 3]);
+            let src = "Object.defineProperty([1, 2], 0, { get() { throw 'getter' } })";
+            let err = ctx.eval::<Vec<i32>, _>(src).unwrap_err();
+            assert!(matches!(err, Error::Exception));
+            assert_eq!(ctx.catch().get::<StdString>().unwrap(), "getter");
+            let val: List<(i32, i32)> = ctx
+                .eval("Object.defineProperty([1, 2], 1, { get() { return 5 } })")
+                .unwrap();
+            assert_eq!(val.0, (1, 5));
+        })
+    }
+
+    #[test]
+    fn from_js_modified_during_conversion() {
+        test_with(|ctx| {
+            // the conversion of the first element changes and truncates the array:
+            // the elements are read when they are converted
+            let val: Vec<Option<Coerced<i32>>> = ctx
+                .eval(
+                    r#"
+                let m = [{ valueOf() { m[1] = 5; m.length = 3; return 1 } }, 2, 3, {}];
+                m
+                "#,
+                )
+                .unwrap();
+            let val: Vec<_> = val.into_iter().map(|v| v.map(|v| v.0)).collect();
+            assert_eq!(val, [Some(1), Some(5), Some(3), None]);
+
+            let array: Array = ctx.eval("[1, 2, 3]").unwrap();
+            let mut iter = array.iter::<i32>();
+            assert_eq!(iter.next().unwrap().unwrap(), 1);
+            array.set(1, 20).unwrap();
+            assert_eq!(iter.next().unwrap().unwrap(), 20);
+            array.set(5, 6).unwrap();
+            assert_eq!(iter.next().unwrap().unwrap(), 3);
+            assert!(iter.next().is_none());
+        })
+    }
+
+    #[test]
+    fn from_js_not_arrays() {
+        test_with(|ctx| {
+            assert!(ctx.eval::<Vec<i32>, _>("new Proxy([1, 2], {})").is_err());
+            assert!(ctx.eval::<Vec<i32>, _>("new Int32Array([1, 2])").is_err());
+            assert!(ctx.eval::<Vec<i32>, _>("({ length: 1, 0: 1 })").is_err());
+            assert!(ctx.eval::<List<(i32, i32)>, _>("new Proxy([1, 2], {})").is_err());
         })
     }
 }
