@@ -728,19 +728,29 @@ impl<'js> Ctx<'js> {
     ///
     /// A suspension by the `snapshot()` builtin is carried out (the runtime is saved) and the
     /// execution continues; one by the `restore()` builtin is returned as [`Error::Restore`].
+    #[inline]
     pub(crate) unsafe fn handle_exception(&self, js_val: qjs::JSValue) -> Result<qjs::JSValue> {
-        let mut js_val = js_val;
+        if qjs::JS_VALUE_GET_NORM_TAG(js_val) != qjs::JS_TAG_EXCEPTION {
+            return Ok(js_val);
+        }
+        self.handle_exception_slow()
+    }
+
+    /// The part of [`Ctx::handle_exception`] for a [`JSValue`] which is an exception.
+    #[cold]
+    #[inline(never)]
+    unsafe fn handle_exception_slow(&self) -> Result<qjs::JSValue> {
         loop {
-            if qjs::JS_VALUE_GET_NORM_TAG(js_val) != qjs::JS_TAG_EXCEPTION {
-                return Ok(js_val);
-            }
             let error = self.raise_exception();
             // taken in any case: when the suspension of the builtin call failed (e.g. out of
             // memory), the request must not be carried out by a later suspension
             let request = self.get_opaque().take_builtin_request();
             match request {
                 Some(request) if error.is_suspended() => {
-                    js_val = crate::snapshot::complete_builtin(self, request)?
+                    let js_val = crate::snapshot::complete_builtin(self, request)?;
+                    if qjs::JS_VALUE_GET_NORM_TAG(js_val) != qjs::JS_TAG_EXCEPTION {
+                        return Ok(js_val);
+                    }
                 }
                 _ => return Err(error),
             }
