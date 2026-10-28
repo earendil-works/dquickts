@@ -9252,7 +9252,8 @@ static JSAutoInitFunc *js_autoinit_func_table[] = {
     JS_InstantiateFunctionListItem2, /* JS_AUTOINIT_ID_PROP */
 };
 
-/* warning: 'prs' is reallocated after it */
+/* warning: 'prs' is reallocated after it. On failure the property is
+   left unchanged so that it is instantiated again at the next access. */
 static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
                                JSProperty *pr, JSShapeProperty *prs)
 {
@@ -9260,6 +9261,8 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     JSContext *realm;
     JSAutoInitFunc *func;
     JSAutoInitIDEnum id;
+    JSVarRef *var_ref = NULL;
+    BOOL ns_var_ref;
     
     if (js_shape_prepare_update(ctx, p, &prs))
         return -1;
@@ -9269,23 +9272,26 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     func = js_autoinit_func_table[id];
     /* 'func' shall not modify the object properties 'pr' */
     val = func(realm, p, prop, pr->u.init.opaque);
-    js_autoinit_free(ctx->rt, pr);
-    prs->flags &= ~JS_PROP_TMASK;
-    pr->u.value = JS_UNDEFINED;
     if (JS_IsException(val))
         return -1;
-    if (id == JS_AUTOINIT_ID_MODULE_NS &&
-        JS_VALUE_GET_TAG(val) == JS_TAG_STRING) {
-        /* WARNING: a varref is returned as a string  ! */
+    /* WARNING: a varref is returned as a string  ! */
+    ns_var_ref = id == JS_AUTOINIT_ID_MODULE_NS &&
+        JS_VALUE_GET_TAG(val) == JS_TAG_STRING;
+    if (!ns_var_ref && p->class_id == JS_CLASS_GLOBAL_OBJECT) {
+        /* in the global object we use references */
+        var_ref = js_create_var_ref(ctx, FALSE);
+        if (!var_ref) {
+            JS_FreeValue(ctx, val);
+            return -1;
+        }
+    }
+    js_autoinit_free(ctx->rt, pr);
+    prs->flags &= ~JS_PROP_TMASK;
+    if (ns_var_ref) {
         prs->flags |= JS_PROP_VARREF;
         pr->u.var_ref = JS_VALUE_GET_PTR(val);
         js_rc(pr->u.var_ref)->ref_count++;
-    } else if (p->class_id == JS_CLASS_GLOBAL_OBJECT) {
-        JSVarRef *var_ref;
-        /* in the global object we use references */
-        var_ref = js_create_var_ref(ctx, FALSE);
-        if (!var_ref)
-            return -1;
+    } else if (var_ref) {
         prs->flags |= JS_PROP_VARREF;
         pr->u.var_ref = var_ref;
         var_ref->value = val; 
@@ -10685,6 +10691,7 @@ static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
                                          JSValue val, int flags)
 {
     uint32_t new_len, array_len;
+    BOOL update_len = FALSE;
     /* extend the array by one */
     /* XXX: convert to slow array if new_len > 2^31-1 elements */
     new_len = p->u.array.count + 1;
@@ -10697,7 +10704,7 @@ static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
                 JS_FreeValue(ctx, val);
                 return JS_ThrowTypeErrorReadOnly(ctx, flags, JS_ATOM_length);
             }
-            p->prop[0].u.value = JS_NewInt32(ctx, new_len);
+            update_len = TRUE;
         }
     }
     if (unlikely(new_len > p->u.array.u1.size)) {
@@ -10706,6 +10713,8 @@ static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
             return -1;
         }
     }
+    if (update_len)
+        p->prop[0].u.value = JS_NewInt32(ctx, new_len);
     p->u.array.u.values[new_len - 1] = val;
     p->u.array.count = new_len;
     return TRUE;
@@ -11065,8 +11074,10 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                 return call_setter(ctx, pr->u.getset.setter, this_obj, val, flags);
             } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
                 /* Instantiate property and retry (potentially useless) */
-                if (JS_AutoInitProperty(ctx, p1, prop, pr, prs))
+                if (JS_AutoInitProperty(ctx, p1, prop, pr, prs)) {
+                    JS_FreeValue(ctx, val);
                     return -1;
+                }
                 goto retry2;
             } else if (!(prs->flags & JS_PROP_WRITABLE)) {
                 goto read_only_prop;

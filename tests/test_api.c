@@ -999,6 +999,132 @@ static void test_with_resolvers_oom(void)
     CHECK(ok);
 }
 
+/* the small blocks come from arenas, so a memory limit alone does not
+   make them fail: take every free small block, then give back all but
+   those of size 'keep_size' or, if keep_size is 0, the last 'n' ones */
+static void *oom_blocks[1 << 16];
+static size_t oom_sizes[1 << 16];
+
+static int oom_fill(JSRuntime *rt, size_t keep_size, int n)
+{
+    int i, j, count = 0, any = 1;
+    size_t size;
+
+    while (any && count < (int)countof(oom_blocks) - 64) {
+        any = 0;
+        for(size = 8; size <= 496; size += 8) {
+            void *p = js_malloc_rt(rt, size);
+            if (p) {
+                oom_sizes[count] = size;
+                oom_blocks[count++] = p;
+                any = 1;
+            }
+        }
+    }
+    if (keep_size) {
+        for(i = j = 0; i < count; i++) {
+            if (oom_sizes[i] == keep_size)
+                oom_blocks[j++] = oom_blocks[i];
+            else
+                js_free_rt(rt, oom_blocks[i]);
+        }
+        count = j;
+    } else {
+        while (n-- > 0 && count > 0)
+            js_free_rt(rt, oom_blocks[--count]);
+    }
+    return count;
+}
+
+/* regression test: running out of memory while instantiating a lazy
+   (autoinit) property made it undefined for good and could leak the
+   value (bellard/quickjs#580, #576); a failed push on a fast array
+   incremented its length (bellard/quickjs#576) */
+static void test_autoinit_oom(void)
+{
+    static const char *const names[] = {
+        "JSON.parse", "decodeURIComponent", "JSON.stringify"
+    };
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSMemoryUsage stats;
+    JSValue global, json, o, v;
+    char buf[64];
+    int which, i, count, failed, n_failed = 0;
+    size_t limit;
+
+    for(which = 0; which < 3; which++) {
+        for(i = 0; i < 62 + 16; i++) {
+            rt = JS_NewRuntime();
+            ctx = JS_NewContext(rt);
+            global = JS_GetGlobalObject(ctx);
+            json = JS_GetPropertyStr(ctx, global, "JSON");
+            o = JS_NewObjectProto(ctx, json);
+            v = which == 2 ? JS_NewObject(ctx) : JS_UNDEFINED;
+            JS_ComputeMemoryUsage(rt, &stats);
+            JS_SetMemoryLimit(rt, stats.malloc_size);
+            if (i < 62)
+                count = oom_fill(rt, 8 + 8 * i, 0);
+            else
+                count = oom_fill(rt, 0, i - 62);
+            if (which == 0) {
+                v = JS_GetPropertyStr(ctx, json, "parse");
+                failed = JS_IsException(v);
+            } else if (which == 1) {
+                v = JS_GetPropertyStr(ctx, global, "decodeURIComponent");
+                failed = JS_IsException(v);
+            } else {
+                failed = JS_SetPropertyStr(ctx, o, "stringify", v) < 0;
+                v = JS_UNDEFINED;
+            }
+            JS_FreeValue(ctx, v);
+            if (failed)
+                JS_FreeValue(ctx, JS_GetException(ctx));
+            while (count > 0)
+                js_free_rt(rt, oom_blocks[--count]);
+            JS_SetMemoryLimit(rt, -1);
+            if (failed) {
+                n_failed++;
+                snprintf(buf, sizeof(buf), "typeof %s === 'function'",
+                         names[which]);
+                CHECK(eval_bool(ctx, buf));
+            }
+            JS_FreeValue(ctx, o);
+            JS_FreeValue(ctx, json);
+            JS_FreeValue(ctx, global);
+            JS_FreeContext(ctx);
+            JS_FreeRuntime(rt); /* asserts that no object is leaked */
+        }
+    }
+    CHECK(n_failed > 0);
+
+    n_failed = 0;
+    for(limit = 0; limit < 2048; limit += 64) {
+        rt = JS_NewRuntime();
+        ctx = JS_NewContext(rt);
+        global = JS_GetGlobalObject(ctx);
+        o = JS_NewArray(ctx);
+        JS_SetPropertyStr(ctx, global, "a", JS_DupValue(ctx, o));
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, stats.malloc_size + limit);
+        for(i = 0; i < 100000; i++) {
+            if (JS_SetPropertyUint32(ctx, o, i, JS_NewInt32(ctx, i)) < 0)
+                break;
+        }
+        JS_SetMemoryLimit(rt, -1);
+        if (i < 100000) {
+            n_failed++;
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            CHECK(eval_bool(ctx, "a.length === a.filter(() => true).length"));
+        }
+        JS_FreeValue(ctx, o);
+        JS_FreeValue(ctx, global);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+    }
+    CHECK(n_failed > 0);
+}
+
 static int detect_module(const char *src)
 {
     return JS_DetectModule(src, strlen(src));
@@ -1703,6 +1829,7 @@ int main(void)
 
     test_promise_hooks();
     test_with_resolvers_oom();
+    test_autoinit_oom();
     test_detect_module();
     printf("test_api: OK\n");
     return 0;
