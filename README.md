@@ -74,25 +74,25 @@ closures:
 $ ./qjs --drepl session.snap
 QuickJS - Type "\h" for help
 Created the durable session session.snap
-qjs > function add(a: number, b: number): number { return a + b }
+qjs> function add(a: number, b: number): number { return a + b }
 undefined
-qjs > let total: number = add(2, 3)
+qjs> let total: number = add(2, 3)
 undefined
-qjs > class Counter { constructor(private n = 0) {} inc(): number { return ++this.n } }
+qjs> class Counter { constructor(private n = 0) {} inc(): number { return ++this.n } }
 undefined
-qjs > const c = new Counter()
+qjs> const c = new Counter()
 undefined
-qjs > c.inc()
+qjs> c.inc()
 1
-qjs > ^C
+qjs> ^C
 (Press Ctrl-C again to quit)
-qjs > ^C
+qjs> ^C
 $ ./qjs --drepl session.snap
 QuickJS - Type "\h" for help
 Restored the durable session session.snap
-qjs > add(total, 10)
+qjs> add(total, 10)
 15
-qjs > c.inc()
+qjs> c.inc()
 2
 ```
 
