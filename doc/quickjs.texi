@@ -365,6 +365,16 @@ not keep the immutability: a read ArrayBuffer is always mutable.
 
 ECMA402 (Internationalization API) is not supported.
 
+The experimental Temporal and Intl implementation (@code{qjs
+--experimental}) embeds a subset of the IANA time zone database. The
+other time zones are loaded on first use from the system time zone
+database: the directory given by the @code{TZDIR} environment variable,
+@file{/usr/share/zoneinfo}, @file{/var/db/timezone/zoneinfo} or
+@file{/usr/share/lib/zoneinfo}. @code{Intl.supportedValuesOf('timeZone')}
+also lists the zones of its @file{tzdata.zi} file. Without a system time
+zone database (e.g. on Windows), only the embedded time zones are
+available.
+
 @subsection Stack traces
 
 The stack trace of an error is captured when the error object is

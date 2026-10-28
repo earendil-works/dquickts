@@ -26,8 +26,12 @@ extern const TZData ti_tz_zone_data[];
 extern const TZAlias ti_tz_aliases[];
 extern const int ti_tz_alias_count;
 
-/* Lookup functions */
+/* Lookup functions. The zones which are not embedded are loaded from the
+   system tz database when available. */
 int ti_tz_find_id(const char *name);
+/* sorted list of the available primary time zone identifiers */
+int ti_tz_primary_name_count(void);
+const char *ti_tz_primary_name(int i);
 int ti_tz_offset_at_sec(int tz_id, int64_t epoch_sec);
 int ti_tz_prev_offset_at_sec(int tz_id, int64_t epoch_sec);
 int64_t ti_tz_next_transition_sec(int tz_id, int64_t epoch_sec);

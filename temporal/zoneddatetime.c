@@ -970,6 +970,9 @@ static JSValue js_zoneddatetime_getTimeZoneTransition(JSContext *ctx, JSValueCon
         return JS_NULL;
     ts.secs = trans_sec;
     ts.nsecs = 0;
+    /* the rule of a system zone gives transitions after the last instant */
+    if (!is_valid_epoch_timespec(&ts))
+        return JS_NULL;
     return js_create_zoneddatetime(ctx, &ts, s->timeZone, s->calendar);
 }
 

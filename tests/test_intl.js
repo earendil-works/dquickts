@@ -217,6 +217,63 @@ function test_dateTimeFormat() {
            "dezembro 12, 2017", "pt-BR dateTimeFormat");
 }
 
+/* zones which are not embedded are loaded from the system tz database */
+function test_system_time_zones() {
+    var f, zdt;
+    try {
+        f = new Intl.DateTimeFormat('en', { timeZone: 'Europe/Rome', hour: 'numeric',
+                                            minute: 'numeric', timeZoneName: 'shortOffset',
+                                            hourCycle: 'h23' });
+    } catch (e) {
+        /* no system tz database */
+        return;
+    }
+    assert(f.resolvedOptions().timeZone, "Europe/Rome", "tz resolved");
+    assert(f.format(Date.UTC(2017, 11, 12, 5)), "06:00 GMT+1", "tz winter");
+    assert(f.format(Date.UTC(2017, 6, 12, 5)), "07:00 GMT+2", "tz summer");
+    /* after the last explicit transition: POSIX TZ rule of the TZif footer */
+    assert(f.format(Date.UTC(2300, 0, 12, 5)), "06:00 GMT+1", "tz rule winter");
+    assert(f.format(Date.UTC(2300, 6, 12, 5)), "07:00 GMT+2", "tz rule summer");
+    assert(new Intl.DateTimeFormat('en', { timeZone: 'asia/kathmandu', timeZoneName: 'shortOffset' })
+           .format(Date.UTC(2020, 0, 1)), "1/1/2020, GMT+5:45", "tz case insensitive");
+
+    zdt = Temporal.Instant.from('2017-07-12T05:00Z').toZonedDateTimeISO('Europe/Rome');
+    assert(zdt.toString(), "2017-07-12T07:00:00+02:00[Europe/Rome]", "tz Temporal");
+    assert(Temporal.ZonedDateTime.from('2017-03-26T12:00[Europe/Rome]').hoursInDay, 23, "tz hoursInDay");
+    zdt = Temporal.ZonedDateTime.from('2300-01-01T00:00[Europe/Rome]');
+    assert(zdt.getTimeZoneTransition('next').toString(),
+           "2300-03-25T03:00:00+02:00[Europe/Rome]", "tz rule next transition");
+    assert(zdt.getTimeZoneTransition('previous').toString(),
+           "2299-10-29T02:00:00+01:00[Europe/Rome]", "tz rule previous transition");
+    assert(Temporal.PlainDateTime.from('2300-03-25T02:30').toZonedDateTime('Europe/Rome').toString(),
+           "2300-03-25T03:30:00+02:00[Europe/Rome]", "tz rule gap");
+    assert(Temporal.PlainDateTime.from('2300-10-28T02:30')
+           .toZonedDateTime('Europe/Rome', { disambiguation: 'later' }).toString(),
+           "2300-10-28T02:30:00+01:00[Europe/Rome]", "tz rule overlap");
+    /* southern hemisphere rule */
+    assert(Temporal.Instant.from('2300-01-01T00:00Z').toZonedDateTimeISO('Australia/Sydney').offset,
+           "+11:00", "tz southern rule summer");
+    assert(Temporal.Instant.from('2300-07-01T00:00Z').toZonedDateTimeISO('Australia/Sydney').offset,
+           "+10:00", "tz southern rule winter");
+
+    Intl.supportedValuesOf('timeZone').forEach(function (tz) {
+        assert(new Intl.DateTimeFormat('en', { timeZone: tz }).resolvedOptions().timeZone, tz,
+               "tz supportedValuesOf DateTimeFormat");
+        assert(new Temporal.ZonedDateTime(0n, tz).timeZoneId, tz, "tz supportedValuesOf Temporal");
+    });
+    /* links of tzdata.zi */
+    if (Intl.supportedValuesOf('timeZone').includes('Europe/Rome')) {
+        assert(new Temporal.ZonedDateTime(0n, 'Europe/Vatican')
+               .equals(new Temporal.ZonedDateTime(0n, 'Europe/Rome')), true, "tz link equals");
+    }
+    assert_throws(function () { new Intl.DateTimeFormat('en', { timeZone: 'Europe/Nowhere' }); },
+                  "tz unknown DateTimeFormat");
+    assert_throws(function () { new Temporal.ZonedDateTime(0n, 'Europe/Nowhere'); },
+                  "tz unknown ZonedDateTime");
+    assert_throws(function () { new Temporal.ZonedDateTime(0n, 'posix/Europe/Rome'); },
+                  "tz posix directory");
+}
+
 function test_numberFormat() {
     // en
     assert(new Intl.NumberFormat('en').format(1234567.89), "1,234,567.89", "en number");
@@ -471,6 +528,7 @@ function test_durationFormat() {
 
 /* Run all tests */
 test_dateTimeFormat();
+test_system_time_zones();
 test_numberFormat();
 test_collator();
 test_listFormat();

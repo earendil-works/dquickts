@@ -1612,10 +1612,10 @@ static JSValue js_intl_supportedValuesOf(JSContext *ctx, JSValueConst this_val,
                                          JS_PROP_C_W_E);
         }
     } else if (!strcmp(key, "timeZone")) {
-        int i;
-        for (i = 0; i < ti_tz_zone_count; i++) {
+        int i, n = ti_tz_primary_name_count();
+        for (i = 0; i < n; i++) {
             JS_DefinePropertyValueUint32(ctx, result, (uint32_t)i,
-                                         JS_NewString(ctx, ti_tz_zone_data[i].canonical_name),
+                                         JS_NewString(ctx, ti_tz_primary_name(i)),
                                          JS_PROP_C_W_E);
         }
     } else if (!strcmp(key, "unit")) {

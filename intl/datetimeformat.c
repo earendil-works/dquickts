@@ -148,8 +148,6 @@ static int is_valid_locale_type(const char *str)
 static int is_valid_time_zone(const char *str)
 {
     int len = (int)strlen(str);
-    int i;
-    int has_slash = 0;
     if (len == 0)
         return 0;
     if (str[0] == '+' || str[0] == '-') {
@@ -176,19 +174,7 @@ static int is_valid_time_zone(const char *str)
         }
         return hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59;
     }
-    /* allow UTC and GMT in any case */
-    if (!strcasecmp(str, "UTC") || !strcasecmp(str, "GMT"))
-        return 1;
-    /* IANA time zone names must contain a slash, except UTC/GMT/Etc zones */
-    for (i = 0; i < len; i++) {
-        char c = str[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-              (c >= '0' && c <= '9') || c == '/' || c == '_' || c == '-' || c == '+'))
-            return 0;
-        if (c == '/')
-            has_slash = 1;
-    }
-    return has_slash;
+    return ti_tz_find_id(str) >= 0;
 }
 
 static int is_supported_calendar(const char *str)
