@@ -673,6 +673,62 @@ static void test_set_length(JSContext *ctx)
     check_exception(ctx, "TypeError");
 }
 
+static void test_fast_array(JSContext *ctx)
+{
+    static const char *const slow[] = {
+        "var sp = []; sp[10] = 1; sp", /* holes */
+        "Object.defineProperty([1, 2], 0, { get() { return 3 } })",
+        "new Proxy([1, 2], {})",
+        "new Int32Array(2)",
+        "(function() { return arguments })(1, 2)",
+        "({ length: 1, 0: 1 })",
+    };
+    JSValue obj, vals[2], *tab;
+    uint32_t len;
+    int64_t len64;
+    const char *str;
+    size_t i;
+
+    obj = eval_str(ctx, "[1, 'ab', {}]");
+    tab = NULL;
+    len = 0;
+    CHECK(JS_GetFastArray(ctx, obj, &tab, &len));
+    CHECK(len == 3 && tab != NULL);
+    CHECK(JS_VALUE_GET_TAG(tab[0]) == JS_TAG_INT && JS_VALUE_GET_INT(tab[0]) == 1);
+    str = JS_ToCString(ctx, tab[1]);
+    CHECK(str && !strcmp(str, "ab"));
+    JS_FreeCString(ctx, str);
+    CHECK(JS_IsObject(tab[2]));
+    JS_FreeValue(ctx, obj);
+
+    /* trailing holes: only the stored elements are returned */
+    obj = eval_str(ctx, "var th = [1, 2]; th.length = 5; th");
+    CHECK(JS_GetFastArray(ctx, obj, &tab, &len) && len == 2);
+    CHECK(JS_GetLength(ctx, obj, &len64) == 0 && len64 == 5);
+    JS_FreeValue(ctx, obj);
+
+    vals[0] = JS_NewInt32(ctx, 7);
+    vals[1] = JS_NewString(ctx, "x");
+    obj = JS_NewArrayFrom(ctx, 2, vals);
+    CHECK(JS_GetFastArray(ctx, obj, &tab, &len) && len == 2);
+    CHECK(JS_VALUE_GET_INT(tab[0]) == 7 && JS_IsString(tab[1]));
+    JS_FreeValue(ctx, obj);
+
+    obj = JS_NewArray(ctx);
+    CHECK(JS_GetFastArray(ctx, obj, &tab, &len) && len == 0);
+    JS_FreeValue(ctx, obj);
+
+    for (i = 0; i < countof(slow); i++) {
+        obj = eval_str(ctx, slow[i]);
+        CHECK(!JS_IsException(obj));
+        CHECK(!JS_GetFastArray(ctx, obj, &tab, &len));
+        JS_FreeValue(ctx, obj);
+    }
+    CHECK(!JS_GetFastArray(ctx, JS_NewInt32(ctx, 1), &tab, &len));
+    CHECK(!JS_GetFastArray(ctx, JS_UNDEFINED, &tab, &len));
+    CHECK(!JS_HasException(ctx));
+}
+
 static void test_conversions(JSContext *ctx)
 {
     JSValue v, obj;
@@ -2611,6 +2667,7 @@ int main(void)
     test_is_module(ctx);
     test_property_values(ctx);
     test_set_length(ctx);
+    test_fast_array(ctx);
     test_conversions(ctx);
     test_uint8_arrays(ctx);
     test_free_macros(ctx);

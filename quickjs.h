@@ -1055,6 +1055,20 @@ int JS_IsArray(JSContext *ctx, JSValueConst val);
 /* new array with the 'count' elements values[]. The values are freed,
    even in case of exception. */
 JSValue JS_NewArrayFrom(JSContext *ctx, int count, const JSValue *values);
+/* If 'obj' is an Array whose elements are stored contiguously (a
+   "fast array"), return TRUE and set *pvalues to its element storage
+   and *plen to the number of stored elements. Otherwise (array with
+   holes or non-index properties, Proxy, typed array, non-object...)
+   return FALSE. Never throws.
+   The indexes 0 to *plen - 1 are own writable data properties.
+   *plen can be smaller than 'length': the indexes from *plen to
+   length - 1 are holes. The values are borrowed (use JS_DupValue() to
+   keep one) and must not be modified. The pointer is only valid until
+   the array is modified or freed, i.e. until any JS code, getter,
+   setter, Proxy trap, finalizer or garbage collection may run: check
+   again after such operations. */
+JS_BOOL JS_GetFastArray(JSContext *ctx, JSValueConst obj,
+                        JSValue **pvalues, uint32_t *plen);
 /* ToLength(obj.length): return -1 if exception */
 int JS_GetLength(JSContext *ctx, JSValueConst obj, int64_t *pres);
 /* obj.length = len (throwing on failure): return -1 if exception */

@@ -11506,6 +11506,12 @@ JSValue JS_NewArrayFrom(JSContext *ctx, int count, const JSValue *values)
     return js_create_array_free(ctx, count, (JSValue *)values);
 }
 
+JS_BOOL JS_GetFastArray(JSContext *ctx, JSValueConst obj,
+                        JSValue **pvalues, uint32_t *plen)
+{
+    return js_get_fast_array(ctx, obj, pvalues, plen);
+}
+
 JSValue JS_NewObjectFrom(JSContext *ctx, int count, const JSAtom *props,
                          const JSValue *values)
 {

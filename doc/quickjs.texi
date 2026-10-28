@@ -1293,6 +1293,15 @@ the name is not an atom yet and no exotic object (such as a
 @code{JS_GetOwnPropertyNames()} would return with the same flags,
 without building the list for ordinary objects.
 
+@code{JS_NewArrayFrom()} creates an array from a C array of values
+(taking ownership of them). @code{JS_GetFastArray()} gives direct read
+access to the elements of an array without holes: the returned pointer
+is borrowed and only valid until the array is modified or any
+Javascript code (getter, setter, Proxy trap, finalizer...) may run, so
+the elements should be duplicated with @code{JS_DupValue()} before
+doing anything else. Proxies, typed arrays and arrays with holes are
+not handled: use @code{JS_GetPropertyUint32()} for them.
+
 @subsection C functions
 
 C functions can be created with

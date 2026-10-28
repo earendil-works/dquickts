@@ -1324,6 +1324,14 @@ unsafe extern "C" {
     ) -> JSValue;
 }
 unsafe extern "C" {
+    pub fn JS_GetFastArray(
+        ctx: *mut JSContext,
+        obj: JSValue,
+        pvalues: *mut *mut JSValue,
+        plen: *mut u32,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn JS_GetLength(ctx: *mut JSContext, obj: JSValue, pres: *mut i64) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
