@@ -209,6 +209,7 @@ impl JsFunction {
         }
     }
 
+    /// The body of `IntoJsFunc::call_raw`.
     pub fn expand_to_js_function_body(&self, lib_crate: &Ident) -> TokenStream {
         let arg_extract = self.params.expand_extract(lib_crate);
         let arg_apply = self.params.expand_apply();
@@ -222,13 +223,13 @@ impl JsFunction {
                     #rust_function(#arg_apply).await
                 };
 
-                #lib_crate::IntoJs::into_js(#lib_crate::promise::Promised(fut), _params.ctx())
+                #lib_crate::IntoJs::into_js_raw(#lib_crate::promise::Promised(fut), _params.ctx())
             }
         } else {
             quote! {
                 #arg_extract
                 let res = #rust_function(#arg_apply);
-                #lib_crate::IntoJs::into_js(res, _params.ctx())
+                #lib_crate::IntoJs::into_js_raw(res, _params.ctx())
             }
         }
     }
@@ -252,9 +253,17 @@ impl JsFunction {
                     #(#arg_type_requirements)*
                 }
 
+                fn call<'a>(&self, params: #lib_crate::function::Params<'a,'js>) -> #lib_crate::Result<#lib_crate::Value<'js>>{
+                    let ctx = params.ctx().clone();
+                    let value = <Self as #lib_crate::function::IntoJsFunc<'js,#arg_type_tuple>>::call_raw(self, params)?;
+                    // SAFETY: an owned value of the context of the call
+                    Ok(unsafe { #lib_crate::Value::from_raw(ctx, value) })
+                }
+
                 // the parameter requirements are checked by the function wrapper
                 // (`Function::new`, `Constructor::new_class`) before it calls this
-                fn call<'a>(&self, params: #lib_crate::function::Params<'a,'js>) -> #lib_crate::Result<#lib_crate::Value<'js>>{
+                #[inline]
+                fn call_raw<'a>(&self, params: #lib_crate::function::Params<'a,'js>) -> #lib_crate::Result<#lib_crate::qjs::JSValue>{
                     let mut _params = params.access();
                     #body
                 }

@@ -3,7 +3,6 @@
 use crate::{
     atom::PredefinedAtom,
     class::{Class, JsClass},
-    function::ffi::RustFunc,
     qjs, Ctx, Error, FromJs, IntoJs, Object, Result, Value,
 };
 
@@ -30,6 +29,17 @@ pub trait IntoJsFunc<'js, P> {
 
     /// Call the function with the given parameters.
     fn call<'a>(&self, params: Params<'a, 'js>) -> Result<Value<'js>>;
+
+    /// Same as [`IntoJsFunc::call`], but returns the owned raw value.
+    ///
+    /// Calls `call` by default; the implementations of this crate and of its macros implement
+    /// it directly (with [`IntoJs::into_js_raw`]) and `call` with it, it is what a JavaScript
+    /// call of a [`Function::new`] function calls.
+    #[doc(hidden)]
+    #[inline]
+    fn call_raw<'a>(&self, params: Params<'a, 'js>) -> Result<qjs::JSValue> {
+        self.call(params).map(Value::into_js_value)
+    }
 }
 
 /// A JavaScript function.
@@ -43,12 +53,7 @@ impl<'js> Function<'js> {
     where
         F: IntoJsFunc<'js, P> + 'js,
     {
-        let func = Box::new(move |params: Params<'_, 'js>| {
-            params.check_params(F::param_requirements())?;
-            f.call(params)
-        }) as Box<dyn RustFunc<'js> + 'js>;
-
-        let cls = Class::instance(ctx, RustFunction(func))?;
+        let cls = Class::instance_cell(ctx, ffi::JsFn::cell::<P>(f))?;
         debug_assert!(cls.is_function());
         Function(cls.into_inner()).with_length(F::param_requirements().min())
     }

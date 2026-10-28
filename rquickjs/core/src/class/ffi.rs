@@ -1,5 +1,11 @@
 use super::{JsClass, Tracer};
-use crate::{class::JsCell, function::Params, qjs, runtime::opaque::Opaque, Atom, Ctx, Value};
+use crate::{
+    class::JsCell,
+    function::{Params, RustFunction},
+    qjs,
+    runtime::opaque::Opaque,
+    Atom, Ctx, Value,
+};
 use alloc::boxed::Box;
 use core::{any::TypeId, mem, panic::AssertUnwindSafe, ptr::NonNull};
 
@@ -500,6 +506,26 @@ impl VTable {
                 }
             }
         }))
+    }
+
+    /// The v-table of [`RustFunction`] with the given call function.
+    ///
+    /// For the functions whose call function knows the type of the Rust function in the
+    /// `RustFunction`, which it calls without its dynamic dispatch. The v-table is otherwise
+    /// the one of `RustFunction`: the cell is a `RustFunction` to everything else.
+    pub(crate) const fn rust_function(call: CallFunc) -> VTable {
+        VTable {
+            id_fn: TypeId::of::<RustFunction<'static>>,
+            finalizer: VTable::finalizer_impl::<'static, RustFunction<'static>>,
+            trace: VTable::trace_impl::<RustFunction<'static>>,
+            call,
+            get_property: VTable::get_property_impl::<RustFunction<'static>>,
+            set_property: VTable::set_property_impl::<RustFunction<'static>>,
+            has_property: VTable::has_property_impl::<RustFunction<'static>>,
+            delete_property: VTable::delete_property_impl::<RustFunction<'static>>,
+            get_own_property: VTable::get_own_property_impl::<RustFunction<'static>>,
+            get_own_property_names: VTable::get_own_property_names_impl::<RustFunction<'static>>,
+        }
     }
 
     pub fn get<'js, C: JsClass<'js>>() -> &'static VTable {

@@ -222,6 +222,12 @@ impl<'js, C: JsClass<'js>> Deref for Class<'js, C> {
 impl<'js, C: JsClass<'js>> Class<'js, C> {
     /// Create a class from a Rust object.
     pub fn instance(ctx: Ctx<'js>, value: C) -> Result<Class<'js, C>> {
+        Self::instance_cell(ctx, ClassCell::new(value))
+    }
+
+    /// Create a class from the cell of a Rust object, which may have its own v-table.
+    #[inline]
+    pub(crate) fn instance_cell(ctx: Ctx<'js>, cell: ClassCell<JsCell<'js, C>>) -> Result<Self> {
         let id = class_id::<C>();
 
         // borrowed from the cache, which keeps it alive while the object is created
@@ -230,7 +236,7 @@ impl<'js, C: JsClass<'js>> Class<'js, C> {
             ctx.handle_exception(qjs::JS_NewObjectProtoClass(ctx.as_ptr(), prototype, id))?
         };
 
-        let ptr = Box::into_raw(Box::new(ClassCell::new(value)));
+        let ptr = Box::into_raw(Box::new(cell));
         unsafe { qjs::JS_SetOpaque(val, ptr.cast()) };
         Ok(Self(
             unsafe { Object::from_js_value(ctx, val) },
