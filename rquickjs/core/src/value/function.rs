@@ -59,16 +59,17 @@ impl<'js> Function<'js> {
     }
 
     /// Call the function with given arguments.
+    #[inline]
     pub fn call<A, R>(&self, args: A) -> Result<R>
     where
         A: IntoArgs<'js>,
         R: FromJs<'js>,
     {
-        let ctx = self.ctx();
         let num = args.num_args();
-        let mut accum_args = Args::new(ctx.clone(), num);
+        // SAFETY: the args are dropped before the borrow of `self` ends
+        let mut accum_args = unsafe { Args::new_borrowed(self.ctx(), num) };
         args.into_args(&mut accum_args)?;
-        self.call_arg(accum_args)
+        accum_args.apply(self)
     }
 
     /// Call the function with given arguments in the form of an [`Args`] object.
@@ -275,16 +276,17 @@ impl<'js> Constructor<'js> {
     /// Call the constructor as a constructor.
     ///
     /// Equivalent to calling any constructor function with the new keyword.
+    #[inline]
     pub fn construct<A, R>(&self, args: A) -> Result<R>
     where
         A: IntoArgs<'js>,
         R: FromJs<'js>,
     {
-        let ctx = self.ctx();
         let num = args.num_args();
-        let mut accum_args = Args::new(ctx.clone(), num);
+        // SAFETY: the args are dropped before the borrow of `self` ends
+        let mut accum_args = unsafe { Args::new_borrowed(self.ctx(), num) };
         args.into_args(&mut accum_args)?;
-        self.construct_args(accum_args)
+        accum_args.construct(self)
     }
 
     /// Call the constructor as a constructor with an [`Args`] object.
