@@ -847,6 +847,30 @@ JSValue JS_GetException(JSContext *ctx);
 JS_BOOL JS_HasException(JSContext *ctx);
 JS_BOOL JS_IsError(JSContext *ctx, JSValueConst val);
 JSValue JS_NewError(JSContext *ctx);
+/* error kinds of JS_NewErrorLen() and JS_ThrowErrorLen() */
+typedef enum JSErrorEnum {
+    JS_EVAL_ERROR,
+    JS_RANGE_ERROR,
+    JS_REFERENCE_ERROR,
+    JS_SYNTAX_ERROR,
+    JS_TYPE_ERROR,
+    JS_URI_ERROR,
+    JS_INTERNAL_ERROR,
+    JS_AGGREGATE_ERROR,
+    JS_SUPPRESSED_ERROR,
+
+    JS_NATIVE_ERROR_COUNT, /* number of different NativeError objects */
+    JS_PLAIN_ERROR = JS_NATIVE_ERROR_COUNT, /* 'Error' */
+} JSErrorEnum;
+/* new error object of kind 'error_num' whose message is the UTF-8
+   string 'msg' of 'len' bytes (no formatting and no length limit,
+   unlike the printf like functions below). Return JS_EXCEPTION if out
+   of memory. */
+JSValue JS_NewErrorLen(JSContext *ctx, JSErrorEnum error_num,
+                       const char *msg, size_t len);
+/* same as JS_NewErrorLen() but throw the error. Return JS_EXCEPTION. */
+JSValue JS_ThrowErrorLen(JSContext *ctx, JSErrorEnum error_num,
+                         const char *msg, size_t len);
 /* same as the JS_Throw*Error() functions but return the error object
    (or JS_EXCEPTION) without throwing it */
 JSValue __js_printf_like(2, 3) JS_NewSyntaxError(JSContext *ctx, const char *fmt, ...);

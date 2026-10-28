@@ -1025,6 +1025,34 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn JS_NewError(ctx: *mut JSContext) -> JSValue;
 }
+pub const JSErrorEnum_JS_EVAL_ERROR: JSErrorEnum = 0;
+pub const JSErrorEnum_JS_RANGE_ERROR: JSErrorEnum = 1;
+pub const JSErrorEnum_JS_REFERENCE_ERROR: JSErrorEnum = 2;
+pub const JSErrorEnum_JS_SYNTAX_ERROR: JSErrorEnum = 3;
+pub const JSErrorEnum_JS_TYPE_ERROR: JSErrorEnum = 4;
+pub const JSErrorEnum_JS_URI_ERROR: JSErrorEnum = 5;
+pub const JSErrorEnum_JS_INTERNAL_ERROR: JSErrorEnum = 6;
+pub const JSErrorEnum_JS_AGGREGATE_ERROR: JSErrorEnum = 7;
+pub const JSErrorEnum_JS_SUPPRESSED_ERROR: JSErrorEnum = 8;
+pub const JSErrorEnum_JS_NATIVE_ERROR_COUNT: JSErrorEnum = 9;
+pub const JSErrorEnum_JS_PLAIN_ERROR: JSErrorEnum = 9;
+pub type JSErrorEnum = ::core::ffi::c_uint;
+unsafe extern "C" {
+    pub fn JS_NewErrorLen(
+        ctx: *mut JSContext,
+        error_num: JSErrorEnum,
+        msg: *const ::core::ffi::c_char,
+        len: size_t,
+    ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_ThrowErrorLen(
+        ctx: *mut JSContext,
+        error_num: JSErrorEnum,
+        msg: *const ::core::ffi::c_char,
+        len: size_t,
+    ) -> JSValue;
+}
 unsafe extern "C" {
     pub fn JS_NewSyntaxError(ctx: *mut JSContext, fmt: *const ::core::ffi::c_char, ...) -> JSValue;
 }

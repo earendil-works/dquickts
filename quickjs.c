@@ -178,21 +178,6 @@ enum {
 static uint8_t const typed_array_size_log2[JS_TYPED_ARRAY_COUNT];
 #define typed_array_size_log2(classid)  (typed_array_size_log2[(classid)- JS_CLASS_UINT8C_ARRAY])
 
-typedef enum JSErrorEnum {
-    JS_EVAL_ERROR,
-    JS_RANGE_ERROR,
-    JS_REFERENCE_ERROR,
-    JS_SYNTAX_ERROR,
-    JS_TYPE_ERROR,
-    JS_URI_ERROR,
-    JS_INTERNAL_ERROR,
-    JS_AGGREGATE_ERROR,
-    JS_SUPPRESSED_ERROR,
-
-    JS_NATIVE_ERROR_COUNT, /* number of different NativeError objects */
-    JS_PLAIN_ERROR = JS_NATIVE_ERROR_COUNT, /* 'Error', only for JS_ThrowError() */
-} JSErrorEnum;
-
 /* the variable and scope indexes must fit on 16 bits. The (-1) and
    ARG_SCOPE_END values are reserved. */
 #define JS_MAX_LOCAL_VARS 65534
@@ -8933,14 +8918,15 @@ JSValue JS_NewError(JSContext *ctx)
     return JS_NewObjectClass(ctx, JS_CLASS_ERROR);
 }
 
-/* return an error object of type 'error_num' or JS_EXCEPTION */
-static JSValue JS_MakeError(JSContext *ctx, JSErrorEnum error_num,
-                            const char *fmt, va_list ap, BOOL add_backtrace)
+/* return an error object of type 'error_num' whose message is the
+   UTF-8 string 'msg' of 'len' bytes or JS_EXCEPTION */
+static JSValue JS_MakeErrorLen(JSContext *ctx, JSErrorEnum error_num,
+                               const char *msg, size_t len,
+                               BOOL add_backtrace)
 {
-    char buf[256];
     JSValue obj;
 
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    assert(error_num <= JS_PLAIN_ERROR);
     obj = JS_NewObjectProtoClass(ctx, error_num == JS_PLAIN_ERROR ?
                                  ctx->class_proto[JS_CLASS_ERROR] :
                                  ctx->native_error_proto[error_num],
@@ -8948,12 +8934,57 @@ static JSValue JS_MakeError(JSContext *ctx, JSErrorEnum error_num,
     if (unlikely(JS_IsException(obj)))
         return obj;
     JS_DefinePropertyValue(ctx, obj, JS_ATOM_message,
-                           JS_NewString(ctx, buf),
+                           JS_NewStringLen(ctx, msg, len),
                            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     if (add_backtrace) {
         build_backtrace(ctx, obj, NULL, 0, 0, 0);
     }
     return obj;
+}
+
+/* Format the message of an error in 'buf' or, if it is longer, in an
+   allocated buffer which must be freed with js_free_rt() (no
+   truncation unless out of memory). No exception is raised. */
+static char *js_format_message(JSRuntime *rt, char *buf, size_t buf_size,
+                               const char *fmt, va_list ap)
+{
+    va_list ap1;
+    char *msg;
+    int len;
+
+    va_copy(ap1, ap);
+    len = vsnprintf(buf, buf_size, fmt, ap1);
+    va_end(ap1);
+    if (unlikely(len < 0)) {
+        buf[0] = '\0';
+    } else if (unlikely(len >= buf_size)) {
+        msg = js_malloc_rt(rt, len + 1);
+        if (msg) {
+            vsnprintf(msg, len + 1, fmt, ap);
+            return msg;
+        }
+    }
+    return buf;
+}
+
+/* return an error object of type 'error_num' or JS_EXCEPTION */
+static JSValue JS_MakeError(JSContext *ctx, JSErrorEnum error_num,
+                            const char *fmt, va_list ap, BOOL add_backtrace)
+{
+    char buf[256], *msg;
+    JSValue obj;
+
+    msg = js_format_message(ctx->rt, buf, sizeof(buf), fmt, ap);
+    obj = JS_MakeErrorLen(ctx, error_num, msg, strlen(msg), add_backtrace);
+    if (msg != buf)
+        js_free_rt(ctx->rt, msg);
+    return obj;
+}
+
+JSValue JS_NewErrorLen(JSContext *ctx, JSErrorEnum error_num,
+                       const char *msg, size_t len)
+{
+    return JS_MakeErrorLen(ctx, error_num, msg, len, TRUE);
 }
 
 #define JS_DEF_NEW_ERROR(name, error_num)                               \
@@ -8990,18 +9021,36 @@ static JSValue JS_ThrowError2(JSContext *ctx, JSErrorEnum error_num,
     return JS_Throw(ctx, obj);
 }
 
+/* TRUE if the backtrace of a thrown error must be added when it is
+   created. It is added later if called from a bytecode function. */
+static BOOL js_throw_needs_backtrace(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame *sf = rt->current_stack_frame;
+
+    return !rt->in_out_of_memory &&
+        (!sf || (JS_GetFunctionBytecode(sf->cur_func) == NULL));
+}
+
 static JSValue JS_ThrowError(JSContext *ctx, JSErrorEnum error_num,
                              const char *fmt, va_list ap)
 {
-    JSRuntime *rt = ctx->rt;
-    JSStackFrame *sf;
-    BOOL add_backtrace;
+    return JS_ThrowError2(ctx, error_num, fmt, ap,
+                          js_throw_needs_backtrace(ctx));
+}
 
-    /* the backtrace is added later if called from a bytecode function */
-    sf = rt->current_stack_frame;
-    add_backtrace = !rt->in_out_of_memory &&
-        (!sf || (JS_GetFunctionBytecode(sf->cur_func) == NULL));
-    return JS_ThrowError2(ctx, error_num, fmt, ap, add_backtrace);
+JSValue JS_ThrowErrorLen(JSContext *ctx, JSErrorEnum error_num,
+                         const char *msg, size_t len)
+{
+    JSValue obj;
+
+    obj = JS_MakeErrorLen(ctx, error_num, msg, len,
+                          js_throw_needs_backtrace(ctx));
+    if (unlikely(JS_IsException(obj))) {
+        /* out of memory: throw JS_NULL to avoid recursing */
+        obj = JS_NULL;
+    }
+    return JS_Throw(ctx, obj);
 }
 
 JSValue __attribute__((format(printf, 2, 3))) JS_ThrowPlainError(JSContext *ctx, const char *fmt, ...)
@@ -75533,15 +75582,17 @@ JSValue __attribute__((format(printf, 3, 4))) JS_ThrowDOMException(JSContext *ct
 {
     JSValue obj, argv[2];
     va_list ap;
-    char buf[256];
+    char buf[256], *msg;
 
     if (JS_IsUndefined(ctx->class_proto[JS_CLASS_DOM_EXCEPTION]) ||
         JS_IsNull(ctx->class_proto[JS_CLASS_DOM_EXCEPTION]))
         return JS_ThrowInternalError(ctx, "DOMException is not available");
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    msg = js_format_message(ctx->rt, buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    argv[0] = JS_NewString(ctx, buf);
+    argv[0] = JS_NewString(ctx, msg);
+    if (msg != buf)
+        js_free_rt(ctx->rt, msg);
     if (JS_IsException(argv[0]))
         return JS_EXCEPTION;
     argv[1] = JS_NewString(ctx, name);

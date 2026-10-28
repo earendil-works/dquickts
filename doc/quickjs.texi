@@ -1315,6 +1315,14 @@ occurred. The actual exception object is stored in the
 @code{JS_NewTypeError()}, @code{JS_NewRangeError()} and the other
 @code{JS_New*Error()} functions build the same error objects as their
 @code{JS_Throw*Error()} counterparts but return them without throwing.
+Their message is formatted with @code{printf()} semantics and is not
+truncated.
+
+@code{JS_NewErrorLen()} and @code{JS_ThrowErrorLen()} take the kind
+of error (@code{JSErrorEnum}, e.g. @code{JS_TYPE_ERROR} or
+@code{JS_PLAIN_ERROR} for @code{Error}) and a UTF-8 message with its
+length: no formatting is done and the message may contain any
+character.
 
 @subsection Script evaluation
 

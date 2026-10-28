@@ -389,6 +389,63 @@ static void test_new_errors(JSContext *ctx)
     CHECK(!JS_HasException(ctx));
 }
 
+static JSValue throw_range_len(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+{
+    return JS_ThrowErrorLen(ctx, JS_RANGE_ERROR, "from C\0len", 10);
+}
+
+static void test_error_len(JSContext *ctx)
+{
+    static const char utf8[] = "caf\xc3\xa9";
+    char long_msg[1001];
+    JSValue e;
+
+    /* the message is not formatted and may contain any character */
+    e = JS_NewErrorLen(ctx, JS_TYPE_ERROR, utf8, strlen(utf8));
+    CHECK(JS_IsError(ctx, e));
+    CHECK(!JS_HasException(ctx));
+    set_global(ctx, "le", e);
+    CHECK(eval_bool(ctx, "Object.getPrototypeOf(le) === TypeError.prototype && "
+                    "le.message === 'caf\\u00e9' && typeof le.stack === 'string' && "
+                    "!Object.getOwnPropertyDescriptor(le, 'message').enumerable"));
+    e = JS_NewErrorLen(ctx, JS_PLAIN_ERROR, "%s", 2);
+    set_global(ctx, "le", e);
+    CHECK(eval_bool(ctx, "Object.getPrototypeOf(le) === Error.prototype && "
+                    "le.message === '%s'"));
+    e = JS_NewErrorLen(ctx, JS_SUPPRESSED_ERROR, "", 0);
+    set_global(ctx, "le", e);
+    CHECK(eval_bool(ctx, "le instanceof SuppressedError && le.message === ''"));
+
+    /* the backtrace includes the JS callers of the C function */
+    set_global(ctx, "throw_range_len",
+               JS_NewCFunction(ctx, throw_range_len, "throw_range_len", 0));
+    CHECK(eval_bool(ctx, "function len_caller() { try { throw_range_len() } catch (e) { return e } } "
+                    "var re = len_caller(); re instanceof RangeError && "
+                    "re.message === 'from C\\0len' && "
+                    "re.stack.startsWith('    at throw_range_len (native)\\n    at len_caller (')"));
+    CHECK(JS_IsException(JS_ThrowErrorLen(ctx, JS_URI_ERROR, "uri", 3)));
+    check_exception(ctx, "URIError");
+
+    /* long messages are not truncated */
+    memset(long_msg, 'x', sizeof(long_msg) - 1);
+    long_msg[sizeof(long_msg) - 1] = '\0';
+    CHECK(JS_IsException(JS_ThrowTypeError(ctx, "%s!", long_msg)));
+    set_global(ctx, "le", JS_GetException(ctx));
+    CHECK(eval_bool(ctx, "le instanceof TypeError && le.message.length === 1001 && "
+                    "le.message === 'x'.repeat(1000) + '!'"));
+    e = JS_NewRangeError(ctx, "%s", long_msg);
+    set_global(ctx, "le", e);
+    CHECK(eval_bool(ctx, "le.message === 'x'.repeat(1000)"));
+    CHECK(JS_IsException(JS_ThrowErrorLen(ctx, JS_INTERNAL_ERROR, long_msg, 1000)));
+    set_global(ctx, "le", JS_GetException(ctx));
+    CHECK(eval_bool(ctx, "le instanceof InternalError && le.message === 'x'.repeat(1000)"));
+    CHECK(JS_IsException(JS_ThrowDOMException(ctx, "NotFoundError", "%s", long_msg)));
+    set_global(ctx, "le", JS_GetException(ctx));
+    CHECK(eval_bool(ctx, "le instanceof DOMException && le.message === 'x'.repeat(1000)"));
+    CHECK(!JS_HasException(ctx));
+}
+
 static void test_integrity(JSContext *ctx)
 {
     JSValue obj;
@@ -2193,6 +2250,7 @@ int main(void)
     test_cstring(ctx);
     test_utf16_strings(ctx);
     test_new_errors(ctx);
+    test_error_len(ctx);
     test_integrity(ctx);
     test_class_names(ctx);
     test_is_module(ctx);
