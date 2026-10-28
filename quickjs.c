@@ -848,11 +848,29 @@ typedef struct JSArrayBuffer {
     /* if immutable, the contents cannot be modified and the array
        buffer cannot be detached nor resized */
     uint8_t immutable;
-    uint8_t *data; /* NULL if detached */
+    /* NULL if detached. If shared and resizable, preceded by a
+       JSGrowableSABHeader */
+    uint8_t *data;
     struct list_head array_list;
     void *opaque;
     JSFreeArrayBufferDataFunc *free_func;
 } JSArrayBuffer;
+
+/* Header in front of the data of a growable SharedArrayBuffer. The
+   memory may be shared by several SharedArrayBuffer objects, possibly
+   in other threads (JS_WriteObject() with JS_WRITE_OBJ_SAB), so the
+   byte length is stored here and atomically updated
+   (HostGrowSharedArrayBuffer). JSArrayBuffer.byte_length caches it (see
+   array_buffer_sync_length()). The 8 byte size keeps the data
+   aligned. */
+typedef union {
+#ifdef CONFIG_ATOMICS
+    _Atomic(int32_t) byte_length;
+#else
+    int32_t byte_length;
+#endif
+    uint64_t align;
+} JSGrowableSABHeader;
 
 typedef struct JSTypedArray {
     struct list_head link; /* link to arraybuffer */
@@ -1455,6 +1473,10 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
 static void js_array_buffer_free(JSRuntime *rt, void *opaque, void *ptr);
 static JSArrayBuffer *js_get_array_buffer(JSContext *ctx, JSValueConst obj);
 static BOOL array_buffer_is_resizable(const JSArrayBuffer *abuf);
+static void array_buffer_sync_length(JSArrayBuffer *abuf);
+static uint8_t *array_buffer_get_alloc_ptr(const JSArrayBuffer *abuf);
+static void typed_array_sync_length(JSObject *p);
+static BOOL typed_array_sync_index(JSObject *p, uint32_t idx);
 static JSValue js_typed_array_constructor(JSContext *ctx,
                                           JSValueConst this_val,
                                           int argc, JSValueConst *argv,
@@ -9416,7 +9438,8 @@ JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
             if (p->fast_array) {
                 if (__JS_AtomIsTaggedInt(prop)) {
                     uint32_t idx = __JS_AtomToUInt32(prop);
-                    if (idx < p->u.array.count) {
+                    if (idx < p->u.array.count ||
+                        typed_array_sync_index(p, idx)) {
                         /* we avoid duplicating the code */
                         return JS_GetPropertyUint32(ctx, JS_MKPTR(JS_TAG_OBJECT, p), idx);
                     } else if (p->class_id >= JS_CLASS_UINT8C_ARRAY &&
@@ -9778,6 +9801,7 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
 
     if (p->is_exotic) {
         if (p->fast_array) {
+            typed_array_sync_length(p);
             if (flags & JS_GPN_STRING_MASK) {
                 num_keys_count += p->u.array.count;
             }
@@ -9998,7 +10022,8 @@ retry:
             if (__JS_AtomIsTaggedInt(prop)) {
                 uint32_t idx;
                 idx = __JS_AtomToUInt32(prop);
-                if (idx < p->u.array.count) {
+                if (idx < p->u.array.count ||
+                    typed_array_sync_index(p, idx)) {
                     if (desc) {
                         desc->flags = JS_PROP_WRITABLE | JS_PROP_ENUMERABLE |
                             JS_PROP_CONFIGURABLE;
@@ -10530,7 +10555,7 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
         if (p->fast_array) {
             uint32_t idx;
             if (JS_AtomIsArrayIndex(ctx, &idx, atom) &&
-                idx < p->u.array.count) {
+                (idx < p->u.array.count || typed_array_sync_index(p, idx))) {
                 if (p->class_id == JS_CLASS_ARRAY ||
                     p->class_id == JS_CLASS_ARGUMENTS ||
                     p->class_id == JS_CLASS_MAPPED_ARGUMENTS) {
@@ -10979,7 +11004,8 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
             if (p1->fast_array) {
                 if (__JS_AtomIsTaggedInt(prop)) {
                     uint32_t idx = __JS_AtomToUInt32(prop);
-                    if (idx < p1->u.array.count) {
+                    if (idx < p1->u.array.count ||
+                        typed_array_sync_index(p1, idx)) {
                         if (unlikely(p == p1))
                             return JS_SetPropertyValue(ctx, this_obj, JS_NewInt32(ctx, idx), val, flags);
                         if (p1->class_id >= JS_CLASS_UINT8C_ARRAY &&
@@ -11248,7 +11274,8 @@ int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                 return -1;
             /* Note: the conversion can detach the typed array, so the
                array bound check must be done after */
-            if (unlikely(idx >= (uint32_t)p->u.array.count))
+            if (unlikely(idx >= (uint32_t)p->u.array.count) &&
+                !typed_array_sync_index(p, idx))
                 goto ta_out_of_bound;
             p->u.array.u.uint8_ptr[idx] = v;
             break;
@@ -11258,7 +11285,8 @@ int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                 goto ta_immutable;
             if (JS_ToInt32Free(ctx, &v, val))
                 return -1;
-            if (unlikely(idx >= (uint32_t)p->u.array.count))
+            if (unlikely(idx >= (uint32_t)p->u.array.count) &&
+                !typed_array_sync_index(p, idx))
                 goto ta_out_of_bound;
             p->u.array.u.uint8_ptr[idx] = v;
             break;
@@ -11268,7 +11296,8 @@ int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                 goto ta_immutable;
             if (JS_ToInt32Free(ctx, &v, val))
                 return -1;
-            if (unlikely(idx >= (uint32_t)p->u.array.count))
+            if (unlikely(idx >= (uint32_t)p->u.array.count) &&
+                !typed_array_sync_index(p, idx))
                 goto ta_out_of_bound;
             p->u.array.u.uint16_ptr[idx] = v;
             break;
@@ -11278,7 +11307,8 @@ int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                 goto ta_immutable;
             if (JS_ToInt32Free(ctx, &v, val))
                 return -1;
-            if (unlikely(idx >= (uint32_t)p->u.array.count))
+            if (unlikely(idx >= (uint32_t)p->u.array.count) &&
+                !typed_array_sync_index(p, idx))
                 goto ta_out_of_bound;
             p->u.array.u.uint32_ptr[idx] = v;
             break;
@@ -11291,7 +11321,8 @@ int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                     goto ta_immutable;
                 if (JS_ToBigInt64Free(ctx, &v, val))
                     return -1;
-                if (unlikely(idx >= (uint32_t)p->u.array.count))
+                if (unlikely(idx >= (uint32_t)p->u.array.count) &&
+                    !typed_array_sync_index(p, idx))
                     goto ta_out_of_bound;
                 p->u.array.u.uint64_ptr[idx] = v;
             }
@@ -11301,7 +11332,8 @@ int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                 goto ta_immutable;
             if (JS_ToFloat64Free(ctx, &d, val))
                 return -1;
-            if (unlikely(idx >= (uint32_t)p->u.array.count))
+            if (unlikely(idx >= (uint32_t)p->u.array.count) &&
+                !typed_array_sync_index(p, idx))
                 goto ta_out_of_bound;
             p->u.array.u.fp16_ptr[idx] = tofp16(d);
             break;
@@ -11310,7 +11342,8 @@ int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                 goto ta_immutable;
             if (JS_ToFloat64Free(ctx, &d, val))
                 return -1;
-            if (unlikely(idx >= (uint32_t)p->u.array.count))
+            if (unlikely(idx >= (uint32_t)p->u.array.count) &&
+                !typed_array_sync_index(p, idx))
                 goto ta_out_of_bound;
             p->u.array.u.float_ptr[idx] = d;
             break;
@@ -11323,7 +11356,8 @@ int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
             }
             if (JS_ToFloat64Free(ctx, &d, val))
                 return -1;
-            if (unlikely(idx >= (uint32_t)p->u.array.count)) {
+            if (unlikely(idx >= (uint32_t)p->u.array.count) &&
+                !typed_array_sync_index(p, idx)) {
             ta_out_of_bound:
                 return TRUE;
             }
@@ -11908,7 +11942,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
             }
             idx = __JS_AtomToUInt32(prop);
             /* if the typed array is detached, p->u.array.count = 0 */
-            if (idx >= p->u.array.count) {
+            if (idx >= p->u.array.count && !typed_array_sync_index(p, idx)) {
             typed_array_oob:
                 return JS_ThrowTypeErrorOrFalse(ctx, flags, "out-of-bound index in typed array");
             }
@@ -47582,16 +47616,21 @@ static int JS_WriteSharedArrayBuffer(BCWriterState *s, JSValueConst obj)
 {
     JSObject *p = JS_VALUE_GET_OBJ(obj);
     JSArrayBuffer *abuf = p->u.array_buffer;
+    uint8_t *ptr;
     assert(!abuf->detached); /* SharedArrayBuffer are never detached */
+    array_buffer_sync_length(abuf);
+    /* the pointer returned by sab_alloc(): for a growable
+       SharedArrayBuffer, it includes the shared byte length */
+    ptr = array_buffer_get_alloc_ptr(abuf);
     bc_put_u8(s, BC_TAG_SHARED_ARRAY_BUFFER);
     bc_put_leb128(s, abuf->byte_length);
     bc_put_leb128(s, abuf->max_byte_length);
-    bc_put_u64(s, (uintptr_t)abuf->data);
+    bc_put_u64(s, (uintptr_t)ptr);
     if (js_resize_array(s->ctx, (void **)&s->sab_tab, sizeof(s->sab_tab[0]),
                         &s->sab_tab_size, s->sab_tab_len + 1))
         return -1;
     /* keep the SAB pointer so that the user can clone it or free it */
-    s->sab_tab[s->sab_tab_len++] = abuf->data;
+    s->sab_tab[s->sab_tab_len++] = ptr;
     return 0;
 }
 
@@ -69745,6 +69784,95 @@ static uint8_t const typed_array_size_log2[JS_TYPED_ARRAY_COUNT] = {
     1, 2, 3                 // Float16Array, Float32Array, Float64Array
 };
 
+static int sab_header_get_length(JSGrowableSABHeader *h)
+{
+#ifdef CONFIG_ATOMICS
+    return atomic_load(&h->byte_length);
+#else
+    return h->byte_length;
+#endif
+}
+
+/* HostGrowSharedArrayBuffer: return FALSE if 'len' is smaller than the
+   current length, which another thread may have increased */
+static BOOL sab_header_grow(JSGrowableSABHeader *h, int32_t len)
+{
+#ifdef CONFIG_ATOMICS
+    int32_t cur_len = atomic_load(&h->byte_length);
+    for(;;) {
+        if (len < cur_len)
+            return FALSE;
+        if (len == cur_len ||
+            atomic_compare_exchange_weak(&h->byte_length, &cur_len, len))
+            return TRUE;
+    }
+#else
+    if (len < h->byte_length)
+        return FALSE;
+    h->byte_length = len;
+    return TRUE;
+#endif
+}
+
+static BOOL array_buffer_is_growable_shared(const JSArrayBuffer *abuf)
+{
+    return abuf->shared && array_buffer_is_resizable(abuf);
+}
+
+static JSGrowableSABHeader *array_buffer_get_sab_header(const JSArrayBuffer *abuf)
+{
+    return (JSGrowableSABHeader *)(abuf->data - sizeof(JSGrowableSABHeader));
+}
+
+/* return the pointer returned by the allocator */
+static uint8_t *array_buffer_get_alloc_ptr(const JSArrayBuffer *abuf)
+{
+    if (array_buffer_is_growable_shared(abuf))
+        return (uint8_t *)array_buffer_get_sab_header(abuf);
+    return abuf->data;
+}
+
+/* Allocate the zero initialized data of a SharedArrayBuffer of 'len'
+   bytes. If 'max_len' >= 0, it is growable: the data is preceded by a
+   JSGrowableSABHeader and 'max_len' bytes are allocated upfront because
+   the memory may be used by other threads, so it is never reallocated.
+   Return NULL if exception. */
+static uint8_t *js_alloc_shared_array_buffer(JSContext *ctx, int len,
+                                             int max_len)
+{
+    JSRuntime *rt = ctx->rt;
+    JSGrowableSABHeader *h;
+    size_t alloc_len, hdr_len;
+    uint8_t *ptr;
+
+    hdr_len = max_len >= 0 ? sizeof(JSGrowableSABHeader) : 0;
+    alloc_len = hdr_len + (max_len >= 0 ? max_len : len);
+    if (alloc_len == 0)
+        alloc_len = 1;
+    if (rt->sab_funcs.sab_alloc) {
+        ptr = rt->sab_funcs.sab_alloc(rt->sab_funcs.sab_opaque, alloc_len);
+        if (!ptr) {
+            JS_ThrowOutOfMemory(ctx);
+            return NULL;
+        }
+        memset(ptr, 0, alloc_len);
+    } else {
+        ptr = js_mallocz(ctx, alloc_len);
+        if (!ptr)
+            return NULL;
+    }
+    if (max_len >= 0) {
+        h = (JSGrowableSABHeader *)ptr;
+#ifdef CONFIG_ATOMICS
+        atomic_init(&h->byte_length, len);
+#else
+        h->byte_length = len;
+#endif
+        ptr += hdr_len;
+    }
+    return ptr;
+}
+
 static JSValue js_array_buffer_constructor3(JSContext *ctx,
                                             JSValueConst new_target,
                                             uint64_t len, uint64_t *max_len,
@@ -69756,9 +69884,9 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
     JSRuntime *rt = ctx->rt;
     JSValue obj;
     JSArrayBuffer *abuf = NULL;
-    uint64_t sab_alloc_len;
 
-    if (!alloc_flag && buf && max_len && free_func != js_array_buffer_free) {
+    if (!alloc_flag && buf && max_len && free_func != js_array_buffer_free &&
+        class_id != JS_CLASS_SHARED_ARRAY_BUFFER) {
         // not observable from JS land, only through C API misuse;
         // JS code cannot create externally managed buffers directly
         return JS_ThrowInternalError(ctx,
@@ -69784,23 +69912,10 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
     abuf->max_byte_length = max_len ? *max_len : -1;
     if (alloc_flag) {
         if (class_id == JS_CLASS_SHARED_ARRAY_BUFFER) {
-            /* a growable SharedArrayBuffer is never reallocated
-               (js_array_buffer_resize()): allocate |maxByteLength|
-               bytes upfront */
-            sab_alloc_len = max_len ? *max_len : len;
-            if (rt->sab_funcs.sab_alloc) {
-                abuf->data = rt->sab_funcs.sab_alloc(rt->sab_funcs.sab_opaque,
-                                                     max_int(sab_alloc_len, 1));
-                if (!abuf->data) {
-                    JS_ThrowOutOfMemory(ctx);
-                    goto fail;
-                }
-                memset(abuf->data, 0, sab_alloc_len);
-            } else {
-                abuf->data = js_mallocz(ctx, max_int(sab_alloc_len, 1));
-                if (!abuf->data)
-                    goto fail;
-            }
+            abuf->data = js_alloc_shared_array_buffer(ctx, len,
+                                                      abuf->max_byte_length);
+            if (!abuf->data)
+                goto fail;
         } else {
             /* the allocation must be done after the object creation */
             abuf->data = js_mallocz(ctx, max_int(len, 1));
@@ -69813,6 +69928,13 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
             rt->sab_funcs.sab_dup(rt->sab_funcs.sab_opaque, buf);
         }
         abuf->data = buf;
+        if (class_id == JS_CLASS_SHARED_ARRAY_BUFFER && max_len) {
+            /* 'buf' is the start of the memory shared with the other
+               SharedArrayBuffer objects (see JS_WriteSharedArrayBuffer()) */
+            abuf->data = buf + sizeof(JSGrowableSABHeader);
+            abuf->byte_length =
+                sab_header_get_length((JSGrowableSABHeader *)buf);
+        }
     }
     init_list_head(&abuf->array_list);
     abuf->detached = FALSE;
@@ -69950,10 +70072,12 @@ static void js_array_buffer_finalizer(JSRuntime *rt, JSValue val)
             }
         }
         if (abuf->shared && rt->sab_funcs.sab_free) {
-            rt->sab_funcs.sab_free(rt->sab_funcs.sab_opaque, abuf->data);
+            rt->sab_funcs.sab_free(rt->sab_funcs.sab_opaque,
+                                   array_buffer_get_alloc_ptr(abuf));
         } else {
             if (abuf->free_func)
-                abuf->free_func(rt, abuf->opaque, abuf->data);
+                abuf->free_func(rt, abuf->opaque,
+                                array_buffer_get_alloc_ptr(abuf));
         }
         js_free_rt(rt, abuf);
     }
@@ -70024,6 +70148,7 @@ static JSValue js_array_buffer_get_byteLength(JSContext *ctx,
     JSArrayBuffer *abuf = JS_GetOpaque2(ctx, this_val, class_id);
     if (!abuf)
         return JS_EXCEPTION;
+    array_buffer_sync_length(abuf);
     /* return 0 if detached */
     return JS_NewUint32(ctx, abuf->byte_length);
 }
@@ -70156,6 +70281,7 @@ uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst obj)
         JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
         goto fail;
     }
+    array_buffer_sync_length(abuf);
     *psize = abuf->byte_length;
     return abuf->data;
  fail:
@@ -70166,6 +70292,38 @@ uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst obj)
 static BOOL array_buffer_is_resizable(const JSArrayBuffer *abuf)
 {
     return abuf->max_byte_length >= 0;
+}
+
+/* update the cached byte length of a growable SharedArrayBuffer and the
+   length of its views: another thread may have grown it */
+static void array_buffer_sync_length(JSArrayBuffer *abuf)
+{
+    int len;
+
+    if (likely(!array_buffer_is_growable_shared(abuf)))
+        return;
+    len = sab_header_get_length(array_buffer_get_sab_header(abuf));
+    if (len != abuf->byte_length) {
+        abuf->byte_length = len;
+        js_array_buffer_update_typed_arrays(abuf);
+    }
+}
+
+/* no-op if 'p' is not a typed array */
+static void typed_array_sync_length(JSObject *p)
+{
+    if (p->class_id >= JS_CLASS_UINT8C_ARRAY &&
+        p->class_id <= JS_CLASS_FLOAT64_ARRAY && p->u.typed_array)
+        array_buffer_sync_length(p->u.typed_array->buffer->u.array_buffer);
+}
+
+/* slow path of the bound check of the element 'idx' of the fast array
+   'p': TRUE if 'p' is a typed array whose SharedArrayBuffer was grown
+   so that 'idx' is now in bounds */
+static BOOL typed_array_sync_index(JSObject *p, uint32_t idx)
+{
+    typed_array_sync_length(p);
+    return idx < p->u.array.count;
 }
 
 typedef enum {
@@ -70296,26 +70454,21 @@ static JSValue js_array_buffer_resize(JSContext *ctx, JSValueConst this_val,
     if (!array_buffer_is_resizable(abuf))
         return JS_ThrowTypeError(ctx, "array buffer is not resizable");
     // TODO(bnoordhuis) support externally managed RABs
-    if (abuf->free_func != js_array_buffer_free)
+    if (!abuf->shared && abuf->free_func != js_array_buffer_free)
         return JS_ThrowTypeError(ctx, "external array buffer is not resizable");
     if (len > abuf->max_byte_length) {
     bad_length:
         return JS_ThrowRangeError(ctx, "invalid array buffer length");
     }
     // SABs can only grow and we don't need to realloc because
-    // js_array_buffer_constructor3 commits all memory upfront;
+    // js_alloc_shared_array_buffer commits all memory upfront;
     // regular RABs are resizable both ways and realloc
     if (abuf->shared) {
-        if (len < abuf->byte_length)
+        /* the byte length is shared with the other SharedArrayBuffer
+           objects of the memory */
+        if (!sab_header_grow(array_buffer_get_sab_header(abuf), len))
             goto bad_length;
-        // Note this is off-spec; there's supposed to be a single atomic
-        // |byteLength| property that's shared across SABs but we store
-        // it per SAB instead. That means when thread A calls sab.grow(2)
-        // at time t0, and thread B calls sab.grow(1) at time t1, we don't
-        // throw a TypeError in thread B as the spec says we should,
-        // instead both threads get their own view of the backing memory,
-        // 2 bytes big in A, and 1 byte big in B
-        abuf->byte_length = len;
+        array_buffer_sync_length(abuf);
     } else {
         data = js_realloc(ctx, abuf->data, max_int(len, 1));
         if (!data)
@@ -70324,8 +70477,8 @@ static JSValue js_array_buffer_resize(JSContext *ctx, JSValueConst this_val,
             memset(&data[abuf->byte_length], 0, len - abuf->byte_length);
         abuf->byte_length = len;
         abuf->data = data;
+        js_array_buffer_update_typed_arrays(abuf);
     }
-    js_array_buffer_update_typed_arrays(abuf);
     return JS_UNDEFINED;
 }
 
@@ -70345,6 +70498,7 @@ static JSValue js_array_buffer_slice(JSContext *ctx,
         return JS_EXCEPTION;
     if (abuf->detached)
         return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
+    array_buffer_sync_length(abuf);
     len = abuf->byte_length;
 
     if (JS_ToInt64Clamp(ctx, &start, argv[0], 0, len, len))
@@ -70484,6 +70638,7 @@ static BOOL typed_array_is_oob(JSObject *p)
     abuf = ta->buffer->u.array_buffer;
     if (abuf->detached)
         return TRUE;
+    array_buffer_sync_length(abuf);
     len = abuf->byte_length;
     if (ta->offset > len)
         return TRUE;
@@ -70537,6 +70692,7 @@ static JSValue js_typed_array_get_length(JSContext *ctx,
     p = get_typed_array(ctx, this_val);
     if (!p)
         return JS_EXCEPTION;
+    typed_array_sync_length(p);
     return JS_NewInt32(ctx, p->u.array.count);
 }
 
@@ -73253,6 +73409,7 @@ static JSValue js_typed_array_constructor(JSContext *ctx,
             if ((offset & ((1 << size_log2) - 1)) != 0)
                 goto invalid_offset;
             abuf = p->u.array_buffer;
+            array_buffer_sync_length(abuf);
             if (JS_IsUndefined(argv[2])) {
                 if (abuf->detached) {
                     JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
@@ -73351,6 +73508,7 @@ static JSValue js_dataview_constructor(JSContext *ctx,
     }
     if (abuf->detached)
         return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
+    array_buffer_sync_length(abuf);
     if (offset > abuf->byte_length)
         return JS_ThrowRangeError(ctx, "invalid byteOffset");
     len = abuf->byte_length - offset;
@@ -73375,6 +73533,7 @@ static JSValue js_dataview_constructor(JSContext *ctx,
         goto fail;
     }
     // RAB could have been resized in JS_CreateFromConstructor()
+    array_buffer_sync_length(abuf);
     if (offset > abuf->byte_length) {
         goto out_of_bound;
     } else if (recompute_len) {
@@ -73412,6 +73571,7 @@ static BOOL dataview_is_oob(JSObject *p)
     abuf = ta->buffer->u.array_buffer;
     if (abuf->detached)
         return TRUE;
+    array_buffer_sync_length(abuf);
     if (ta->offset > abuf->byte_length)
         return TRUE;
     if (ta->track_rab)
@@ -73500,6 +73660,7 @@ static JSValue js_dataview_getValue(JSContext *ctx,
     abuf = ta->buffer->u.array_buffer;
     if (abuf->detached)
         return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
+    array_buffer_sync_length(abuf);
     // order matters: this check should come before the next one
     if ((pos + size) > ta->length)
         return JS_ThrowRangeError(ctx, "out of bound");
@@ -73644,6 +73805,7 @@ static JSValue js_dataview_setValue(JSContext *ctx,
     abuf = ta->buffer->u.array_buffer;
     if (abuf->detached)
         return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
+    array_buffer_sync_length(abuf);
     // order matters: this check should come before the next one
     if ((pos + size) > ta->length)
         return JS_ThrowRangeError(ctx, "out of bound");
@@ -73758,6 +73920,7 @@ static JSObject *js_atomics_get_buf(JSContext *ctx,
     }
     ta = p->u.typed_array;
     abuf = ta->buffer->u.array_buffer;
+    array_buffer_sync_length(abuf);
     if (is_write && abuf->immutable) {
         JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
         return NULL;

@@ -1163,7 +1163,9 @@ The worker instances have the following properties:
   Send a message to the corresponding worker. @code{msg} is cloned in
   the destination worker using an algorithm similar to the @code{HTML}
   structured clone algorithm. @code{SharedArrayBuffer} are shared
-  between workers.
+  between workers. The byte length of a growable
+  @code{SharedArrayBuffer} is also shared: @code{grow()} in a worker
+  is visible from the others.
 
   Current limitations: @code{Map} and @code{Set} are not supported
   yet.
@@ -1668,7 +1670,9 @@ line number tables. Unlike @code{JS_SetStripInfo()}, which strips at
 compile time, they only change the written bytecode.
 @code{JS_ReadObject2()} returns the memory of the SharedArrayBuffers
 read, like @code{JS_WriteObject2()} for the written ones, so that the
-host can adjust its reference counts.
+host can adjust its reference counts. These are the pointers returned
+by the @code{sab_alloc} function set with
+@code{JS_SetSharedArrayBufferFunctions()}.
 
 @section Runtime
 

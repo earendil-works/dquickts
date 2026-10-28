@@ -1180,6 +1180,10 @@ JSValue JS_NewUint8ArrayCopy(JSContext *ctx, const uint8_t *buf, size_t len);
    Return NULL if exception. WARNING: any JS call can detach or resize
    the buffer and render the returned pointer invalid */
 uint8_t *JS_GetUint8Array(JSContext *ctx, size_t *psize, JSValueConst obj);
+/* sab_free(), sab_dup() and the SharedArrayBuffer memory returned by
+   JS_WriteObject2()/JS_ReadObject2() use the pointer returned by
+   sab_alloc(). For a growable SharedArrayBuffer, the engine stores the
+   byte length shared by its clones at the start of this memory. */
 typedef struct {
     void *(*sab_alloc)(void *opaque, size_t size);
     void (*sab_free)(void *opaque, void *ptr);

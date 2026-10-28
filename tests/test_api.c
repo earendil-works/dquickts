@@ -1651,11 +1651,17 @@ static void test_read_object2(void)
     JS_FreeRuntime(rt);
 }
 
-/* growable SharedArrayBuffer: the memory is allocated upfront */
+/* growable SharedArrayBuffer: the memory is allocated upfront and the
+   byte length is shared by the clones (upstream bellard/quickjs issue
+   546) */
 static void test_growable_sab(void)
 {
     JSRuntime *rt;
     JSContext *ctx;
+    JSValue sab, copy;
+    uint8_t *buf, **wtab, **rtab, *data;
+    size_t len, wlen, rlen, size;
+    int i;
 
     /* without SharedArrayBuffer allocator */
     rt = JS_NewRuntime();
@@ -1663,6 +1669,42 @@ static void test_growable_sab(void)
     CHECK(eval_bool(ctx, "var s = new SharedArrayBuffer(1, { maxByteLength: 4096 }); "
                     "var a = new Uint8Array(s); s.grow(4096); a.fill(7); "
                     "s.byteLength === 4096 && a.length === 4096 && a[4095] === 7"));
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+
+    rt = JS_NewRuntime();
+    JS_SetSharedArrayBufferFunctions(rt, &t_sab_funcs);
+    ctx = JS_NewContext(rt);
+    sab = eval_str(ctx, "globalThis.sab = new SharedArrayBuffer(1, { maxByteLength: 16 }); "
+                   "globalThis.view = new Uint8Array(sab); sab");
+    CHECK(!JS_IsException(sab));
+    buf = JS_WriteObject2(ctx, &len, sab, JS_WRITE_OBJ_SAB, &wtab, &wlen);
+    CHECK(buf != NULL && wlen == 1);
+    for(i = 0; i < 2; i++) {
+        copy = JS_ReadObject2(ctx, buf, len, JS_READ_OBJ_SAB, &rtab, &rlen);
+        CHECK(!JS_IsException(copy));
+        CHECK(rlen == 1 && rtab[0] == wtab[0]);
+        CHECK(test_sab(rtab[0])->ref_count == 2 + i);
+        js_free(ctx, rtab);
+        set_global(ctx, i == 0 ? "copy" : "copy2", copy);
+    }
+    /* the growth is visible from all the clones and their views */
+    CHECK(eval_bool(ctx, "copy.grow(8); new Uint8Array(copy)[7] = 5; "
+                    "view[7] === 5 && view.length === 8 && sab.byteLength === 8 && "
+                    "copy2.byteLength === 8 && copy2.maxByteLength === 16"));
+    data = JS_GetArrayBuffer(ctx, &size, sab);
+    CHECK(data != NULL && size == 8 && data[7] == 5);
+    /* cannot shrink: another clone already grew the memory */
+    CHECK(eval_bool(ctx, "var ok; copy2.grow(12); "
+                    "try { copy.grow(10); ok = false; } "
+                    "catch(e) { ok = e instanceof RangeError; } "
+                    "ok && view.length === 12 && copy.byteLength === 12"));
+    CHECK(eval_bool(ctx, "sab.grow(12); sab.byteLength === 12"));
+    js_free(ctx, wtab);
+    js_free(ctx, buf);
+    JS_FreeValue(ctx, sab);
+    eval_bool(ctx, "delete globalThis.sab; delete globalThis.view; "
+              "delete globalThis.copy; delete globalThis.copy2");
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 }

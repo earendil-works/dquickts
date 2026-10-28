@@ -484,10 +484,9 @@ static int snap_data_write_array_buffer(SnapWriter *w, JSObject *p)
 static int snap_data_read_array_buffer(SnapReader *r, JSObject *p)
 {
     JSContext *ctx = r->ctx;
-    JSRuntime *rt = r->rt;
     BOOL shared = (p->class_id == JS_CLASS_SHARED_ARRAY_BUFFER);
     JSArrayBuffer *abuf;
-    uint32_t len, max_len, alloc_len;
+    uint32_t len, max_len;
     uint8_t present, flags;
 
     if (bc_get_u8(&r->bc, &present))
@@ -524,19 +523,8 @@ static int snap_data_read_array_buffer(SnapReader *r, JSObject *p)
     if (abuf->detached)
         goto done;
     if (shared) {
-        /* a growable SharedArrayBuffer is never reallocated: allocate
-           max_byte_length bytes upfront */
-        alloc_len = max_len;
-        if (rt->sab_funcs.sab_alloc) {
-            abuf->data = rt->sab_funcs.sab_alloc(rt->sab_funcs.sab_opaque,
-                                                 max_int(alloc_len, 1));
-            if (!abuf->data)
-                JS_ThrowOutOfMemory(ctx);
-            else
-                memset(abuf->data, 0, alloc_len);
-        } else {
-            abuf->data = js_mallocz(ctx, max_int(alloc_len, 1));
-        }
+        abuf->data = js_alloc_shared_array_buffer(ctx, len,
+                                                  abuf->max_byte_length);
     } else {
         abuf->data = js_malloc(ctx, max_int(len, 1));
     }
