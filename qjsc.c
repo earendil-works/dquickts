@@ -123,7 +123,7 @@ static BOOL has_name(const char *names, const char *name)
         end = strchr(p, ' ');
         if (!end)
             end = p + strlen(p);
-        if (end - p == len && !memcmp(p, name, len))
+        if ((size_t)(end - p) == len && !memcmp(p, name, len))
             return TRUE;
         if (*end == '\0')
             return FALSE;
