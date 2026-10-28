@@ -1921,6 +1921,27 @@ static void test_weak_map_ephemeron(void)
     JS_FreeRuntime(rt);
 }
 
+/* the partial result is freed when a BigInt power fails */
+static void test_bigint_pow_leak(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSMemoryUsage mu1, mu2;
+    const char *str = "try { 3n ** 10000000n } catch (e) {}";
+    int i;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    for(i = 0; i < 2; i++) {
+        JS_ComputeMemoryUsage(rt, &mu1);
+        JS_FreeValue(ctx, eval_str(ctx, str));
+        JS_ComputeMemoryUsage(rt, &mu2);
+    }
+    CHECK(mu2.malloc_count == mu1.malloc_count);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     JSRuntime *rt;
@@ -1939,6 +1960,7 @@ int main(void)
     test_calloc();
     test_weak_map_ephemeron();
     test_trigger_interrupt();
+    test_bigint_pow_leak();
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);
