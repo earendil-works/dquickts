@@ -843,4 +843,45 @@ mod test {
             assert!(is_instance);
         });
     }
+
+    #[test]
+    fn call_rust_fn_with_primitive_args() {
+        test_with(|ctx| {
+            let global = ctx.globals();
+            global
+                .set(
+                    "prims",
+                    Func::from(|a: i32, b: f64, c: bool, d: u8| format!("{a} {b} {c} {d}")),
+                )
+                .unwrap();
+            let res: StdString = ctx.eval("prims(2.75, 3, false, 255)").unwrap();
+            assert_eq!(res, "2 3 false 255");
+            let res: StdString = ctx.eval("prims(-1e100, -0, true, 0.5)").unwrap();
+            assert_eq!(res, "-2147483648 -0 true 0");
+
+            let res: StdString = ctx
+                .eval("try { prims(1, 2, 0, 3) } catch (e) { e.message }")
+                .unwrap();
+            assert_eq!(res, "Error converting from js 'int' into type 'bool'");
+            let res: StdString = ctx
+                .eval("try { prims('1', 2, true, 3) } catch (e) { e.message }")
+                .unwrap();
+            assert_eq!(res, "Error converting from js 'string' into type 'i32'");
+            let res: StdString = ctx
+                .eval("try { prims(1, {}, true, 3) } catch (e) { e.message }")
+                .unwrap();
+            assert_eq!(res, "Error converting from js 'object' into type 'f64'");
+            let res: StdString = ctx
+                .eval("try { prims(1, 2, true, 256) } catch (e) { e.message }")
+                .unwrap();
+            assert!(res.contains("'u8'"), "{res}");
+            let res: StdString = ctx
+                .eval("try { prims(1, 2) } catch (e) { e.message }")
+                .unwrap();
+            assert!(
+                res.contains("Error calling function with 2 argument(s) while 4 where expected"),
+                "{res}"
+            );
+        })
+    }
 }

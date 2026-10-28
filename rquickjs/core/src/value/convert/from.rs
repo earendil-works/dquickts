@@ -1,6 +1,6 @@
 use crate::{
-    convert::List, Array, CString, Ctx, Error, FromAtom, FromJs, Object, Result, StdString, String,
-    Type, Value,
+    convert::List, qjs, Array, CString, Ctx, Error, FromAtom, FromJs, Object, Result, StdString,
+    String, Value,
 };
 use alloc::{
     boxed::Box,
@@ -245,15 +245,18 @@ macro_rules! from_js_impls {
     };
 
     // for basic primitive types (int and float)
-    // (ex. f64 => Float as_float Int as_int)
-    (val: $($type:ty => $($jstype:ident $getfn:ident)*,)*) => {
+    // (ex. f64 => JS_TAG_FLOAT64 get_float JS_TAG_INT get_int)
+    //
+    // Matches on the value tag directly: these tags map one to one to the accepted `Type`s
+    // (Bool, Int, Float), so the full `Value::type_of` is only computed for the error.
+    (val: $($type:ty => $($jstag:ident $getfn:ident)*,)*) => {
         $(
             impl<'js> FromJs<'js> for $type {
+                #[inline]
                 fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-                    let type_ = value.type_of();
-                    match type_ {
-                        $(Type::$jstype => Ok(unsafe { value.$getfn() } as _),)*
-                        _ => Err(Error::new_from_js(type_.as_str(), stringify!($type))),
+                    match unsafe { qjs::JS_VALUE_GET_NORM_TAG(value.value) } {
+                        $(qjs::$jstag => Ok(unsafe { value.$getfn() } as _),)*
+                        _ => Err(Error::new_from_js(value.type_of().as_str(), stringify!($type))),
                     }
                 }
             }
@@ -303,9 +306,9 @@ from_js_impls! {
 
 from_js_impls! {
     val:
-    bool => Bool get_bool,
-    i32 => Float get_float Int get_int,
-    f64 => Float get_float Int get_int,
+    bool => JS_TAG_BOOL get_bool,
+    i32 => JS_TAG_FLOAT64 get_float JS_TAG_INT get_int,
+    f64 => JS_TAG_FLOAT64 get_float JS_TAG_INT get_int,
 }
 
 from_js_impls! {
