@@ -38,6 +38,7 @@ impl<'js> Object<'js> {
     }
 
     /// Get a new value
+    #[inline]
     pub fn get<K: IntoAtom<'js>, V: FromJs<'js>>(&self, k: K) -> Result<V> {
         if let Some(name) = k.as_key_str() {
             // No atom is created for a name which is not an atom yet.
@@ -56,6 +57,7 @@ impl<'js> Object<'js> {
     }
 
     /// Get a value by atom without taking ownership of the atom.
+    #[inline]
     pub(crate) fn get_atom<V: FromJs<'js>>(&self, atom: &Atom<'js>) -> Result<V> {
         unsafe {
             let val = qjs::JS_GetProperty(self.0.ctx.as_ptr(), self.0.as_js_value(), atom.atom);
@@ -65,9 +67,11 @@ impl<'js> Object<'js> {
 
     /// # Safety
     /// `val` must be an owned value returned by a property get on this object's context.
+    #[inline]
     unsafe fn from_get_result<V: FromJs<'js>>(&self, val: qjs::JSValue) -> Result<V> {
-        let val = self.0.ctx.handle_exception(val)?;
-        V::from_js(self.ctx(), Value::from_js_value(self.0.ctx.clone(), val))
+        let ctx = self.ctx();
+        let val = ctx.handle_exception(val)?;
+        V::from_js_raw_owned(ctx, val)
     }
 
     /// check whether the object contains a certain key.
