@@ -266,6 +266,26 @@ impl Runtime {
             JobException(unsafe { Context::from_raw(ptr, self.clone()) })
         })
     }
+
+    /// Execute pending jobs in order, including the jobs they enqueue, until none is left or
+    /// `max_jobs` were executed (`None`: no limit).
+    ///
+    /// Same as calling [`Runtime::execute_pending_job`] in a loop, with a single lock of the
+    /// runtime and a single call into the engine. Returns the number of executed jobs, or
+    /// stops at the first job which threw and returns its error, the jobs after it staying
+    /// pending.
+    #[inline]
+    pub fn execute_pending_jobs(&self, max_jobs: Option<usize>) -> StdResult<usize, JobException> {
+        let mut lock = self.inner.lock();
+        lock.update_stack_top();
+        lock.execute_pending_jobs(max_jobs).map_err(|e| {
+            let ptr = NonNull::new(e).expect("QuickJS returned null ptr for job error");
+            // JS_ExecutePendingJobs returns a borrowed context pointer;
+            // dup it so Context can own a reference.
+            unsafe { qjs::JS_DupContext(ptr.as_ptr()) };
+            JobException(unsafe { Context::from_raw(ptr, self.clone()) })
+        })
+    }
 }
 
 // Since all functions which use runtime are behind a mutex
@@ -314,6 +334,65 @@ mod test {
         rt.set_max_stack_size(256 * 1024);
         ctx.with(|ctx| {
             ctx.eval::<i32, _>("1 + 1").unwrap();
+        });
+    }
+
+    #[test]
+    fn execute_pending_jobs() {
+        let rt = Runtime::new().unwrap();
+        let ctx = crate::Context::full(&rt).unwrap();
+        assert_eq!(rt.execute_pending_jobs(None).unwrap(), 0);
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.log = [];
+                Promise.resolve().then(() => {
+                    log.push(1);
+                    Promise.resolve().then(() => log.push(3));
+                });
+                Promise.resolve().then(() => log.push(2));
+                "#,
+            )
+            .unwrap();
+        });
+        assert_eq!(rt.execute_pending_jobs(Some(0)).unwrap(), 0);
+        assert_eq!(rt.execute_pending_jobs(Some(1)).unwrap(), 1);
+        // the job enqueued by the first one runs too
+        assert_eq!(rt.execute_pending_jobs(None).unwrap(), 2);
+        assert!(!rt.is_job_pending());
+        ctx.with(|ctx| {
+            assert_eq!(ctx.eval::<crate::StdString, _>("log.join()").unwrap(), "1,2,3");
+        });
+    }
+
+    #[test]
+    fn execute_pending_jobs_stops_at_error() {
+        use crate::{Exception, Function};
+
+        let rt = Runtime::new().unwrap();
+        let ctx = crate::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>("globalThis.ran = 0; globalThis.f = () => { ran++ };").unwrap();
+            let f: Function = ctx.globals().get("f").unwrap();
+            let thrower: Function = ctx.eval("() => { throw new Error('boom') }").unwrap();
+            f.defer(()).unwrap();
+            thrower.defer(()).unwrap();
+            f.defer(()).unwrap();
+        });
+        let err = rt.execute_pending_jobs(None).unwrap_err();
+        err.0.with(|ctx| {
+            let e = ctx
+                .catch()
+                .into_object()
+                .and_then(Exception::from_object)
+                .expect("the job threw an exception");
+            assert_eq!(e.message().as_deref(), Some("boom"));
+            assert_eq!(ctx.globals().get::<_, i32>("ran").unwrap(), 1);
+        });
+        assert!(rt.is_job_pending());
+        assert_eq!(rt.execute_pending_jobs(None).unwrap(), 1);
+        ctx.with(|ctx| {
+            assert_eq!(ctx.globals().get::<_, i32>("ran").unwrap(), 2);
         });
     }
 

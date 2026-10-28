@@ -132,10 +132,13 @@ where
                 }
             };
 
+            // Run all the pending jobs, continuing after the jobs which throw.
             loop {
-                match lock.runtime.execute_pending_job() {
-                    Ok(false) => break,
-                    Ok(true) => made_progress = true,
+                match lock.runtime.execute_pending_jobs(None) {
+                    Ok(n) => {
+                        made_progress |= n > 0;
+                        break;
+                    }
                     Err(_ctx) => {
                         // TODO figure out what to do with a job error.
                         made_progress = true;

@@ -248,6 +248,26 @@ impl RawRuntime {
         Err(unsafe { ctx_ptr.assume_init() })
     }
 
+    /// Executes pending jobs in order, including the jobs they enqueue, until none is left
+    /// or `max_jobs` were executed (`None`: no limit), in one call into the engine.
+    ///
+    /// Returns the number of executed jobs, or, if a job threw, the borrowed pointer to its
+    /// context (where the exception is pending) after stopping at that job.
+    pub fn execute_pending_jobs(
+        &mut self,
+        max_jobs: Option<usize>,
+    ) -> StdResult<usize, *mut qjs::JSContext> {
+        let max_jobs: core::ffi::c_int =
+            max_jobs.map_or(-1, |n| n.min(core::ffi::c_int::MAX as usize) as core::ffi::c_int);
+        let mut ctx_ptr = core::ptr::null_mut();
+        let result =
+            unsafe { qjs::JS_ExecutePendingJobs(self.rt.as_ptr(), max_jobs, &mut ctx_ptr) };
+        if result < 0 {
+            return Err(ctx_ptr);
+        }
+        Ok(result as usize)
+    }
+
     #[cfg(feature = "loader")]
     pub unsafe fn set_loader<R, L>(&mut self, resolver: R, loader: L)
     where
