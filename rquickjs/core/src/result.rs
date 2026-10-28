@@ -7,7 +7,7 @@ use core::{
 };
 
 use alloc::{
-    ffi::{CString, NulError},
+    ffi::NulError,
     string::{FromUtf8Error, ToString as _},
 };
 
@@ -288,52 +288,23 @@ impl Error {
         matches!(self, Self::TooManyArgs { .. } | Self::MissingArgs { .. })
     }
 
-    /// Optimized conversion to [`CString`]
-    pub(crate) fn to_cstring(&self) -> CString {
-        // stringify error with NUL at end
-        let mut message = alloc::format!("{self}\0").into_bytes();
-
-        message.pop(); // pop last NUL because CString add this later
-
-        // TODO: Replace by `CString::from_vec_with_nul_unchecked` later when it will be stabilized
-        unsafe { CString::from_vec_unchecked(message) }
-    }
-
     /// Throw an exception
     pub(crate) fn throw(&self, ctx: &Ctx) -> qjs::JSValue {
         use Error::*;
-        match self {
+        let kind = match self {
             // the pending exception (or suspension marker) keeps unwinding
-            Exception | Suspended => qjs::JS_EXCEPTION,
-            Allocation => unsafe { qjs::JS_ThrowOutOfMemory(ctx.as_ptr()) },
+            Exception | Suspended => return qjs::JS_EXCEPTION,
+            Allocation => return unsafe { qjs::JS_ThrowOutOfMemory(ctx.as_ptr()) },
             InvalidString(_)
             | Utf8(_)
             | FromJs { .. }
             | IntoJs { .. }
             | TooManyArgs { .. }
-            | MissingArgs { .. } => {
-                let message = self.to_cstring();
-                unsafe { qjs::JS_ThrowTypeError(ctx.as_ptr(), c"%s".as_ptr(), message.as_ptr()) }
-            }
-            AsSlice(_) => {
-                let message = self.to_cstring();
-                unsafe {
-                    qjs::JS_ThrowReferenceError(ctx.as_ptr(), c"%s".as_ptr(), message.as_ptr())
-                }
-            }
+            | MissingArgs { .. } => qjs::JSErrorEnum_JS_TYPE_ERROR,
+            AsSlice(_) => qjs::JSErrorEnum_JS_REFERENCE_ERROR,
             #[cfg(feature = "loader")]
-            Resolving { .. } | Loading { .. } => {
-                let message = self.to_cstring();
-                unsafe {
-                    qjs::JS_ThrowReferenceError(ctx.as_ptr(), c"%s".as_ptr(), message.as_ptr())
-                }
-            }
-            Unknown => {
-                let message = self.to_cstring();
-                unsafe {
-                    qjs::JS_ThrowInternalError(ctx.as_ptr(), c"%s".as_ptr(), message.as_ptr())
-                }
-            }
+            Resolving { .. } | Loading { .. } => qjs::JSErrorEnum_JS_REFERENCE_ERROR,
+            Unknown => qjs::JSErrorEnum_JS_INTERNAL_ERROR,
             error => {
                 unsafe {
                     let value = qjs::JS_NewError(ctx.as_ptr());
@@ -351,9 +322,19 @@ impl Error {
                         }
                     }
                     let js_val = (obj).into_js_value();
-                    qjs::JS_Throw(ctx.as_ptr(), js_val)
+                    return qjs::JS_Throw(ctx.as_ptr(), js_val);
                 }
             }
+        };
+        // the message is not formatted nor truncated by QuickJS
+        let message = self.to_string();
+        unsafe {
+            qjs::JS_ThrowErrorLen(
+                ctx.as_ptr(),
+                kind,
+                message.as_ptr().cast(),
+                message.len() as _,
+            )
         }
     }
 }

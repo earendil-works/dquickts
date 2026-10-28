@@ -22,10 +22,23 @@ impl fmt::Debug for Exception<'_> {
     }
 }
 
+/// Throws a new error of the given kind with the message `message` (no length limit).
+fn throw_error_len(ctx: &Ctx<'_>, kind: qjs::JSErrorEnum, message: &str) -> Error {
+    unsafe {
+        let res = qjs::JS_ThrowErrorLen(
+            ctx.as_ptr(),
+            kind,
+            message.as_ptr().cast(),
+            message.len() as _,
+        );
+        debug_assert_eq!(qjs::JS_VALUE_GET_NORM_TAG(res), qjs::JS_TAG_EXCEPTION);
+    }
+    Error::Exception
+}
+
 /// Writes as many characters of `str` as will fit into `buf`, followed by a nul byte.
 ///
-/// QuickJS implementation doesn't allow error strings longer than 256 anyway so
-/// truncating here is fine.
+/// The DOMException name and message are truncated to 255 bytes.
 fn truncate_cstr_into(buf: &mut [MaybeUninit<u8>; 256], mut str: &str) {
     let mut max = buf.len() - 1;
     if str.len() > max {
@@ -118,58 +131,27 @@ impl<'js> Exception<'js> {
 
     /// Throws a new syntax error.
     pub fn throw_syntax(ctx: &Ctx<'js>, message: &str) -> Error {
-        let mut buffer = [MaybeUninit::uninit(); 256];
-        truncate_cstr_into(&mut buffer, message);
-        unsafe {
-            let res = qjs::JS_ThrowSyntaxError(ctx.as_ptr(), c"%s".as_ptr(), buffer.as_mut_ptr());
-            debug_assert_eq!(qjs::JS_VALUE_GET_NORM_TAG(res), qjs::JS_TAG_EXCEPTION);
-        }
-        Error::Exception
+        throw_error_len(ctx, qjs::JSErrorEnum_JS_SYNTAX_ERROR, message)
     }
 
     /// Throws a new type error.
     pub fn throw_type(ctx: &Ctx<'js>, message: &str) -> Error {
-        let mut buffer = [MaybeUninit::uninit(); 256];
-        truncate_cstr_into(&mut buffer, message);
-        unsafe {
-            let res = qjs::JS_ThrowTypeError(ctx.as_ptr(), c"%s".as_ptr(), buffer.as_mut_ptr());
-            debug_assert_eq!(qjs::JS_VALUE_GET_NORM_TAG(res), qjs::JS_TAG_EXCEPTION);
-        }
-        Error::Exception
+        throw_error_len(ctx, qjs::JSErrorEnum_JS_TYPE_ERROR, message)
     }
 
     /// Throws a new reference error.
     pub fn throw_reference(ctx: &Ctx<'js>, message: &str) -> Error {
-        let mut buffer = [MaybeUninit::uninit(); 256];
-        truncate_cstr_into(&mut buffer, message);
-        unsafe {
-            let res =
-                qjs::JS_ThrowReferenceError(ctx.as_ptr(), c"%s".as_ptr(), buffer.as_mut_ptr());
-            debug_assert_eq!(qjs::JS_VALUE_GET_NORM_TAG(res), qjs::JS_TAG_EXCEPTION);
-        }
-        Error::Exception
+        throw_error_len(ctx, qjs::JSErrorEnum_JS_REFERENCE_ERROR, message)
     }
 
     /// Throws a new range error.
     pub fn throw_range(ctx: &Ctx<'js>, message: &str) -> Error {
-        let mut buffer = [MaybeUninit::uninit(); 256];
-        truncate_cstr_into(&mut buffer, message);
-        unsafe {
-            let res = qjs::JS_ThrowRangeError(ctx.as_ptr(), c"%s".as_ptr(), buffer.as_mut_ptr());
-            debug_assert_eq!(qjs::JS_VALUE_GET_NORM_TAG(res), qjs::JS_TAG_EXCEPTION);
-        }
-        Error::Exception
+        throw_error_len(ctx, qjs::JSErrorEnum_JS_RANGE_ERROR, message)
     }
 
     /// Throws a new internal error.
     pub fn throw_internal(ctx: &Ctx<'js>, message: &str) -> Error {
-        let mut buffer = [MaybeUninit::uninit(); 256];
-        truncate_cstr_into(&mut buffer, message);
-        unsafe {
-            let res = qjs::JS_ThrowInternalError(ctx.as_ptr(), c"%s".as_ptr(), buffer.as_mut_ptr());
-            debug_assert_eq!(qjs::JS_VALUE_GET_NORM_TAG(res), qjs::JS_TAG_EXCEPTION);
-        }
-        Error::Exception
+        throw_error_len(ctx, qjs::JSErrorEnum_JS_INTERNAL_ERROR, message)
     }
 
     /// Throws a new DOMException.
@@ -217,6 +199,36 @@ mod test {
     use crate::{
         atom::PredefinedAtom, context::intrinsic, Context, Error, Exception, Object, Runtime,
     };
+
+    #[test]
+    fn throw_long_message() {
+        let rt = Runtime::new().unwrap();
+        let ctx = Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            // no truncation, any character
+            let message = "\u{e9}".repeat(300) + "\0end";
+            let e = Exception::throw_range(&ctx, &message);
+            assert!(matches!(e, Error::Exception), "{e}");
+            let object = ctx.catch().into_object().unwrap();
+            assert!(object.is_instance_of(ctx.globals().get::<_, Object>("RangeError").unwrap()));
+            let exception = Exception::from_object(object).unwrap();
+            assert_eq!(exception.message().as_deref(), Some(message.as_str()));
+            assert!(exception.stack().is_some());
+
+            let message = "x".repeat(1000);
+            let error = Error::new_from_js_message("value", "thing", message.clone());
+            let res = error.throw(&ctx);
+            assert_eq!(
+                unsafe { crate::qjs::JS_VALUE_GET_NORM_TAG(res) },
+                crate::qjs::JS_TAG_EXCEPTION
+            );
+            let object = ctx.catch().into_object().unwrap();
+            assert!(object.is_instance_of(ctx.globals().get::<_, Object>("TypeError").unwrap()));
+            let exception = Exception::from_object(object).unwrap();
+            assert_eq!(exception.message(), Some(error.to_string()));
+            assert!(exception.message().unwrap().ends_with(&message));
+        });
+    }
 
     #[test]
     fn test_throw_dom() {
