@@ -1127,6 +1127,11 @@ JSValue JS_GetPrototype(JSContext *ctx, JSValueConst val);
 
 int JS_GetOwnPropertyNames(JSContext *ctx, JSPropertyEnum **ptab,
                            uint32_t *plen, JSValueConst obj, int flags);
+/* set '*plen' to the number of properties JS_GetOwnPropertyNames()
+   would return, without building the list for ordinary objects. Return
+   -1 if exception. */
+int JS_GetOwnPropertyCount(JSContext *ctx, uint32_t *plen, JSValueConst obj,
+                           int flags);
 void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab,
                          uint32_t len);
 int JS_GetOwnProperty(JSContext *ctx, JSPropertyDescriptor *desc,

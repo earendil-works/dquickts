@@ -2453,6 +2453,57 @@ static void test_property_str_len(void)
     JS_FreeRuntime(rt);
 }
 
+/* JS_GetOwnPropertyCount() returns the JS_GetOwnPropertyNames() count */
+static void check_own_count(JSContext *ctx, const char *src, int flags,
+                            uint32_t expected)
+{
+    JSValue obj = eval_str(ctx, src);
+    JSPropertyEnum *tab;
+    uint32_t len, count;
+
+    CHECK(JS_GetOwnPropertyNames(ctx, &tab, &len, obj, flags) == 0);
+    JS_FreePropertyEnum(ctx, tab, len);
+    CHECK(JS_GetOwnPropertyCount(ctx, &count, obj, flags) == 0);
+    CHECK(count == len && count == expected);
+    JS_FreeValue(ctx, obj);
+}
+
+static void test_own_property_count(JSContext *ctx)
+{
+    const int str_enum = JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY;
+    const int all = JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK;
+    const char *obj = "var s4o = { a: 1, b: 2, 1: 3, [Symbol()]: 4 };"
+        "Object.defineProperty(s4o, 'h', { value: 5 }); delete s4o.b; s4o";
+    uint32_t count;
+
+    check_own_count(ctx, "({})", str_enum, 0);
+    check_own_count(ctx, obj, str_enum, 2);
+    check_own_count(ctx, obj, JS_GPN_STRING_MASK, 3);
+    check_own_count(ctx, obj, JS_GPN_SYMBOL_MASK, 1);
+    check_own_count(ctx, obj, all, 4);
+    check_own_count(ctx, "[1, 2, 3]", str_enum, 3);
+    check_own_count(ctx, "[1, 2, 3]", JS_GPN_STRING_MASK, 4);
+    check_own_count(ctx, "new String('ab')", str_enum, 2);
+    check_own_count(ctx, "new Uint8Array(5)", str_enum, 5);
+    check_own_count(ctx, "(function (a, b) { return arguments })(1, 2)", str_enum, 2);
+    /* Proxy traps are called as by JS_GetOwnPropertyNames() */
+    CHECK(eval_bool(ctx, "var s4n = 0; var s4q = new Proxy({ a: 1, b: 2 }, {"
+                    "ownKeys(t) { s4n++; return Reflect.ownKeys(t) },"
+                    "getOwnPropertyDescriptor(t, k) { s4n++;"
+                    "  return Reflect.getOwnPropertyDescriptor(t, k) } }); true"));
+    check_own_count(ctx, "s4q", str_enum, 2);
+    CHECK(eval_bool(ctx, "s4n === 6"));
+    CHECK(JS_GetOwnPropertyCount(ctx, &count, JS_NewInt32(ctx, 1), str_enum) == -1);
+    check_exception(ctx, "TypeError");
+    CHECK(eval_bool(ctx, "var s4t = new Proxy({}, { ownKeys() { throw new RangeError() } }); true"));
+    {
+        JSValue t = eval_str(ctx, "s4t");
+        CHECK(JS_GetOwnPropertyCount(ctx, &count, t, str_enum) == -1);
+        check_exception(ctx, "RangeError");
+        JS_FreeValue(ctx, t);
+    }
+}
+
 int main(void)
 {
     JSRuntime *rt;
@@ -2499,6 +2550,7 @@ int main(void)
     test_free_macros(ctx);
     test_function_list_flags(ctx);
     test_promises(ctx);
+    test_own_property_count(ctx);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 

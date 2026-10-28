@@ -1284,6 +1284,10 @@ take a UTF-8 property name with an explicit length; like
 the name is not an atom yet and no exotic object (such as a
 @code{Proxy}) in the prototype chain can observe it.
 
+@code{JS_GetOwnPropertyCount()} returns the number of properties
+@code{JS_GetOwnPropertyNames()} would return with the same flags,
+without building the list for ordinary objects.
+
 @subsection C functions
 
 C functions can be created with

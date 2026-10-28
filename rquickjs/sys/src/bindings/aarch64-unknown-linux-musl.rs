@@ -1516,6 +1516,14 @@ unsafe extern "C" {
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    pub fn JS_GetOwnPropertyCount(
+        ctx: *mut JSContext,
+        plen: *mut u32,
+        obj: JSValue,
+        flags: ::core::ffi::c_int,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn JS_FreePropertyEnum(ctx: *mut JSContext, tab: *mut JSPropertyEnum, len: u32);
 }
 unsafe extern "C" {

@@ -10216,35 +10216,26 @@ void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab, uint32_t len)
     }
 }
 
-/* return < 0 in case if exception, 0 if OK. ptab and its atoms must
-   be freed by the user. */
-static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
-                                                      JSPropertyEnum **ptab,
-                                                      uint32_t *plen,
-                                                      JSObject *p, int flags)
+/* count the own properties of the shape of 'p' selected by 'flags',
+   split into array index, other string and symbol keys. Return -1 if
+   exception (uninitialized module binding). */
+static force_inline int __exception js_count_shape_props(JSContext *ctx,
+                                                         JSObject *p, int flags,
+                                                         uint32_t *pnum,
+                                                         uint32_t *pstr,
+                                                         uint32_t *psym)
 {
-    int i, j;
     JSShape *sh;
     JSShapeProperty *prs;
-    JSPropertyEnum *tab_atom, *tab_exotic;
     JSAtom atom;
-    uint32_t num_keys_count, str_keys_count, sym_keys_count, atom_count;
-    uint32_t num_index, str_index, sym_index, exotic_count, exotic_keys_count;
-    BOOL is_enumerable, num_sorted;
-    uint32_t num_key;
+    uint32_t num_keys_count, str_keys_count, sym_keys_count, num_key;
+    BOOL is_enumerable;
     JSAtomKindEnum kind;
+    int i;
 
-    /* clear pointer for consistency in case of failure */
-    *ptab = NULL;
-    *plen = 0;
-
-    /* compute the number of returned properties */
     num_keys_count = 0;
     str_keys_count = 0;
     sym_keys_count = 0;
-    exotic_keys_count = 0;
-    exotic_count = 0;
-    tab_exotic = NULL;
     sh = p->shape;
     for(i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
         atom = prs->atom;
@@ -10273,6 +10264,41 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
             }
         }
     }
+    *pnum = num_keys_count;
+    *pstr = str_keys_count;
+    *psym = sym_keys_count;
+    return 0;
+}
+
+/* return < 0 in case if exception, 0 if OK. ptab and its atoms must
+   be freed by the user. */
+static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
+                                                      JSPropertyEnum **ptab,
+                                                      uint32_t *plen,
+                                                      JSObject *p, int flags)
+{
+    int i, j;
+    JSShape *sh;
+    JSShapeProperty *prs;
+    JSPropertyEnum *tab_atom, *tab_exotic;
+    JSAtom atom;
+    uint32_t num_keys_count, str_keys_count, sym_keys_count, atom_count;
+    uint32_t num_index, str_index, sym_index, exotic_count, exotic_keys_count;
+    BOOL is_enumerable, num_sorted;
+    uint32_t num_key;
+    JSAtomKindEnum kind;
+
+    /* clear pointer for consistency in case of failure */
+    *ptab = NULL;
+    *plen = 0;
+
+    /* compute the number of returned properties */
+    exotic_keys_count = 0;
+    exotic_count = 0;
+    tab_exotic = NULL;
+    if (js_count_shape_props(ctx, p, flags, &num_keys_count,
+                             &str_keys_count, &sym_keys_count))
+        return -1;
 
     if (p->is_exotic) {
         if (p->fast_array) {
@@ -10436,6 +10462,54 @@ int JS_GetOwnPropertyNames(JSContext *ctx, JSPropertyEnum **ptab,
     }
     return JS_GetOwnPropertyNamesInternal(ctx, ptab, plen,
                                           JS_VALUE_GET_OBJ(obj), flags);
+}
+
+/* Same count as JS_GetOwnPropertyNames() with the same side effects,
+   without building the property list unless an exotic
+   get_own_property_names method (e.g. Proxy ownKeys) is involved. */
+int JS_GetOwnPropertyCount(JSContext *ctx, uint32_t *plen, JSValueConst obj,
+                           int flags)
+{
+    JSObject *p;
+    JSPropertyEnum *tab;
+    uint32_t num_keys_count, str_keys_count, sym_keys_count;
+    uint64_t count;
+
+    *plen = 0;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
+        JS_ThrowTypeErrorNotAnObject(ctx);
+        return -1;
+    }
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->is_exotic && !p->fast_array && p->class_id != JS_CLASS_STRING) {
+        const JSClassExoticMethods *em = ctx->rt->class_array[p->class_id].exotic;
+        if (em && em->get_own_property_names) {
+            if (JS_GetOwnPropertyNamesInternal(ctx, &tab, plen, p, flags))
+                return -1;
+            JS_FreePropertyEnum(ctx, tab, *plen);
+            return 0;
+        }
+    }
+    if (js_count_shape_props(ctx, p, flags, &num_keys_count,
+                             &str_keys_count, &sym_keys_count))
+        return -1;
+    count = (uint64_t)num_keys_count + str_keys_count + sym_keys_count;
+    if (p->is_exotic) {
+        if (p->fast_array) {
+            typed_array_sync_length(p);
+            if (flags & JS_GPN_STRING_MASK)
+                count += p->u.array.count;
+        } else if (p->class_id == JS_CLASS_STRING) {
+            if (flags & JS_GPN_STRING_MASK)
+                count += js_string_obj_get_length(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+        }
+    }
+    if (count > INT32_MAX) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    *plen = count;
+    return 0;
 }
 
 /* Return -1 if exception,
