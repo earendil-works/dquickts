@@ -912,7 +912,7 @@ static void test_typed_array_data(JSContext *ctx)
     static const int elem_sizes[] = { 1, 1, 1, 2, 2, 4, 4, 8, 8, 2, 4, 8 };
     JSValue v, buf, arg;
     uint8_t *p, *base;
-    size_t size;
+    size_t size, off;
     int t, i;
 
     CHECK(countof(elem_sizes) == JS_TYPED_ARRAY_FLOAT64 + 1);
@@ -947,6 +947,12 @@ static void test_typed_array_data(JSContext *ctx)
     check_ta_data(ctx, eval_str(ctx, "rab.resize(4); tl"), 4, 0, 4);
     check_ta_data(ctx, eval_str(ctx, "rab.resize(2); tl"), -1, 0, 0);
     check_ta_data(ctx, eval_str(ctx, "rab.resize(32); tl"), 4, 28, 4);
+    /* JS_GetTypedArrayBuffer() returns the same current byte length */
+    v = eval_str(ctx, "rab.resize(20); tl");
+    buf = JS_GetTypedArrayBuffer(ctx, v, &off, &size, NULL);
+    CHECK(!JS_IsException(buf) && off == 4 && size == 16);
+    JS_FreeValue(ctx, buf);
+    JS_FreeValue(ctx, v);
 
     /* length-tracking view of a growable SharedArrayBuffer */
     v = eval_str(ctx, "var gsab = new SharedArrayBuffer(4, { maxByteLength: 16 }); "

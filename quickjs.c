@@ -71698,19 +71698,22 @@ JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
 {
     JSObject *p;
     JSTypedArray *ta;
+    int size_log2;
+
     p = get_typed_array(ctx, obj);
     if (!p)
         return JS_EXCEPTION;
     if (typed_array_is_oob(p))
         return JS_ThrowTypeErrorArrayBufferOOB(ctx);
     ta = p->u.typed_array;
+    size_log2 = typed_array_size_log2(p->class_id);
     if (pbyte_offset)
         *pbyte_offset = ta->offset;
+    /* not ta->length: it is the initial length of a length-tracking view */
     if (pbyte_length)
-        *pbyte_length = ta->length;
-    if (pbytes_per_element) {
-        *pbytes_per_element = 1 << typed_array_size_log2(p->class_id);
-    }
+        *pbyte_length = (size_t)p->u.array.count << size_log2;
+    if (pbytes_per_element)
+        *pbytes_per_element = (size_t)1 << size_log2;
     return JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
 }
 
