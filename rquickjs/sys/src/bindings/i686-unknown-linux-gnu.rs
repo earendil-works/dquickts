@@ -476,10 +476,7 @@ unsafe extern "C" {
     pub fn JS_NewContext(rt: *mut JSRuntime) -> *mut JSContext;
 }
 unsafe extern "C" {
-    pub fn JS_FreeContext(s: *mut JSContext);
-}
-unsafe extern "C" {
-    pub fn JS_DupContext(ctx: *mut JSContext) -> *mut JSContext;
+    pub fn __JS_FreeContext(ctx: *mut JSContext);
 }
 unsafe extern "C" {
     pub fn JS_GetContextOpaque(ctx: *mut JSContext) -> *mut ::core::ffi::c_void;

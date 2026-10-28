@@ -1973,6 +1973,65 @@ static void test_calloc(void)
     JS_FreeRuntime(rt);
 }
 
+static int64_t obj_count(JSRuntime *rt)
+{
+    JSMemoryUsage m;
+    JS_RunGC(rt);
+    JS_ComputeMemoryUsage(rt, &m);
+    return m.obj_count;
+}
+
+/* JS_DupContext() / JS_FreeContext() are inline: a context outlives
+   the release of its owner reference while other references exist */
+static void test_context_refcount(void)
+{
+    const JSMallocFunctions *mfs[] = { NULL, &t_mf };
+    int i;
+
+    for(i = 0; i < (int)countof(mfs); i++) {
+        JSRuntime *rt = mfs[i] ? JS_NewRuntime2(mfs[i], NULL) : JS_NewRuntime();
+        JSContext *ctx, *ctx2, *pctx;
+        int64_t n0;
+
+        CHECK(rt != NULL);
+        n0 = obj_count(rt);
+        ctx = JS_NewContext(rt);
+        CHECK(ctx != NULL);
+        CHECK(obj_count(rt) > n0);
+
+        ctx2 = JS_DupContext(ctx);
+        CHECK(ctx2 == ctx);
+        CHECK(eval_bool(ctx, "globalThis.x = 42; true"));
+        JS_FreeContext(ctx); /* the owner reference */
+        CHECK(eval_bool(ctx2, "x === 42"));
+        CHECK(JS_DupContext(JS_DupContext(ctx2)) == ctx2);
+        JS_FreeContext(ctx2);
+        JS_FreeContext(ctx2);
+        CHECK(eval_bool(ctx2, "x === 42"));
+        JS_FreeContext(ctx2); /* the last reference frees the context */
+        CHECK(obj_count(rt) == n0);
+
+        /* a pending job keeps its realm alive after the owner release */
+        ctx = JS_NewContext(rt);
+        CHECK(eval_bool(ctx, "Promise.resolve().then(() => { globalThis.done = 1; }); true"));
+        JS_FreeContext(ctx);
+        CHECK(JS_IsJobPending(rt));
+        CHECK(JS_ExecutePendingJob(rt, &pctx) == 1);
+        /* only cycles through the realm's objects keep it now */
+        CHECK(obj_count(rt) == n0);
+
+        /* the job reports its realm while another reference exists */
+        ctx = JS_NewContext(rt);
+        CHECK(eval_bool(ctx, "Promise.resolve().then(() => { globalThis.done = 1; }); true"));
+        CHECK(JS_ExecutePendingJob(rt, &pctx) == 1);
+        CHECK(pctx == ctx);
+        CHECK(eval_bool(ctx, "done === 1"));
+        JS_FreeContext(ctx);
+        CHECK(obj_count(rt) == n0);
+        JS_FreeRuntime(rt);
+    }
+}
+
 /* bellard/quickjs#581: a WeakMap value is kept only while its key is
    reachable and one GC pass collects the unreachable entries */
 static void test_weak_map_ephemeron(void)
@@ -2117,6 +2176,7 @@ int main(void)
     test_runtime();
     test_normalize2();
     test_calloc();
+    test_context_refcount();
     test_weak_map_ephemeron();
     test_trigger_interrupt();
     test_bigint_pow_leak();

@@ -2991,6 +2991,8 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
         return NULL;
     }
     js_rc(ctx)->ref_count = 1;
+    /* JS_DupContext() and JS_FreeContext() in quickjs.h access it there */
+    assert(&js_rc(ctx)->ref_count == &((JSRefCountHeader *)((uint32_t *)ctx - 1))->ref_count);
     add_gc_object(rt, &ctx->header, JS_GC_OBJ_TYPE_JS_CONTEXT);
     ctx->rt = rt;
     list_add_tail(&ctx->link, &rt->context_list);
@@ -3098,12 +3100,6 @@ static void js_free_modules(JSContext *ctx, JSFreeModuleEnum flag)
     }
 }
 
-JSContext *JS_DupContext(JSContext *ctx)
-{
-    js_rc(ctx)->ref_count++;
-    return ctx;
-}
-
 /* used by the GC */
 static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
                            JS_MarkFunc *mark_func)
@@ -3157,13 +3153,12 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
         mark_func(rt, &ctx->regexp_result_shape->header);
 }
 
-void JS_FreeContext(JSContext *ctx)
+/* called by JS_FreeContext() when the last reference is released */
+void __JS_FreeContext(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
     int i;
 
-    if (--js_rc(ctx)->ref_count > 0)
-        return;
     assert(js_rc(ctx)->ref_count == 0);
 
 #ifdef ENABLE_DUMPS // JS_DUMP_ATOMS

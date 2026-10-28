@@ -478,8 +478,26 @@ void JS_RunGC(JSRuntime *rt);
 JS_BOOL JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
 
 JSContext *JS_NewContext(JSRuntime *rt);
-void JS_FreeContext(JSContext *s);
-JSContext *JS_DupContext(JSContext *ctx);
+void __JS_FreeContext(JSContext *ctx);
+
+/* The context reference count is stored in the memory block header
+   right before the JSContext, at the same place as the reference
+   count of the reference counted values. */
+static inline JSContext *JS_DupContext(JSContext *ctx)
+{
+    ((JSRefCountHeader *)((uint32_t *)ctx - 1))->ref_count++;
+    return ctx;
+}
+
+/* release a reference to the context; it is freed (with its intrinsic
+   objects) when the last reference is released */
+static inline void JS_FreeContext(JSContext *ctx)
+{
+    JSRefCountHeader *p = (JSRefCountHeader *)((uint32_t *)ctx - 1);
+    if (--p->ref_count <= 0) {
+        __JS_FreeContext(ctx);
+    }
+}
 void *JS_GetContextOpaque(JSContext *ctx);
 void JS_SetContextOpaque(JSContext *ctx, void *opaque);
 JSRuntime *JS_GetRuntime(JSContext *ctx);
