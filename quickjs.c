@@ -102,7 +102,7 @@ enum {
     /* classid tag        */    /* union usage   | properties */
     JS_CLASS_OBJECT = 1,        /* must be first */
     JS_CLASS_ARRAY,             /* u.array       | length */
-    JS_CLASS_ERROR,             /* u.object_data: stack */
+    JS_CLASS_ERROR,             /* u.error */
     JS_CLASS_NUMBER,            /* u.object_data */
     JS_CLASS_STRING,            /* u.object_data */
     JS_CLASS_BOOLEAN,           /* u.object_data */
@@ -1222,10 +1222,35 @@ struct JSObject {
             uint32_t count; /* <= 2^31-1. 0 for a detached typed array */
         } array;    /* 12/20 bytes */
         JSRegExp regexp;    /* JS_CLASS_REGEXP: 8/16 bytes */
+        struct { /* JS_CLASS_ERROR: 12/16/24 bytes */
+            /* [[ErrorData]] stack trace (see Error.prototype.stack):
+               JS_UNINITIALIZED if not captured or if 'backtrace' is
+               not formatted yet */
+            JSValue stack;
+            /* captured stack trace formatted on first use or NULL
+               (see build_backtrace()) */
+            struct JSErrorBacktrace *backtrace;
+        } error;
         JSValue object_data;    /* for JS_SetObjectData(): 8/16/16 bytes */
         JSGlobalObject global_object;
     } u;
 };
+
+/* stack frame of a captured stack trace (see build_backtrace()) */
+typedef struct JSBacktraceFrame {
+    JSValue func_name; /* string or JS_NULL */
+    /* bytecode function with debug information or NULL (counted
+       reference) */
+    JSFunctionBytecode *b;
+    uint32_t pc; /* position in 'b' */
+    BOOL native; /* TRUE if C function */
+} JSBacktraceFrame;
+
+/* default stack trace of an Error object, formatted on first use */
+typedef struct JSErrorBacktrace {
+    int count;
+    JSBacktraceFrame frames[0];
+} JSErrorBacktrace;
 
 typedef struct JSMapRecord {
     int ref_count; /* used during enumeration to avoid freeing the record */
@@ -1354,6 +1379,8 @@ static void js_array_finalizer(JSRuntime *rt, JSValue val);
 static void js_array_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 static void js_mapped_arguments_finalizer(JSRuntime *rt, JSValue val);
 static void js_mapped_arguments_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
+static void js_error_finalizer(JSRuntime *rt, JSValue val);
+static void js_error_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 static void js_object_data_finalizer(JSRuntime *rt, JSValue val);
 static void js_object_data_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 static void js_callsite_finalizer(JSRuntime *rt, JSValue val);
@@ -2219,7 +2246,7 @@ typedef struct JSClassShortDef {
 static JSClassShortDef const js_std_class_def[] = {
     { JS_ATOM_Object, NULL, NULL },                             /* JS_CLASS_OBJECT */
     { JS_ATOM_Array, js_array_finalizer, js_array_mark },       /* JS_CLASS_ARRAY */
-    { JS_ATOM_Error, js_object_data_finalizer, js_object_data_mark }, /* JS_CLASS_ERROR */
+    { JS_ATOM_Error, js_error_finalizer, js_error_mark }, /* JS_CLASS_ERROR */
     { JS_ATOM_Number, js_object_data_finalizer, js_object_data_mark }, /* JS_CLASS_NUMBER */
     { JS_ATOM_String, js_object_data_finalizer, js_object_data_mark }, /* JS_CLASS_STRING */
     { JS_ATOM_Boolean, js_object_data_finalizer, js_object_data_mark }, /* JS_CLASS_BOOLEAN */
@@ -6340,7 +6367,8 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
         goto set_exotic;
     case JS_CLASS_ERROR:
         /* no stack trace captured yet (see build_backtrace()) */
-        p->u.object_data = JS_UNINITIALIZED;
+        p->u.error.stack = JS_UNINITIALIZED;
+        p->u.error.backtrace = NULL;
         break;
     case JS_CLASS_REGEXP:
         p->u.regexp.pattern = NULL;
@@ -6951,6 +6979,30 @@ static void js_array_mark(JSRuntime *rt, JSValueConst val,
     for(i = 0; i < p->u.array.count; i++) {
         JS_MarkValue(rt, p->u.array.u.values[i], mark_func);
     }
+}
+
+static void js_backtrace_free(JSRuntime *rt, struct JSErrorBacktrace *bt);
+static void js_backtrace_mark(JSRuntime *rt, struct JSErrorBacktrace *bt,
+                              JS_MarkFunc *mark_func);
+
+static void js_error_finalizer(JSRuntime *rt, JSValue val)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JS_FreeValueRT(rt, p->u.error.stack);
+    p->u.error.stack = JS_UNDEFINED;
+    if (p->u.error.backtrace) {
+        js_backtrace_free(rt, p->u.error.backtrace);
+        p->u.error.backtrace = NULL;
+    }
+}
+
+static void js_error_mark(JSRuntime *rt, JSValueConst val,
+                          JS_MarkFunc *mark_func)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JS_MarkValue(rt, p->u.error.stack, mark_func);
+    if (p->u.error.backtrace)
+        js_backtrace_mark(rt, p->u.error.backtrace, mark_func);
 }
 
 static void js_object_data_finalizer(JSRuntime *rt, JSValue val)
@@ -7817,7 +7869,14 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
                 }
             }
             break;
-        case JS_CLASS_ERROR:             /* u.object_data */
+        case JS_CLASS_ERROR:             /* u.error */
+            compute_value_size(p->u.error.stack, hp);
+            if (p->u.error.backtrace) {
+                s->memory_used_count++;
+                s->memory_used_size += sizeof(JSErrorBacktrace) +
+                    p->u.error.backtrace->count * sizeof(JSBacktraceFrame);
+            }
+            break;
         case JS_CLASS_NUMBER:            /* u.object_data */
         case JS_CLASS_STRING:            /* u.object_data */
         case JS_CLASS_BOOLEAN:           /* u.object_data */
@@ -8274,9 +8333,9 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
     return 0;
 }
 
-/* return a string property without executing arbitrary JS code (used
-   when dumping the stack trace or in debug print). */
-static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop)
+/* return the string value of the 'prop' data property of 'obj' or
+   JS_NULL. No JS code is run. */
+static JSValueConst get_prop_string_value(JSValueConst obj, JSAtom prop)
 {
     JSObject *p;
     JSProperty *pr;
@@ -8284,7 +8343,7 @@ static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop
     JSValueConst val;
 
     if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
-        return NULL;
+        return JS_NULL;
     p = JS_VALUE_GET_OBJ(obj);
     prs = find_own_property(&pr, p, prop);
     if (!prs) {
@@ -8292,16 +8351,26 @@ static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop
            field of the Error objects */
         p = p->shape->proto;
         if (!p)
-            return NULL;
+            return JS_NULL;
         prs = find_own_property(&pr, p, prop);
         if (!prs)
-            return NULL;
+            return JS_NULL;
     }
     
     if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
-        return NULL;
+        return JS_NULL;
     val = pr->u.value;
     if (JS_VALUE_GET_TAG(val) != JS_TAG_STRING)
+        return JS_NULL;
+    return val;
+}
+
+/* return a string property without executing arbitrary JS code (used
+   when dumping the stack trace or in debug print). */
+static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop)
+{
+    JSValueConst val = get_prop_string_value(obj, prop);
+    if (JS_IsNull(val))
         return NULL;
     return JS_ToCString(ctx, val);
 }
@@ -8428,6 +8497,40 @@ static JSValue js_new_callsite(JSContext *ctx, JSStackFrame *sf,
     return obj;
 }
 
+/* add a level of the default stack trace. 'b' is the bytecode function
+   with debug information or NULL. */
+static void js_backtrace_put_frame(JSContext *ctx, DynBuf *dbuf,
+                                   const char *func_name,
+                                   JSFunctionBytecode *b, uint32_t pc,
+                                   BOOL native)
+{
+    const char *atom_str;
+    int line_num, col_num;
+    char buf[16];
+
+    dbuf_putstr(dbuf, "    at ");
+    if (!func_name || func_name[0] == '\0')
+        func_name = "<anonymous>";
+    dbuf_putstr(dbuf, func_name);
+    if (native) {
+        dbuf_putstr(dbuf, " (native)");
+    } else if (b) {
+        line_num = find_line_num(ctx, b, pc, &col_num);
+        atom_str = JS_AtomToCString(ctx, b->debug.filename);
+        dbuf_putstr(dbuf, " (");
+        dbuf_putstr(dbuf, atom_str ? atom_str : "<null>");
+        JS_FreeCString(ctx, atom_str);
+        if (line_num != 0) {
+            dbuf_putc(dbuf, ':');
+            dbuf_put(dbuf, (const uint8_t *)buf, i32toa(buf, line_num));
+            dbuf_putc(dbuf, ':');
+            dbuf_put(dbuf, (const uint8_t *)buf, i32toa(buf, col_num));
+        }
+        dbuf_putc(dbuf, ')');
+    }
+    dbuf_putc(dbuf, '\n');
+}
+
 /* Return the stack trace from 'sf' as a string or, if 'callsites' is
    TRUE, as an array of CallSite objects. Return JS_NULL in case of
    exception. If filename != NULL, an additional level is added with
@@ -8439,7 +8542,6 @@ static JSValue get_backtrace(JSContext *ctx, JSStackFrame *sf,
     JSValue ret, val;
     DynBuf dbuf;
     const char *func_name_str;
-    const char *str1;
     JSObject *p;
     int level;
 
@@ -8482,35 +8584,21 @@ static JSValue get_backtrace(JSContext *ctx, JSStackFrame *sf,
             continue;
         }
         func_name_str = get_prop_string(ctx, sf->cur_func, JS_ATOM_name);
-        if (!func_name_str || func_name_str[0] == '\0')
-            str1 = "<anonymous>";
-        else
-            str1 = func_name_str;
-        dbuf_printf(&dbuf, "    at %s", str1);
-        JS_FreeCString(ctx, func_name_str);
-
         p = JS_VALUE_GET_OBJ(sf->cur_func);
         if (js_class_has_bytecode(p->class_id)) {
-            JSFunctionBytecode *b;
-            const char *atom_str;
-            int line_num1, col_num1;
-
-            b = p->u.func.function_bytecode;
+            JSFunctionBytecode *b = p->u.func.function_bytecode;
             if (b->has_debug) {
-                line_num1 = find_line_num(ctx, b,
-                                          sf->cur_pc - b->byte_code_buf - 1, &col_num1);
-                atom_str = JS_AtomToCString(ctx, b->debug.filename);
-                dbuf_printf(&dbuf, " (%s",
-                            atom_str ? atom_str : "<null>");
-                JS_FreeCString(ctx, atom_str);
-                if (line_num1 != 0)
-                    dbuf_printf(&dbuf, ":%d:%d", line_num1, col_num1);
-                dbuf_putc(&dbuf, ')');
+                js_backtrace_put_frame(ctx, &dbuf, func_name_str, b,
+                                       sf->cur_pc - b->byte_code_buf - 1,
+                                       FALSE);
+            } else {
+                js_backtrace_put_frame(ctx, &dbuf, func_name_str, NULL, 0,
+                                       FALSE);
             }
         } else {
-            dbuf_printf(&dbuf, " (native)");
+            js_backtrace_put_frame(ctx, &dbuf, func_name_str, NULL, 0, TRUE);
         }
-        dbuf_putc(&dbuf, '\n');
+        JS_FreeCString(ctx, func_name_str);
         level++;
     }
     if (callsites)
@@ -8527,6 +8615,170 @@ static JSValue get_backtrace(JSContext *ctx, JSStackFrame *sf,
  fail:
     JS_FreeValue(ctx, ret);
     return JS_NULL;
+}
+
+/* Capture the levels of the default stack trace from 'sf' (see
+   get_backtrace()) without formatting them. The result only depends
+   on immutable data (function bytecode and position) and on the
+   function names which are read now. Return NULL if out of memory (no
+   exception is raised). */
+static JSErrorBacktrace *js_backtrace_capture(JSContext *ctx,
+                                              JSStackFrame *sf,
+                                              int backtrace_flags, int limit)
+{
+    JSRuntime *rt = ctx->rt;
+    JSErrorBacktrace *bt;
+    JSBacktraceFrame *fr, *fr_end;
+    JSStackFrame *sf1;
+    JSObject *p;
+    int n, flags;
+
+    n = 0;
+    flags = backtrace_flags;
+    for(sf1 = sf; sf1 != NULL && n < limit; sf1 = sf1->prev_frame) {
+        if (sf1->js_mode & JS_MODE_BACKTRACE_BARRIER)
+            break;
+        if (flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) {
+            flags &= ~JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL;
+            continue;
+        }
+        n++;
+    }
+    bt = js_malloc_rt(rt, sizeof(*bt) + n * sizeof(bt->frames[0]));
+    if (!bt)
+        return NULL;
+    bt->count = n;
+    fr = bt->frames;
+    fr_end = fr + n;
+    flags = backtrace_flags;
+    for(; fr < fr_end; sf = sf->prev_frame) {
+        if (flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) {
+            flags &= ~JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL;
+            continue;
+        }
+        /* same name as get_prop_string() in get_backtrace() */
+        fr->func_name = JS_DupValueRT(rt, get_prop_string_value(sf->cur_func,
+                                                                JS_ATOM_name));
+        fr->b = NULL;
+        fr->pc = 0;
+        fr->native = FALSE;
+        p = JS_VALUE_GET_OBJ(sf->cur_func);
+        if (js_class_has_bytecode(p->class_id)) {
+            JSFunctionBytecode *b = p->u.func.function_bytecode;
+            if (b->has_debug) {
+                fr->b = b;
+                fr->pc = sf->cur_pc - b->byte_code_buf - 1;
+                JS_DupValueRT(rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b));
+            }
+        } else {
+            fr->native = TRUE;
+        }
+        fr++;
+    }
+    return bt;
+}
+
+static void js_backtrace_free(JSRuntime *rt, JSErrorBacktrace *bt)
+{
+    JSBacktraceFrame *fr;
+    int i;
+
+    for(i = 0; i < bt->count; i++) {
+        fr = &bt->frames[i];
+        JS_FreeValueRT(rt, fr->func_name);
+        if (fr->b)
+            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, fr->b));
+    }
+    js_free_rt(rt, bt);
+}
+
+static void js_backtrace_mark(JSRuntime *rt, JSErrorBacktrace *bt,
+                              JS_MarkFunc *mark_func)
+{
+    int i;
+
+    for(i = 0; i < bt->count; i++) {
+        if (bt->frames[i].b)
+            JS_MarkValue(rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE,
+                                      bt->frames[i].b), mark_func);
+    }
+}
+
+/* Return the stack trace string of 'bt' (same as get_backtrace() at
+   capture time) or JS_NULL. The pending exception is preserved and no
+   exception is returned. */
+static JSValue js_backtrace_to_string(JSContext *ctx,
+                                      const JSErrorBacktrace *bt)
+{
+    JSRuntime *rt = ctx->rt;
+    const JSBacktraceFrame *fr;
+    JSValue ret, saved_exception;
+    BOOL saved_uncatchable;
+    const char *func_name_str;
+    DynBuf dbuf;
+    int i;
+
+    saved_exception = rt->current_exception;
+    saved_uncatchable = rt->current_exception_is_uncatchable;
+    rt->current_exception = JS_UNINITIALIZED;
+    rt->current_exception_is_uncatchable = FALSE;
+
+    js_dbuf_init(ctx, &dbuf);
+    for(i = 0; i < bt->count; i++) {
+        fr = &bt->frames[i];
+        func_name_str = NULL;
+        if (!JS_IsNull(fr->func_name))
+            func_name_str = JS_ToCString(ctx, fr->func_name);
+        js_backtrace_put_frame(ctx, &dbuf, func_name_str, fr->b, fr->pc,
+                               fr->native);
+        JS_FreeCString(ctx, func_name_str);
+    }
+    dbuf_putc(&dbuf, '\0');
+    if (dbuf_error(&dbuf))
+        ret = JS_NULL;
+    else
+        ret = JS_NewString(ctx, (char *)dbuf.buf);
+    dbuf_free(&dbuf);
+    if (JS_IsException(ret))
+        ret = JS_NULL;
+
+    JS_FreeValue(ctx, rt->current_exception);
+    rt->current_exception = saved_exception;
+    rt->current_exception_is_uncatchable = saved_uncatchable;
+    return ret;
+}
+
+/* format the stack trace of the Error object 'p' if it is not done
+   yet (no observable side effect) */
+static void js_error_format_stack(JSContext *ctx, JSObject *p)
+{
+    JSErrorBacktrace *bt = p->u.error.backtrace;
+
+    if (bt) {
+        /* 'p->u.error.stack' is JS_UNINITIALIZED */
+        p->u.error.stack = js_backtrace_to_string(ctx, bt);
+        p->u.error.backtrace = NULL;
+        js_backtrace_free(ctx->rt, bt);
+    }
+}
+
+/* Return the Error.prepareStackTrace() function to use for a new stack
+   trace or JS_UNDEFINED. It is not used for the errors raised by
+   itself, for the uncatchable ones (interruption) and outside of JS
+   code (host calls, heap snapshot reading where the functions may be
+   incomplete, GC). No JS code is run. */
+static JSValueConst js_get_prepare_stack_trace(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValueConst prepare_func;
+
+    if (rt->in_prepare_stack_trace || rt->current_exception_is_uncatchable ||
+        !rt->current_stack_frame || rt->gc_phase != JS_GC_PHASE_NONE)
+        return JS_UNDEFINED;
+    prepare_func = js_get_error_ctor_data(ctx, JS_ATOM_prepareStackTrace);
+    if (!JS_IsFunction(ctx, prepare_func))
+        return JS_UNDEFINED;
+    return prepare_func;
 }
 
 /* Return the stack trace of 'error_obj': the string of
@@ -8547,6 +8799,7 @@ static JSValue build_stack_trace(JSContext *ctx, JSValueConst error_obj,
     BOOL saved_uncatchable;
     int limit;
 
+    prepare_func = js_get_prepare_stack_trace(ctx);
     /* the pending exception may be 'error_obj' (exception of a
        bytecode operation): it must not be replaced by an exception
        raised here */
@@ -8568,15 +8821,7 @@ static JSValue build_stack_trace(JSContext *ctx, JSValueConst error_obj,
     }
 
     stack = JS_EXCEPTION;
-    /* Error.prepareStackTrace() is not used for the errors raised by
-       itself, for the uncatchable ones (interruption) and outside of
-       JS code (host calls, heap snapshot reading where the functions
-       may be incomplete, GC) */
-    prepare_func = JS_UNDEFINED;
-    if (!rt->in_prepare_stack_trace && !saved_uncatchable &&
-        rt->current_stack_frame && rt->gc_phase == JS_GC_PHASE_NONE)
-        prepare_func = js_get_error_ctor_data(ctx, JS_ATOM_prepareStackTrace);
-    if (JS_IsFunction(ctx, prepare_func)) {
+    if (!JS_IsUndefined(prepare_func)) {
         /* the call may replace Error.prepareStackTrace */
         prepare = JS_DupValue(ctx, prepare_func);
         args[1] = get_backtrace(ctx, sf, filename, line_num, col_num,
@@ -8635,13 +8880,31 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj1,
             goto done;
         }
     }
-    stack = build_stack_trace(ctx, error_obj, JS_UNDEFINED, filename,
-                              line_num, col_num, backtrace_flags);
     p = JS_VALUE_GET_OBJ(error_obj);
     if (p->class_id == JS_CLASS_ERROR) {
-        JS_FreeValue(ctx, p->u.object_data);
-        p->u.object_data = stack;
+        JSErrorBacktrace *bt;
+        
+        if (!filename && JS_IsUndefined(js_get_prepare_stack_trace(ctx))) {
+            /* default stack trace: the levels are captured now and
+               formatted when the stack is read (much faster when it
+               is never read) */
+            bt = js_backtrace_capture(ctx, ctx->rt->current_stack_frame,
+                                      backtrace_flags,
+                                      js_get_stack_trace_limit(ctx));
+            stack = bt ? JS_UNINITIALIZED : JS_NULL;
+        } else {
+            bt = NULL;
+            stack = build_stack_trace(ctx, error_obj, JS_UNDEFINED, filename,
+                                      line_num, col_num, backtrace_flags);
+        }
+        JS_FreeValue(ctx, p->u.error.stack);
+        if (p->u.error.backtrace)
+            js_backtrace_free(ctx->rt, p->u.error.backtrace);
+        p->u.error.stack = stack;
+        p->u.error.backtrace = bt;
     } else {
+        stack = build_stack_trace(ctx, error_obj, JS_UNDEFINED, filename,
+                                  line_num, col_num, backtrace_flags);
         JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack,
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     }
@@ -8658,7 +8921,7 @@ static BOOL is_backtrace_needed(JSContext *ctx, JSValueConst obj)
     p = JS_VALUE_GET_OBJ(obj);
     if (p->class_id != JS_CLASS_ERROR)
         return FALSE;
-    if (!JS_IsUninitialized(p->u.object_data))
+    if (!JS_IsUninitialized(p->u.error.stack) || p->u.error.backtrace)
         return FALSE; /* already captured */
     if (find_own_property1(p, JS_ATOM_stack))
         return FALSE;
@@ -15477,8 +15740,18 @@ static void js_print_error(JSPrintValueState *s, JSObject *p)
     /* dump the stack if present: own 'stack' property, else the stack
        trace returned by the Error.prototype.stack getter */
     str = get_prop_string(s->ctx, JS_MKPTR(JS_TAG_OBJECT, p), JS_ATOM_stack);
-    if (!str && JS_VALUE_GET_TAG(p->u.object_data) == JS_TAG_STRING)
-        str = JS_ToCString(s->ctx, p->u.object_data);
+    if (!str) {
+        if (p->u.error.backtrace) {
+            /* the object is not modified while it is printed */
+            JSValue stack = js_backtrace_to_string(s->ctx,
+                                                   p->u.error.backtrace);
+            if (JS_VALUE_GET_TAG(stack) == JS_TAG_STRING)
+                str = JS_ToCString(s->ctx, stack);
+            JS_FreeValue(s->ctx, stack);
+        } else if (JS_VALUE_GET_TAG(p->u.error.stack) == JS_TAG_STRING) {
+            str = JS_ToCString(s->ctx, p->u.error.stack);
+        }
+    }
     if (str) {
         js_putc(s, '\n');
         
@@ -51756,9 +52029,12 @@ static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
     if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
         return JS_ThrowTypeErrorNotAnObject(ctx);
     p = JS_VALUE_GET_OBJ(this_val);
-    if (p->class_id != JS_CLASS_ERROR || JS_IsUninitialized(p->u.object_data))
+    if (p->class_id != JS_CLASS_ERROR)
         return JS_UNDEFINED;
-    return JS_DupValue(ctx, p->u.object_data);
+    js_error_format_stack(ctx, p);
+    if (JS_IsUninitialized(p->u.error.stack))
+        return JS_UNDEFINED;
+    return JS_DupValue(ctx, p->u.error.stack);
 }
 
 /* SetterThatIgnoresPrototypeProperties(this, %Error.prototype%, "stack", value) */

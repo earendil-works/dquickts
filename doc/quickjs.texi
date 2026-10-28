@@ -382,7 +382,10 @@ created (or, for the errors raised by bytecode operations, when it is
 thrown). @code{Error.prototype.stack} is an accessor (Error stack
 accessor proposal) returning the captured stack trace: it is not an
 own property of the errors. By default it is a string with one
-@code{    at function (file:line:column)} line per call level.
+@code{    at function (file:line:column)} line per call level. The
+default string is built when the stack is first read, with the call
+levels and function names captured at creation time, so that creating
+and throwing errors is fast when their stack is not used.
 
 The V8 stack trace API is supported:
 

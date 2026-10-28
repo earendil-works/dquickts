@@ -1097,8 +1097,18 @@ static int snap_write_payload(SnapWriter *w, JSObject *p)
     case JS_CLASS_SYMBOL:
     case JS_CLASS_DATE:
     case JS_CLASS_BIG_INT:
-    case JS_CLASS_ERROR: /* stack trace, uninitialized if not captured */
         return snap_put_value(w, p->u.object_data);
+    case JS_CLASS_ERROR: /* stack trace, uninitialized if not captured */
+        if (p->u.error.backtrace) {
+            /* stack trace not formatted yet: the string is written
+               without modifying the heap (the string is kept by
+               snap_put_string()) */
+            JSValue stack = js_backtrace_to_string(ctx, p->u.error.backtrace);
+            int ret = snap_put_value(w, stack);
+            JS_FreeValue(ctx, stack);
+            return ret;
+        }
+        return snap_put_value(w, p->u.error.stack);
     case JS_CLASS_CALL_SITE:
         {
             JSCallSiteData *csd = p->u.opaque;
@@ -2516,9 +2526,11 @@ static int snap_read_payload(SnapReader *r, JSObject *p, int flags)
     case JS_CLASS_SYMBOL:
     case JS_CLASS_DATE:
     case JS_CLASS_BIG_INT:
-    case JS_CLASS_ERROR:
         snap_payload_ready(r); /* object_data is not a reference */
         return snap_get_value(r, &p->u.object_data);
+    case JS_CLASS_ERROR:
+        snap_payload_ready(r); /* the stack is not a reference */
+        return snap_get_value(r, &p->u.error.stack);
     case JS_CLASS_CALL_SITE:
         {
             JSCallSiteData *csd;
