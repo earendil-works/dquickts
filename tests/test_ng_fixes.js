@@ -401,6 +401,16 @@ function test_date_parse_spaces()
     }
 }
 
+/* bellard/quickjs#449: shortest round-trip string for powers of two */
+function test_issue_449()
+{
+    assert(String(7.120236347223045e-307), "7.120236347223045e-307");
+    assert(String(2 ** -1007), "7.291122019556398e-304");
+    assert(String(2 ** -957), "8.209073602596753e-289");
+    assert(String(2 ** -1074), "5e-324");
+    assert(String(2 ** 1023), "8.98846567431158e+307");
+}
+
 /* ng 6b3bed1: Array.isArray() walks a proxy chain of any depth */
 function test_proxy_is_array()
 {
@@ -609,6 +619,7 @@ test_template_tostring_order();
 test_syntax_error_column();
 test_date_parse_spaces();
 test_proxy_is_array();
+test_issue_449();
 test_issue_546();
 await test_issue_563();
 await test_for_await_close();
