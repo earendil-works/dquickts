@@ -226,16 +226,23 @@ fn expand_into_js_struct(
 ) -> Result<TokenStream> {
     match Fields::from_fields(struct_.fields)? {
         Fields::Named(fields) => {
+            let names = fields
+                .iter()
+                .map(|field| convert_field_name(field, config.rename_all));
             let writes = fields.iter().map(|field| {
                 let field_ident = field.ident.as_ref().unwrap();
-                let field_name = convert_field_name(field, config.rename_all);
-                quote!(value.set(#field_name, self.#field_ident)?;)
+                quote!(value.set(self.#field_ident)?;)
             });
 
+            let count = fields.len();
+
+            // the runtime creates the atoms of the names once, identified by their address
             Ok(quote! {
-                let value = #crate_name::Object::new(ctx.clone())?;
+                static NAMES: [&str; #count] = [#(#names),*];
+                #[allow(unused_mut)]
+                let mut value = #crate_name::object::StaticObjectBuilder::new(ctx, &NAMES)?;
                 #(#writes)*
-                Ok(value.into_value())
+                Ok(value.build()?.into_value())
             })
         }
         Fields::Unnamed(fields) => {

@@ -778,6 +778,18 @@ fn set_is_define(ctx: &Ctx<'_>, atom: qjs::JSAtom) -> bool {
     unsafe { qjs::JS_NewObjectSetIsDefine(ctx.as_ptr(), atom) != 0 }
 }
 
+/// Set the property `atom` of `object` to the owned `value`.
+///
+/// # Safety
+/// `atom` and `value` must belong to the runtime of `object`.
+unsafe fn set_raw(object: &Object<'_>, atom: qjs::JSAtom, value: qjs::JSValue) -> Result<()> {
+    let ctx = object.ctx();
+    if qjs::JS_SetProperty(ctx.as_ptr(), object.as_js_value(), atom, value) < 0 {
+        return Err(ctx.raise_exception());
+    }
+    Ok(())
+}
+
 /// Builder of a new object: the same as [`Object::new`] followed by [`Object::set`] of each
 /// property, faster.
 ///
@@ -872,9 +884,88 @@ impl Drop for ObjectBuilder<'_> {
     }
 }
 
+/// Builder of a new object with property names known at compile time, for the derived
+/// [`IntoJs`](crate::IntoJs): the same as [`ObjectBuilder`] setting them in order.
+///
+/// The runtime creates the atoms of the names once and keeps them, while the context keeps the
+/// shape of the last objects created with them alive.
+#[doc(hidden)]
+pub struct StaticObjectBuilder<'js> {
+    ctx: Ctx<'js>,
+    /// The atoms of the names, kept by the runtime.
+    keys: *const [qjs::JSAtom],
+    /// The number of properties set.
+    count: usize,
+    /// The owned values of the first properties, to create with the object.
+    values: PropBuf<qjs::JSValue>,
+    /// The object, once a property must be set on it.
+    object: Option<Object<'js>>,
+}
+
+impl<'js> StaticObjectBuilder<'js> {
+    /// Start building a new object whose properties will be `names` in order.
+    pub fn new(ctx: &Ctx<'js>, names: &'static [&'static str]) -> Result<Self> {
+        let keys = unsafe { ctx.get_opaque().static_atoms(ctx, names)? };
+        Ok(StaticObjectBuilder {
+            ctx: ctx.clone(),
+            keys,
+            count: 0,
+            values: PropBuf::new(),
+            object: None,
+        })
+    }
+
+    fn keys(&self) -> &[qjs::JSAtom] {
+        // SAFETY: the runtime keeps the atoms until it is dropped
+        unsafe { &*self.keys }
+    }
+
+    /// Set the next property, as [`Object::set`] would.
+    ///
+    /// # Panics
+    /// If all the names are already set.
+    pub fn set<V: IntoJs<'js>>(&mut self, value: V) -> Result<()> {
+        let atom = *self.keys().get(self.count).expect("a value for each name");
+        self.count += 1;
+        let value = value.into_js(&self.ctx)?;
+        if self.object.is_none() && set_is_define(&self.ctx, atom) {
+            self.values.push(value.into_js_value());
+            return Ok(());
+        }
+        let object = self.object()?;
+        unsafe { set_raw(object, atom, value.into_js_value()) }
+    }
+
+    /// The object, created with the kept properties on first call.
+    fn object(&mut self) -> Result<&Object<'js>> {
+        if self.object.is_none() {
+            let values = self.values.as_slice();
+            let atoms = &self.keys()[..values.len()];
+            let res = unsafe { new_object_from(&self.ctx, atoms, values) };
+            self.values.clear();
+            self.object = Some(res?);
+        }
+        Ok(self.object.as_ref().unwrap())
+    }
+
+    /// Get the object with all its properties.
+    pub fn build(mut self) -> Result<Object<'js>> {
+        self.object()?;
+        Ok(self.object.take().unwrap())
+    }
+}
+
+impl Drop for StaticObjectBuilder<'_> {
+    fn drop(&mut self) {
+        for &value in self.values.as_slice() {
+            unsafe { qjs::JS_FreeValue(self.ctx.as_ptr(), value) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::ObjectBuilder;
+    use super::{ObjectBuilder, StaticObjectBuilder};
     use crate::*;
 
     #[test]
@@ -1458,6 +1549,44 @@ mod test {
             let log: Vec<StdString> = ctx.eval("log").unwrap();
             assert_eq!(log, ["second"]);
         })
+    }
+
+    #[test]
+    fn static_builder() {
+        static NAMES: [&str; 4] = ["b", "1", "__proto__", "a"];
+        fn build(ctx: &Ctx<'_>) -> StdString {
+            let mut builder = StaticObjectBuilder::new(ctx, &NAMES).unwrap();
+            for i in 0..4 {
+                builder.set(i).unwrap();
+            }
+            let obj = builder.build().unwrap();
+            describe(ctx, &obj)
+        }
+        let rt = Runtime::new().unwrap();
+        let ctx1 = Context::full(&rt).unwrap();
+        let ctx2 = Context::full(&rt).unwrap();
+        for ctx in [&ctx1, &ctx2, &ctx1] {
+            ctx.with(|ctx| {
+                // '__proto__' sets the prototype to 2: ignored as it isn't an object
+                assert_eq!(build(&ctx), "1,b,a | true | {\"1\":1,\"b\":0,\"a\":3}");
+            });
+        }
+        ctx2.with(|ctx| {
+            ctx.eval::<(), _>(
+                "Object.defineProperty(Object.prototype, 'a', \
+                 { set(v) { globalThis.a_set = v }, configurable: true })",
+            )
+            .unwrap();
+            assert_eq!(build(&ctx), "1,b | true | {\"1\":1,\"b\":0}");
+            assert_eq!(ctx.globals().get::<_, i32>("a_set").unwrap(), 3);
+        });
+        // another runtime has its own atoms
+        let rt2 = Runtime::new().unwrap();
+        Context::full(&rt2).unwrap().with(|ctx| {
+            assert_eq!(build(&ctx), "1,b,a | true | {\"1\":1,\"b\":0,\"a\":3}");
+        });
+        drop((ctx1, ctx2));
+        drop(rt);
     }
 
     #[test]

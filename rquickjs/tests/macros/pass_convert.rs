@@ -11,6 +11,15 @@ struct RenamedFields {
 #[derive(Debug, PartialEq, Eq, FromJs, IntoJs)]
 struct Pair(u32, String);
 
+/// Set as by `Object::set`: `__proto__` sets the prototype (ignored for a number)
+#[derive(IntoJs)]
+struct WithProto {
+    a: u32,
+    #[qjs(rename = "__proto__")]
+    p: u32,
+    b: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Trace, JsLifetime)]
 #[rquickjs::class]
 struct JsClassShape {
@@ -55,6 +64,24 @@ pub fn main() {
                 label_text: "beta".into(),
             }
         );
+
+        for _ in 0..2 {
+            ctx.globals()
+                .set("withProto", WithProto { a: 1, p: 2, b: 3 })
+                .unwrap();
+            ctx.eval::<(), _>(
+                r#"
+                if (Object.keys(withProto).join() !== "a,b" || withProto.b !== 3) {
+                    throw new Error("withProto");
+                }
+                if (Object.getPrototypeOf(withProto) !== Object.prototype) {
+                    throw new Error("withProto prototype");
+                }
+            "#,
+            )
+            .catch(&ctx)
+            .unwrap();
+        }
 
         ctx.globals().set("pair", Pair(3, "gamma".into())).unwrap();
 

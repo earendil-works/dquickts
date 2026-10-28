@@ -1,6 +1,6 @@
 use crate::{
     class::{self, JsClass},
-    qjs, Ctx, Error, JsLifetime, Object, Value,
+    qjs, Atom, Ctx, Error, JsLifetime, Object, Value,
 };
 
 use super::{
@@ -10,7 +10,7 @@ use super::{
 };
 use super::{Decorators, Suspender};
 use crate::snapshot::{BuiltinRequest, SnapshotHost};
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::{
     any::{Any, TypeId},
@@ -70,6 +70,34 @@ impl Hasher for TypeIdHasher {
 
 type PrototypeMap<'js> = HashMap<TypeId, Option<Object<'js>>, BuildHasherDefault<TypeIdHasher>>;
 
+/// Hasher of the addresses of static data.
+#[derive(Default)]
+struct AddrHasher(u64);
+
+impl Hasher for AddrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        // spreads the address bits to the high bits used by the hash table
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+}
+
+/// The atoms of static property names, by the address and length of the names.
+type StaticAtomMap = HashMap<(usize, usize), Box<[qjs::JSAtom]>, BuildHasherDefault<AddrHasher>>;
+
 /// Opaque book keeping data for Rust.
 pub(crate) struct Opaque<'js> {
     /// Used to carry a panic if a callback triggered one.
@@ -104,6 +132,10 @@ pub(crate) struct Opaque<'js> {
     /// The prototypes of the Rust classes, by the [`TypeId`] of the class.
     prototypes: UnsafeCell<PrototypeMap<'js>>,
 
+    /// The atoms of the static property names of
+    /// [`StaticObjectBuilder`](crate::object::StaticObjectBuilder), freed with the runtime.
+    static_atoms: UnsafeCell<StaticAtomMap>,
+
     userdata: UserDataMap,
 
     #[cfg(feature = "futures")]
@@ -136,6 +168,8 @@ impl<'js> Opaque<'js> {
             decorators: Cell::new(Decorators::Standard),
 
             prototypes: UnsafeCell::new(PrototypeMap::default()),
+
+            static_atoms: UnsafeCell::new(StaticAtomMap::default()),
 
             userdata: UserDataMap::default(),
 
@@ -429,11 +463,49 @@ impl<'js> Opaque<'js> {
         }
     }
 
+    /// Returns the atoms of the static `names`, created on first use and kept until the runtime
+    /// is dropped.
+    ///
+    /// # Safety
+    /// The atoms must not be used after the runtime is dropped.
+    pub unsafe fn static_atoms(
+        &self,
+        ctx: &Ctx<'js>,
+        names: &'static [&'static str],
+    ) -> Result<*const [qjs::JSAtom], Error> {
+        // static data lives at its address for the whole program, which identifies the names
+        let key = (names.as_ptr() as usize, names.len());
+        if let Some(atoms) = (*self.static_atoms.get()).get(&key) {
+            return Ok(&**atoms as *const _);
+        }
+        let mut atoms = Vec::with_capacity(names.len());
+        for name in names {
+            match Atom::from_str(ctx.clone(), name) {
+                Ok(atom) => atoms.push(atom.into_atom_val()),
+                Err(error) => {
+                    for atom in atoms {
+                        qjs::JS_FreeAtom(ctx.as_ptr(), atom);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let atoms = (*self.static_atoms.get())
+            .entry(key)
+            .or_insert(atoms.into_boxed_slice());
+        Ok(&**atoms as *const _)
+    }
+
     /// Cleans up all the internal state.
     ///
-    /// Called before dropping the runtime to ensure that we drop everything before freeing the
-    /// runtime.
-    pub fn clear(&mut self) {
+    /// Called before dropping the runtime `rt` to ensure that we drop everything before freeing
+    /// the runtime.
+    pub fn clear(&mut self, rt: *mut qjs::JSRuntime) {
+        for (_, atoms) in self.static_atoms.get_mut().drain() {
+            for &atom in atoms.iter() {
+                unsafe { qjs::JS_FreeAtomRT(rt, atom) };
+            }
+        }
         self.rejection_tracker.get_mut().take();
         self.interrupt_handler.get_mut().take();
         self.panic.take();
