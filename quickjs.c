@@ -9385,6 +9385,9 @@ static JSValue JS_MakeError(JSContext *ctx, JSErrorEnum error_num,
     char buf[256], *msg;
     JSValue obj;
 
+    /* constant message: no printf */
+    if (!strchr(fmt, '%'))
+        return JS_MakeErrorLen(ctx, error_num, fmt, strlen(fmt), add_backtrace);
     msg = js_format_message(ctx->rt, buf, sizeof(buf), fmt, ap);
     obj = JS_MakeErrorLen(ctx, error_num, msg, strlen(msg), add_backtrace);
     if (msg != buf)
@@ -9512,20 +9515,53 @@ static int __attribute__((format(printf, 3, 4))) JS_ThrowTypeErrorOrFalse(JSCont
     }
 }
 
+/* Throw an error whose message is 'fmt' where its only conversion,
+   "%s", is replaced by 'str'. Same as JS_ThrowError() without
+   printf. */
+static JSValue JS_ThrowErrorStr(JSContext *ctx, JSErrorEnum error_num,
+                                const char *fmt, const char *str)
+{
+    char buf[256], *msg;
+    const char *p;
+    size_t len1, len2, len3, len;
+    JSValue ret;
+
+    p = strstr(fmt, "%s");
+    assert(p != NULL);
+    len1 = p - fmt;
+    assert(!memchr(fmt, '%', len1) && !strchr(p + 2, '%'));
+    len2 = strlen(str);
+    len3 = strlen(p + 2);
+    len = len1 + len2 + len3;
+    msg = buf;
+    if (unlikely(len > sizeof(buf))) {
+        msg = js_malloc_rt(ctx->rt, len);
+        if (!msg)
+            return JS_ThrowOutOfMemory(ctx);
+    }
+    memcpy(msg, fmt, len1);
+    memcpy(msg + len1, str, len2);
+    memcpy(msg + len1 + len2, p + 2, len3);
+    ret = JS_ThrowErrorLen(ctx, error_num, msg, len);
+    if (msg != buf)
+        js_free_rt(ctx->rt, msg);
+    return ret;
+}
+
 /* never use it directly */
 static JSValue __attribute__((format(printf, 3, 4))) __JS_ThrowTypeErrorAtom(JSContext *ctx, JSAtom atom, const char *fmt, ...)
 {
     char buf[ATOM_GET_STR_BUF_SIZE];
-    return JS_ThrowTypeError(ctx, fmt,
-                             JS_AtomGetStr(ctx, buf, sizeof(buf), atom));
+    return JS_ThrowErrorStr(ctx, JS_TYPE_ERROR, fmt,
+                            JS_AtomGetStr(ctx, buf, sizeof(buf), atom));
 }
 
 /* never use it directly */
 static JSValue __attribute__((format(printf, 3, 4))) __JS_ThrowSyntaxErrorAtom(JSContext *ctx, JSAtom atom, const char *fmt, ...)
 {
     char buf[ATOM_GET_STR_BUF_SIZE];
-    return JS_ThrowSyntaxError(ctx, fmt,
-                             JS_AtomGetStr(ctx, buf, sizeof(buf), atom));
+    return JS_ThrowErrorStr(ctx, JS_SYNTAX_ERROR, fmt,
+                            JS_AtomGetStr(ctx, buf, sizeof(buf), atom));
 }
 
 /* %s is replaced by 'atom'. The macro is used so that gcc can check
@@ -9609,7 +9645,7 @@ static JSValue JS_ThrowTypeErrorNotAConstructor(JSContext *ctx,
     fail:
         return JS_ThrowTypeError(ctx, "not a constructor");
     }
-    JS_ThrowTypeError(ctx, "%s is not a constructor", name);
+    JS_ThrowErrorStr(ctx, JS_TYPE_ERROR, "%s is not a constructor", name);
     JS_FreeCString(ctx, name);
     return JS_EXCEPTION;
 }
@@ -9622,16 +9658,16 @@ static JSValue JS_ThrowTypeErrorNotASymbol(JSContext *ctx)
 static JSValue JS_ThrowReferenceErrorNotDefined(JSContext *ctx, JSAtom name)
 {
     char buf[ATOM_GET_STR_BUF_SIZE];
-    return JS_ThrowReferenceError(ctx, "'%s' is not defined",
-                                  JS_AtomGetStr(ctx, buf, sizeof(buf), name));
+    return JS_ThrowErrorStr(ctx, JS_REFERENCE_ERROR, "'%s' is not defined",
+                            JS_AtomGetStr(ctx, buf, sizeof(buf), name));
 }
 
 static JSValue JS_ThrowReferenceErrorUninitialized(JSContext *ctx, JSAtom name)
 {
     char buf[ATOM_GET_STR_BUF_SIZE];
-    return JS_ThrowReferenceError(ctx, "%s is not initialized",
-                                  name == JS_ATOM_NULL ? "lexical variable" :
-                                  JS_AtomGetStr(ctx, buf, sizeof(buf), name));
+    return JS_ThrowErrorStr(ctx, JS_REFERENCE_ERROR, "%s is not initialized",
+                            name == JS_ATOM_NULL ? "lexical variable" :
+                            JS_AtomGetStr(ctx, buf, sizeof(buf), name));
 }
 
 static JSValue JS_ThrowReferenceErrorUninitialized2(JSContext *ctx,
