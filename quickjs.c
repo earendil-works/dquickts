@@ -2725,7 +2725,7 @@ int JS_ExecutePendingJobs(JSRuntime *rt, int max_jobs, JSContext **pctx)
     int n;
 
     if (max_jobs < 0)
-        max_jobs = INT_MAX;
+        max_jobs = INT32_MAX;
     for(n = 0; n < max_jobs && !list_empty(&rt->job_list); n++) {
         if (js_execute_first_job(rt, pctx) < 0)
             return -1;
