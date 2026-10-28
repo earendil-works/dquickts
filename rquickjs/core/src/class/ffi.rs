@@ -298,10 +298,9 @@ impl VTable {
     ) -> qjs::JSValue {
         let this_ptr = this_ptr.cast::<ClassCell<JsCell<C>>>();
         let params = Params::from_ffi_class(ctx, function, this, argc, argv, flags);
-        // An uncounted copy of the call's context, for handling a panic or throwing the error
-        // after `params` (which holds the counted reference) has been consumed: the engine keeps
-        // the context alive for the whole call, so no extra reference is needed.
-        let ctx = mem::ManuallyDrop::new(core::ptr::read(params.ctx()));
+        // An uncounted context for handling a panic or throwing the error after `params` has been
+        // consumed: the engine keeps the context alive for the whole call.
+        let ctx = Ctx::from_ptr_uncounted(ctx);
 
         ctx.handle_panic(AssertUnwindSafe(|| {
             C::call(&this_ptr.as_ref().data, params)

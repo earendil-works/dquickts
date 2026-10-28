@@ -130,6 +130,20 @@ impl<'js> Ctx<'js> {
         }
     }
 
+    /// An uncounted `Ctx` of `ctx`, for lending a context the engine keeps alive (e.g. during a
+    /// call from it) without the reference counting of [`Ctx::from_ptr`].
+    ///
+    /// # Safety
+    /// `ctx` must be a live context which outlives the returned value; the value must not be
+    /// dropped (cloning it is fine, the clones are counted).
+    #[inline]
+    pub(crate) unsafe fn from_ptr_uncounted(ctx: *mut qjs::JSContext) -> mem::ManuallyDrop<Self> {
+        mem::ManuallyDrop::new(Ctx {
+            ctx: NonNull::new_unchecked(ctx),
+            _marker: Invariant::new(),
+        })
+    }
+
     pub(crate) unsafe fn new(ctx: &'js Context) -> Self {
         unsafe { qjs::JS_DupContext(ctx.0.ctx().as_ptr()) };
         Ctx {

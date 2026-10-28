@@ -2,71 +2,77 @@ use crate::{
     function::{Exhaustive, Flat, FuncArg, Opt, Rest, This},
     qjs, Ctx, FromJs, Result, Value,
 };
-use alloc::{borrow::Cow, vec::Vec};
-use core::{mem::size_of, slice};
+use alloc::vec::Vec;
+use core::{marker::PhantomData, mem::ManuallyDrop};
 
 /// A struct which contains the values a callback is called with.
 ///
 /// Arguments retrieved from the JavaScript side for calling Rust functions.
 pub struct Params<'a, 'js> {
-    ctx: Ctx<'js>,
-    function: qjs::JSValue,
-    this: qjs::JSValue,
-    args: Cow<'a, [qjs::JSValue]>,
+    /// The context of the call, uncounted: the engine keeps it alive during the call, which
+    /// the params can't outlive (they are only lent to the callbacks for an unnamed `'a`).
+    ctx: ManuallyDrop<Ctx<'js>>,
+    function: qjs::JSValueConst,
+    this: qjs::JSValueConst,
+    /// The arguments, read with `read_unaligned`: QuickJS only guarantees four-byte alignment
+    /// of `argv` on 32-bit MSVC.
+    argv: *const qjs::JSValue,
+    argc: usize,
     is_constructor: bool,
+    /// The arguments and the values borrowed from the caller for the call, which outlives the
+    /// params (and the context).
+    _marker: PhantomData<&'a [Ctx<'js>]>,
 }
 
 impl<'a, 'js> Params<'a, 'js> {
     /// Create params from the arguments returned by the class callback.
+    ///
+    /// # Safety
+    /// The arguments must be the ones of a call of the context `ctx`, which keeps them and the
+    /// context alive for `'a`.
+    #[inline]
     pub(crate) unsafe fn from_ffi_class(
         ctx: *mut qjs::JSContext,
-        function: qjs::JSValue,
-        this: qjs::JSValue,
+        function: qjs::JSValueConst,
+        this: qjs::JSValueConst,
         argc: qjs::c_int,
-        argv: *mut qjs::JSValue,
+        argv: *const qjs::JSValue,
         flags: qjs::c_int,
     ) -> Self {
-        let args: Cow<'a, [qjs::JSValue]> = if argv.is_null() {
+        let argc = if argv.is_null() {
             assert_eq!(
                 argc, 0,
                 "got a null pointer from quickjs for a non-zero number of args"
             );
-            Cow::Borrowed(&[])
+            0
         } else {
-            let argc = usize::try_from(argc).expect("invalid argument number");
-            if argv.is_aligned() {
-                Cow::Borrowed(slice::from_raw_parts(argv, argc))
-            } else {
-                // QuickJS only guarantees four-byte alignment here on 32-bit MSVC.
-                let bytes = argv.cast::<u8>();
-                Cow::Owned(
-                    (0..argc)
-                        .map(|index| {
-                            bytes
-                                .add(index * size_of::<qjs::JSValue>())
-                                .cast::<qjs::JSValue>()
-                                .read_unaligned()
-                        })
-                        .collect(),
-                )
-            }
+            usize::try_from(argc).expect("invalid argument number")
         };
 
         let is_constructor = (flags & qjs::JS_CALL_FLAG_CONSTRUCTOR as qjs::c_int) != 0;
 
         Self {
-            ctx: Ctx::from_ptr(ctx),
+            ctx: Ctx::from_ptr_uncounted(ctx),
             function,
             this,
-            args,
+            argv,
+            argc,
             is_constructor,
+            _marker: PhantomData,
         }
+    }
+
+    /// The argument at `index`, which must be smaller than the number of arguments.
+    #[inline]
+    unsafe fn raw_arg(&self, index: usize) -> qjs::JSValueConst {
+        debug_assert!(index < self.argc);
+        self.argv.add(index).read_unaligned()
     }
 
     /// Checks if the parameters fit the param num requirements.
     #[inline]
     pub fn check_params(&self, num: ParamRequirement) -> Result<()> {
-        let given = self.args.len();
+        let given = self.argc;
         if given < num.min || (num.exhaustive && given > num.max) {
             return Err(Self::param_error(num, given));
         }
@@ -96,30 +102,33 @@ impl<'a, 'js> Params<'a, 'js> {
 
     /// Returns the value on which this function called. i.e. in `bla.foo()` the `foo` value.
     pub fn function(&self) -> Value<'js> {
-        unsafe { Value::from_js_value_const(self.ctx.clone(), self.function) }
+        unsafe { Value::from_js_value_const(self.ctx().clone(), self.function) }
     }
 
     /// Returns the this on which this function called. i.e. in `bla.foo()` the `bla` value.
     pub fn this(&self) -> Value<'js> {
-        unsafe { Value::from_js_value_const(self.ctx.clone(), self.this) }
+        unsafe { Value::from_js_value_const(self.ctx().clone(), self.this) }
     }
 
     /// Returns the argument at a given index..
     pub fn arg(&self, index: usize) -> Option<Value<'js>> {
-        self.args
-            .get(index)
-            .map(|arg| unsafe { Value::from_js_value_const(self.ctx.clone(), *arg) })
+        if index < self.argc {
+            let arg = unsafe { self.raw_arg(index) };
+            Some(unsafe { Value::from_js_value_const(self.ctx().clone(), arg) })
+        } else {
+            None
+        }
     }
 
     /// Returns the number of arguments.
     #[inline]
     pub fn len(&self) -> usize {
-        self.args.len()
+        self.argc
     }
 
     /// Returns if there are no arguments
     pub fn is_empty(&self) -> bool {
-        self.args.is_empty()
+        self.argc == 0
     }
 
     /// Returns if the function is called as a constructor.
@@ -162,6 +171,18 @@ impl<'a, 'js> ParamsAccessor<'a, 'js> {
         self.params.function()
     }
 
+    /// Returns the next argument, borrowed from the caller.
+    ///
+    /// # Panic
+    /// This function panics if it is called more times then there are arguments.
+    #[inline]
+    fn next_raw(&mut self) -> qjs::JSValueConst {
+        assert!(self.offset < self.params.argc, "arg called too many times");
+        let res = unsafe { self.params.raw_arg(self.offset) };
+        self.offset += 1;
+        res
+    }
+
     /// Returns the next arguments.
     ///
     /// Each call to this function returns a different argument
@@ -170,14 +191,8 @@ impl<'a, 'js> ParamsAccessor<'a, 'js> {
     /// This function panics if it is called more times then there are arguments.
     #[inline]
     pub fn arg(&mut self) -> Value<'js> {
-        assert!(
-            self.offset < self.params.args.len(),
-            "arg called too many times"
-        );
-        let res = self.params.args[self.offset];
-        self.offset += 1;
-        // TODO: figure out ownership
-        unsafe { Value::from_js_value_const(self.params.ctx.clone(), res) }
+        let res = self.next_raw();
+        unsafe { Value::from_js_value_const(self.params.ctx().clone(), res) }
     }
 
     /// Returns the next argument together with the context of the call.
@@ -190,13 +205,24 @@ impl<'a, 'js> ParamsAccessor<'a, 'js> {
     #[inline]
     pub fn ctx_and_arg(&mut self) -> (&Ctx<'js>, Value<'js>) {
         let arg = self.arg();
-        (&self.params.ctx, arg)
+        (self.params.ctx(), arg)
+    }
+
+    /// Converts the next argument with [`FromJs`].
+    ///
+    /// # Panic
+    /// This function panics if it is called more times then there are arguments.
+    #[inline]
+    pub fn arg_from_js<T: FromJs<'js>>(&mut self) -> Result<T> {
+        let arg = self.next_raw();
+        // SAFETY: an argument of the call, alive during it
+        unsafe { T::from_js_raw(self.params.ctx(), arg) }
     }
 
     /// returns the number of arguments remaining
     #[inline]
     pub fn len(&self) -> usize {
-        self.params.args.len() - self.offset
+        self.params.argc - self.offset
     }
     /// returns whether there are any arguments remaining.
     #[inline]
@@ -305,35 +331,39 @@ pub trait FromParam<'js>: Sized {
 }
 
 impl<'js, T: FromJs<'js>> FromParam<'js> for T {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::single()
     }
 
+    #[inline]
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
-        let (ctx, arg) = params.ctx_and_arg();
-        T::from_js(ctx, arg)
+        params.arg_from_js()
     }
 }
 
 impl<'js> FromParam<'js> for Ctx<'js> {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::none()
     }
 
+    #[inline]
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
         Ok(params.ctx().clone())
     }
 }
 
 impl<'js, T: FromJs<'js>> FromParam<'js> for Opt<T> {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::optional()
     }
 
+    #[inline]
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
         if !params.is_empty() {
-            let (ctx, arg) = params.ctx_and_arg();
-            Ok(Opt(Some(T::from_js(ctx, arg)?)))
+            Ok(Opt(Some(params.arg_from_js()?)))
         } else {
             Ok(Opt(None))
         }
@@ -341,26 +371,33 @@ impl<'js, T: FromJs<'js>> FromParam<'js> for Opt<T> {
 }
 
 impl<'js, T: FromJs<'js>> FromParam<'js> for This<T> {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::any()
     }
 
+    #[inline]
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
-        T::from_js(params.ctx(), params.this()).map(This)
+        // SAFETY: `this` is kept alive by the caller during the call
+        unsafe { T::from_js_raw(params.ctx(), params.params.this) }.map(This)
     }
 }
 
 impl<'js, T: FromJs<'js>> FromParam<'js> for FuncArg<T> {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::any()
     }
 
+    #[inline]
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
-        T::from_js(params.ctx(), params.function()).map(FuncArg)
+        // SAFETY: the function is kept alive by the caller during the call
+        unsafe { T::from_js_raw(params.ctx(), params.params.function) }.map(FuncArg)
     }
 }
 
 impl<'js, T: FromJs<'js>> FromParam<'js> for Rest<T> {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::any()
     }
@@ -368,28 +405,31 @@ impl<'js, T: FromJs<'js>> FromParam<'js> for Rest<T> {
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
         let mut res = Vec::with_capacity(params.len());
         for _ in 0..params.len() {
-            let (ctx, arg) = params.ctx_and_arg();
-            res.push(T::from_js(ctx, arg)?);
+            res.push(params.arg_from_js()?);
         }
         Ok(Rest(res))
     }
 }
 
 impl<'js, T: FromParams<'js>> FromParam<'js> for Flat<T> {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         T::param_requirements()
     }
 
+    #[inline]
     fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
         T::from_params(params).map(Flat)
     }
 }
 
 impl<'js> FromParam<'js> for Exhaustive {
+    #[inline]
     fn param_requirement() -> ParamRequirement {
         ParamRequirement::exhaustive()
     }
 
+    #[inline]
     fn from_param<'a>(_params: &mut ParamsAccessor<'a, 'js>) -> Result<Self> {
         Ok(Exhaustive)
     }
@@ -412,11 +452,13 @@ macro_rules! impl_from_params{
             $($t : FromParam<'js>,)*
         {
 
+            #[inline]
             fn param_requirements() -> ParamRequirement{
                 ParamRequirement::none()
                     $(.combine($t::param_requirement()))*
             }
 
+            #[inline]
             fn from_params<'a>(_args: &mut ParamsAccessor<'a,'js>) -> Result<Self>{
                 Ok((
                     $($t::from_param(_args)?,)*
@@ -476,8 +518,12 @@ mod tests {
                 )
             };
 
-            assert_eq!(unsafe { qjs::JS_VALUE_GET_INT(params.args[0]) }, 17);
-            assert_eq!(unsafe { qjs::JS_VALUE_GET_INT(params.args[1]) }, 42);
+            assert_eq!(params.len(), 2);
+            assert_eq!(params.arg(0).and_then(|v| v.as_int()), Some(17));
+            assert_eq!(params.arg(1).and_then(|v| v.as_int()), Some(42));
+            let mut params = params.access();
+            assert_eq!(params.arg_from_js::<i32>().unwrap(), 17);
+            assert_eq!(params.arg_from_js::<i32>().unwrap(), 42);
         });
     }
 
