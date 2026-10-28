@@ -2849,23 +2849,29 @@ static int handle_posted_message(JSRuntime *rt, JSContext *ctx,
 
         pthread_mutex_unlock(&ps->mutex);
 
+        /* 'port' is freed if the GC run by the allocations below
+           collects the Worker object, and 'func' might be destroyed
+           when calling itself (if it frees the handler), so must take
+           extra care */
+        func = JS_DupValue(ctx, port->on_message_func);
+
         data_obj = JS_ReadObject(ctx, msg->data, msg->data_len,
                                  JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE);
 
         js_free_message(msg);
 
-        if (JS_IsException(data_obj))
+        if (JS_IsException(data_obj)) {
+            JS_FreeValue(ctx, func);
             return -1;
+        }
         obj = JS_NewObject(ctx);
         if (JS_IsException(obj)) {
             JS_FreeValue(ctx, data_obj);
+            JS_FreeValue(ctx, func);
             return -1;
         }
         JS_DefinePropertyValueStr(ctx, obj, "data", data_obj, JS_PROP_C_W_E);
 
-        /* 'func' might be destroyed when calling itself (if it frees the
-           handler), so must take extra care */
-        func = JS_DupValue(ctx, port->on_message_func);
         retval = JS_Call(ctx, func, JS_UNDEFINED, 1, (JSValueConst *)&obj);
         JS_FreeValue(ctx, obj);
         JS_FreeValue(ctx, func);
@@ -4320,6 +4326,11 @@ static JSValue js_worker_ctor(JSContext *ctx, JSValueConst new_target,
        don't support creating workers inside workers */
     if (!is_main_thread(rt))
         return JS_ThrowTypeError(ctx, "cannot create a worker inside a worker");
+
+    /* the embedder must call js_std_set_worker_new_context_func() */
+    if (!js_worker_new_runtime_func || !js_worker_new_context_func)
+        return JS_ThrowTypeError(ctx, "worker context function not set");
+
 
     /* base name, assuming the calling function is a normal JS
        function */

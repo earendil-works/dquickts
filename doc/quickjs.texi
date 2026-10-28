@@ -1387,7 +1387,8 @@ for(;;) @{
 @item js_std_set_worker_new_runtime_func(func)
 @item js_std_set_worker_new_context_func(func)
 Set the functions creating the runtime (@code{JS_NewRuntime()} by
-default) and the context of the new workers.
+default) and the context of the new workers. Without context function,
+the @code{os.Worker} constructor throws a @code{TypeError}.
 @end table
 
 The module name normalizer set with @code{JS_SetModuleLoaderFunc()} or

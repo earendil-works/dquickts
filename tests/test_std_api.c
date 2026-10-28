@@ -299,10 +299,83 @@ static void test_worker_new_runtime(void)
     js_std_set_worker_new_runtime_func(JS_NewRuntime);
 }
 
+/* bellard/quickjs#538: without js_std_set_worker_new_context_func(),
+   the Worker constructor throws instead of calling a NULL function in
+   the worker thread */
+static void test_worker_no_context_func(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSValue val;
+
+    js_std_set_worker_new_context_func(NULL);
+    rt = JS_NewRuntime();
+    check(rt != NULL, "cannot create the runtime");
+    js_std_init_handlers(rt);
+    JS_SetModuleLoaderFunc2(rt, NULL, js_module_loader,
+                            js_module_check_attributes, NULL);
+    ctx = new_std_context(rt);
+    val = JS_Eval(ctx, worker_src, strlen(worker_src),
+                  "tests/test_std_api.js", JS_EVAL_TYPE_MODULE);
+    val = js_std_await(ctx, val);
+    check(JS_IsException(val), "worker created without a context function");
+    check_exception(ctx, "worker context function not set");
+
+    js_std_free_handlers(rt);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+/* "abort" makes the worker exit after its first messages */
+static const char worker_cycle_src[] =
+    "globalThis.n = 0;\n"
+    "globalThis.h = { w: new os.Worker('./test_worker_module.js') };\n"
+    "h.w.self_ref = h.w;\n"
+    "globalThis.wr = new WeakRef(h.w);\n"
+    "h.w.onmessage = (e) => { n++; };\n"
+    "h.w.postMessage({ type: 'abort' });\n"
+    "h.w = null;\n";
+
+/* bellard/quickjs#527: the GC run while the message event is built
+   collects the Worker object (only referenced by itself) and frees its
+   message handler */
+static void test_worker_gc_in_message(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSValue val;
+
+    js_std_set_worker_new_runtime_func(worker_new_runtime);
+    js_std_set_worker_new_context_func(worker_new_context);
+    rt = JS_NewRuntime();
+    check(rt != NULL, "cannot create the runtime");
+    js_std_init_handlers(rt);
+    JS_SetModuleLoaderFunc2(rt, NULL, js_module_loader,
+                            js_module_check_attributes, NULL);
+    ctx = new_std_context(rt);
+    val = JS_Eval(ctx, worker_cycle_src, strlen(worker_cycle_src),
+                  "tests/test_std_api.js", JS_EVAL_TYPE_GLOBAL);
+    check(!JS_IsException(val), "gc_in_message: cannot create the worker");
+    JS_FreeValue(ctx, val);
+    /* the next object allocation runs the GC */
+    JS_SetGCThreshold(rt, 0);
+    check(js_std_poll_io(ctx, 10000) == 0, "gc_in_message: poll");
+    check(eval_int(ctx, "n") == 1, "gc_in_message: message not handled");
+    check(eval_int(ctx, "+(wr.deref() === undefined)") == 1,
+          "gc_in_message: worker not collected");
+
+    js_std_free_handlers(rt);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    js_std_set_worker_new_runtime_func(JS_NewRuntime);
+}
+
 int main(int argc, char **argv)
 {
     test_eval_script_interrupt();
     test_loop_once();
     test_worker_new_runtime();
+    test_worker_no_context_func();
+    test_worker_gc_in_message();
     return 0;
 }
