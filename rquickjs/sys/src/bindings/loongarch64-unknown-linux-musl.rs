@@ -195,6 +195,7 @@ pub const JS_DUMP_MODULE_EXEC: u32 = 2097152;
 pub const JS_DUMP_CLOSURE: u32 = 4194304;
 pub const JS_DUMP_ROPE_REBALANCE: u32 = 8388608;
 pub const JS_ATOM_NULL: u32 = 0;
+pub const JS_ATOM_DATA_BUF_SIZE: u32 = 16;
 pub const JS_CALL_FLAG_CONSTRUCTOR: u32 = 1;
 pub const JS_INVALID_CLASS_ID: u32 = 0;
 pub const JS_HINT_STRING: u32 = 0;
@@ -811,6 +812,15 @@ unsafe extern "C" {
         plen: *mut size_t,
         atom: JSAtom,
     ) -> *const ::core::ffi::c_char;
+}
+unsafe extern "C" {
+    pub fn JS_AtomGetStringData(
+        ctx: *mut JSContext,
+        atom: JSAtom,
+        plen: *mut size_t,
+        pwide: *mut ::core::ffi::c_int,
+        buf: *mut ::core::ffi::c_char,
+    ) -> *const ::core::ffi::c_void;
 }
 unsafe extern "C" {
     pub fn JS_ValueToAtom(ctx: *mut JSContext, val: JSValue) -> JSAtom;

@@ -4472,6 +4472,28 @@ static BOOL JS_AtomSymbolHasDescription(JSContext *ctx, JSAtom v)
             !(p->len == 0 && p->is_wide_char != 0));
 }
 
+const void *JS_AtomGetStringData(JSContext *ctx, JSAtom atom, size_t *plen,
+                                 JS_BOOL *pwide, char *buf)
+{
+    JSAtomStruct *p;
+
+    if (__JS_AtomIsTaggedInt(atom)) {
+        *plen = u32toa(buf, __JS_AtomToUInt32(atom));
+        *pwide = FALSE;
+        return buf;
+    }
+    assert(atom < ctx->rt->atom_size);
+    /* as __JS_AtomToValue(): a symbol without description has an
+       empty string */
+    p = ctx->rt->atom_array[atom];
+    *plen = p->len;
+    *pwide = p->is_wide_char;
+    if (p->is_wide_char)
+        return p->u.str16;
+    else
+        return p->u.str8;
+}
+
 /* free with JS_FreeCString() */
 const char *JS_AtomToCStringLen(JSContext *ctx, size_t *plen, JSAtom atom)
 {

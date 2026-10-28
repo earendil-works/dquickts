@@ -241,6 +241,49 @@ static void test_object_from(void)
     JS_FreeRuntime(rt);
 }
 
+/* check JS_AtomGetStringData() of the atom of 'val' against 'latin1'
+   (Latin-1) or 'utf16' */
+static void check_atom_data(JSContext *ctx, JSValue val, const char *latin1,
+                            const uint16_t *utf16, size_t len)
+{
+    char buf[JS_ATOM_DATA_BUF_SIZE];
+    const void *data;
+    JSAtom atom;
+    size_t len1;
+    JS_BOOL wide;
+
+    atom = JS_ValueToAtom(ctx, val);
+    JS_FreeValue(ctx, val);
+    CHECK(atom != JS_ATOM_NULL);
+    data = JS_AtomGetStringData(ctx, atom, &len1, &wide, buf);
+    CHECK(data != NULL && len1 == len);
+    /* an empty string has any width */
+    if (utf16)
+        CHECK(wide && memcmp(data, utf16, len * 2) == 0);
+    else
+        CHECK((!wide || len == 0) && memcmp(data, latin1, len) == 0);
+    JS_FreeAtom(ctx, atom);
+}
+
+static void test_atom_string_data(JSContext *ctx)
+{
+    static const uint16_t euro[] = { 'a', 0x20ac };
+
+    check_atom_data(ctx, JS_NewString(ctx, "abc"), "abc", NULL, 3);
+    check_atom_data(ctx, JS_NewString(ctx, ""), "", NULL, 0);
+    check_atom_data(ctx, JS_NewString(ctx, "\xc3\xa9t\xc3\xa9"), "\xe9t\xe9", NULL, 3);
+    check_atom_data(ctx, JS_NewString(ctx, "a\xe2\x82\xac"), NULL, euro, 2);
+    /* integer atoms */
+    check_atom_data(ctx, JS_NewInt32(ctx, 0), "0", NULL, 1);
+    check_atom_data(ctx, JS_NewInt32(ctx, 123), "123", NULL, 3);
+    check_atom_data(ctx, JS_NewInt32(ctx, 2147483647), "2147483647", NULL, 10);
+    check_atom_data(ctx, JS_NewString(ctx, "4294967294"), "4294967294", NULL, 10);
+    /* symbols: their description */
+    check_atom_data(ctx, eval_str(ctx, "Symbol('desc')"), "desc", NULL, 4);
+    check_atom_data(ctx, eval_str(ctx, "Symbol()"), "", NULL, 0);
+    check_atom_data(ctx, eval_str(ctx, "Symbol.iterator"), "Symbol.iterator", NULL, 15);
+}
+
 static void test_numbers(JSContext *ctx)
 {
     JSValue v;
@@ -3124,6 +3167,7 @@ int main(void)
     test_function_list_flags(ctx);
     test_promises(ctx);
     test_own_property_count(ctx);
+    test_atom_string_data(ctx);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 

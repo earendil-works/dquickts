@@ -620,6 +620,15 @@ static inline const char *JS_AtomToCString(JSContext *ctx, JSAtom atom)
 {
     return JS_AtomToCStringLen(ctx, NULL, atom);
 }
+/* size of the 'buf' argument of JS_AtomGetStringData() */
+#define JS_ATOM_DATA_BUF_SIZE 16
+/* Borrowed view of JS_AtomToString(ctx, atom) as JS_GetStringData()
+   returns it, without allocation: the decimal digits of an integer
+   atom are written to 'buf' (JS_ATOM_DATA_BUF_SIZE bytes) and
+   returned, the contents of other atoms (the description of a symbol)
+   remain valid while the atom is alive. */
+const void *JS_AtomGetStringData(JSContext *ctx, JSAtom atom, size_t *plen,
+                                 JS_BOOL *pwide, char *buf);
 JSAtom JS_ValueToAtom(JSContext *ctx, JSValueConst val);
 
 /* object class support */
