@@ -44,26 +44,57 @@ impl<'js> Array<'js> {
     }
 
     /// Get the value at an index in the JavaScript array.
+    #[inline]
     pub fn get<V: FromJs<'js>>(&self, idx: usize) -> Result<V> {
+        let val = self.get_value(idx)?;
+        V::from_js(self.ctx(), val)
+    }
+
+    /// Read the element at `idx`, borrowed from the fast array storage when it is there.
+    #[inline]
+    fn get_value(&self, idx: usize) -> Result<Value<'js>> {
         let ctx = self.ctx();
         let obj = self.0.as_js_value();
-        let val = unsafe {
-            let mut values: *mut qjs::JSValue = ptr::null_mut();
-            let mut count: u32 = 0;
-            // Elements stored in a fast array are own data properties: reading them
-            // directly is what JS_GetPropertyUint32() would do. The pointer is used
-            // before any JS code can run.
-            if qjs::JS_GetFastArray(ctx.as_ptr(), obj, &mut values, &mut count) != 0
-                && idx < count as usize
-            {
-                Value::from_js_value_const(ctx.clone(), *values.add(idx))
-            } else {
-                let val = qjs::JS_GetPropertyUint32(ctx.as_ptr(), obj, idx as _);
-                let val = ctx.handle_exception(val)?;
-                Value::from_js_value(ctx.clone(), val)
+        unsafe {
+            match fast_elements(ctx, obj) {
+                // Elements stored in a fast array are own data properties: reading them
+                // directly is what JS_GetPropertyUint32() would do. The pointer is used
+                // before any JS code can run.
+                Some((values, count)) if idx < count => {
+                    Ok(Value::from_js_value_const(ctx.clone(), *values.add(idx)))
+                }
+                _ => {
+                    let val = qjs::JS_GetPropertyUint32(ctx.as_ptr(), obj, idx as _);
+                    let val = ctx.handle_exception(val)?;
+                    Ok(Value::from_js_value(ctx.clone(), val))
+                }
             }
-        };
-        V::from_js(ctx, val)
+        }
+    }
+
+    /// Convert the elements `0..len()` in order, `len()` being read once at the start.
+    ///
+    /// Like [`Array::iter`], each element is read right before it is converted: a conversion
+    /// changing the array is seen by the following elements.
+    pub(crate) fn collect_vec<T: FromJs<'js>>(&self) -> Result<Vec<T>> {
+        let len = self.len();
+        // The stored elements bound the capacity: a long length with holes doesn't inflate it.
+        let stored = unsafe { fast_elements(self.ctx(), self.0.as_js_value()) };
+        let mut vec = Vec::with_capacity(stored.map_or(0, |(_, count)| count).min(len));
+        for idx in 0..len {
+            vec.push(self.get(idx)?);
+        }
+        Ok(vec)
+    }
+
+    /// Like `Array::from_value`, with a quick accept of fast arrays (which are arrays).
+    #[inline]
+    pub(crate) fn from_list_value(value: Value<'js>) -> Result<Self> {
+        if unsafe { fast_elements(&value.ctx, value.value) }.is_some() {
+            Ok(Array(Object(value)))
+        } else {
+            Self::from_value(value)
+        }
     }
 
     /// Set the value at an index in the JavaScript array.
@@ -106,6 +137,23 @@ impl<'js> Array<'js> {
 
     pub fn as_object(&self) -> &Object<'js> {
         &self.0
+    }
+}
+
+/// The elements and the element count of `obj` when it is a fast array.
+///
+/// The elements are only valid until JS code runs or the array is changed.
+#[inline]
+unsafe fn fast_elements(
+    ctx: &Ctx<'_>,
+    obj: qjs::JSValueConst,
+) -> Option<(*const qjs::JSValue, usize)> {
+    let mut values: *mut qjs::JSValue = ptr::null_mut();
+    let mut count: u32 = 0;
+    if qjs::JS_GetFastArray(ctx.as_ptr(), obj, &mut values, &mut count) != 0 {
+        Some((values as *const qjs::JSValue, count as usize))
+    } else {
+        None
     }
 }
 
@@ -396,6 +444,38 @@ mod test {
             array.set(5, 6).unwrap();
             assert_eq!(iter.next().unwrap().unwrap(), 3);
             assert!(iter.next().is_none());
+        })
+    }
+
+    #[test]
+    fn from_js_collections() {
+        use alloc::collections::{BTreeSet, LinkedList, VecDeque};
+        use hashbrown::HashSet;
+        test_with(|ctx| {
+            let fast = "[3, 1, 2, 3]";
+            // set past the end and then filled: not a fast array
+            let slow = "(() => { const s = [3, 1]; s[3] = 3; s[2] = 2; return s })()";
+            for src in [fast, slow] {
+                let val: Vec<i32> = ctx.eval(src).unwrap();
+                assert_eq!(val, [3, 1, 2, 3]);
+                let val: VecDeque<i32> = ctx.eval(src).unwrap();
+                assert_eq!(val, [3, 1, 2, 3]);
+                let val: LinkedList<i32> = ctx.eval(src).unwrap();
+                assert!(val.into_iter().eq([3, 1, 2, 3]));
+                let val: BTreeSet<i32> = ctx.eval(src).unwrap();
+                assert!(val.into_iter().eq([1, 2, 3]));
+                let val: HashSet<i32> = ctx.eval(src).unwrap();
+                assert!(val.len() == 3 && (1..=3).all(|i| val.contains(&i)));
+                let val: List<(i32, i32, i32, i32)> = ctx.eval(src).unwrap();
+                assert_eq!(val.0, (3, 1, 2, 3));
+                let val: Vec<Value> = ctx.eval(src).unwrap();
+                assert_eq!(val.len(), 4);
+                assert_eq!(val[3].as_int(), Some(3));
+            }
+            assert!(ctx.eval::<BTreeSet<i32>, _>("[1, 'x']").is_err());
+            // the capacity comes from the stored elements, not from the length
+            let src = "(() => { const h = [1]; h.length = 2 ** 31 - 1; return h })()";
+            assert!(ctx.eval::<Vec<i32>, _>(src).is_err());
         })
     }
 

@@ -236,7 +236,7 @@ macro_rules! from_js_impls {
                 $($type: FromJs<'js>,)*
             {
                 fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-                    let array = Array::from_value(value)?;
+                    let array = Array::from_list_value(value)?;
 
                     let tuple_len = 0 $(+ from_js_impls!(@one $type))*;
                     let array_len = array.len();
@@ -260,8 +260,9 @@ macro_rules! from_js_impls {
                 $($param: $($pguard)*,)*
             {
                 fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-                    let array = Array::from_value(value)?;
-                    array.iter().collect::<Result<_>>()
+                    // A vector is collected in place, the other types as from any iterator.
+                    let elements = Array::from_list_value(value)?.collect_vec::<T>()?;
+                    Ok(elements.into_iter().collect())
                 }
             }
         )*
@@ -279,7 +280,14 @@ macro_rules! from_js_impls {
             {
                 fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
                     let object = Object::from_value(value)?;
-                    object.props().collect::<Result<_>>()
+                    // Collecting the `Result`s would lose the exact length: the entries go to a
+                    // vector first, which the `BTreeMap`s sort when built from an iterator anyway.
+                    let props = object.props::<K, V>();
+                    let mut entries = Vec::with_capacity(props.len());
+                    for entry in props {
+                        entries.push(entry?);
+                    }
+                    Ok(entries.into_iter().collect())
                 }
             }
         )*
@@ -518,6 +526,32 @@ chrono_from_js_impls! {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn js_to_maps() {
+        use crate::{test_with, Error, StdString};
+        use alloc::collections::BTreeMap;
+        use hashbrown::HashMap;
+
+        test_with(|ctx| {
+            let src = "({ b: 2, a: 1, 0: 0 })";
+            let map: BTreeMap<StdString, i32> = ctx.eval(src).unwrap();
+            let expected = [("0", 0), ("a", 1), ("b", 2)].map(|(k, v)| (StdString::from(k), v));
+            assert_eq!(map, BTreeMap::from(expected));
+            let map: HashMap<StdString, i32> = ctx.eval(src).unwrap();
+            assert_eq!(map.len(), 3);
+            assert_eq!((map["0"], map["a"], map["b"]), (0, 1, 2));
+            let map: BTreeMap<StdString, i32> = ctx.eval("({})").unwrap();
+            assert!(map.is_empty());
+
+            let src = "({ a: 1, get b() { throw 'getter' } })";
+            let err = ctx.eval::<BTreeMap<StdString, i32>, _>(src).unwrap_err();
+            assert!(matches!(err, Error::Exception));
+            assert_eq!(ctx.catch().get::<StdString>().unwrap(), "getter");
+            assert!(ctx.eval::<HashMap<StdString, i32>, _>("({ a: 'x' })").is_err());
+            assert!(ctx.eval::<HashMap<StdString, i32>, _>("1").is_err());
+        })
+    }
+
     #[test]
     fn js_to_system_time() {
         use crate::{Context, Runtime};
