@@ -101,6 +101,23 @@ impl<'js> Object<'js> {
 
     /// Set a member of an object to a certain value
     pub fn set<K: IntoAtom<'js>, V: IntoJs<'js>>(&self, key: K, value: V) -> Result<()> {
+        if let Some(name) = key.as_key_str() {
+            // the atom is looked up (or created) and released by the call
+            let val = value.into_js(self.ctx())?;
+            unsafe {
+                if qjs::JS_SetPropertyStrLen(
+                    self.0.ctx.as_ptr(),
+                    self.0.as_js_value(),
+                    name.as_ptr().cast(),
+                    name.len() as _,
+                    val.into_js_value(),
+                ) < 0
+                {
+                    return Err(self.0.ctx.raise_exception());
+                }
+            }
+            return Ok(());
+        }
         let atom = key.into_atom(self.ctx())?;
         let val = value.into_js(self.ctx())?;
         unsafe {
@@ -1620,6 +1637,36 @@ mod test {
                 .nth(4)
                 .unwrap();
             assert!(matches!(err, Err(Error::Utf8(_))));
+        })
+    }
+
+    #[test]
+    fn set_by_name() {
+        test_with(|ctx| {
+            let obj: Object = ctx
+                .eval(
+                    r#"
+                    var log = [];
+                    var proto = { set s(v) { log.push(v) } };
+                    Object.defineProperty(proto, 'ro', { value: 0 });
+                    Object.create(proto)
+                "#,
+                )
+                .unwrap();
+            obj.set("héllo", 1).unwrap();
+            obj.set(StdString::from("12"), 2).unwrap();
+            obj.set(&StdString::from("a\0b"), 3).unwrap();
+            obj.set("s", 4).unwrap();
+            assert!(matches!(obj.set("ro", 5), Err(Error::Exception)));
+            drop(ctx.catch());
+            let keys = obj.keys().collect::<Result<Vec<StdString>>>().unwrap();
+            assert_eq!(keys, ["12", "héllo", "a\0b"]);
+            assert_eq!(obj.get::<_, i32>("a\0b").unwrap(), 3);
+            let log: Vec<i32> = ctx.eval("log").unwrap();
+            assert_eq!(log, [4]);
+            let proto = Object::new(ctx.clone()).unwrap();
+            obj.set("__proto__", proto.clone()).unwrap();
+            assert_eq!(obj.get_prototype(), Some(proto));
         })
     }
 
