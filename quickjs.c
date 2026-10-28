@@ -37914,6 +37914,12 @@ JSValue JS_GetModulePrivateValue(JSContext *ctx, JSModuleDef *m)
     return JS_DupValue(ctx, m->private_value);
 }
 
+int JS_SetModuleAttributes(JSContext *ctx, JSModuleDef *m, JSValue attributes)
+{
+    set_value(ctx, &m->attributes, attributes);
+    return 0;
+}
+
 void JS_SetModuleLoaderFunc(JSRuntime *rt,
                             JSModuleNormalizeFunc *module_normalize,
                             JSModuleLoaderFunc *module_loader, void *opaque)

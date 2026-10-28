@@ -252,7 +252,7 @@ PROGS+=examples/hello examples/test_fib
 ifndef CONFIG_M32
 ifndef CONFIG_WIN32
 PROGS+=examples/hello_module
-QJSC_TESTS=tests/test_qjsc_unused
+QJSC_TESTS=tests/test_qjsc_unused tests/test_qjsc_modules
 endif
 endif
 ifdef CONFIG_SHARED_LIBS
@@ -396,7 +396,7 @@ clean:
 	rm -f *.a *.o *.d *~ unicode_gen regexp_test fuzz_eval fuzz_compile fuzz_regexp $(PROGS)
 	rm -f hello.c test_fib.c
 	rm -f examples/*.so tests/*.so tests/test_std_api$(EXE) tests/test_api$(EXE)
-	rm -f tests/test_qjsc_unused
+	rm -f tests/test_qjsc_unused tests/test_qjsc_modules tests/test_qjsc_modules.c
 	rm -rf $(OBJDIR)/ *.dSYM/ qjs-debug$(EXE)
 	rm -rf run-test262-debug$(EXE)
 	rm -f run_octane run_sunspider_like
@@ -509,6 +509,7 @@ ifdef CONFIG_SHARED_LIBS
 endif
 ifdef QJSC_TESTS
 	./tests/test_qjsc_unused
+	./tests/test_qjsc_modules
 endif
 ifdef CONFIG_TEMPORAL_INTL
 	$(WINE) ./qjs$(EXE) --experimental tests/test_intl.js
@@ -516,6 +517,15 @@ endif
 
 tests/test_qjsc_unused: $(QJSC) libquickjs$(LTOEXT).a tests/test_qjsc_unused.js
 	$(QJSC) -fno-unused -o $@ tests/test_qjsc_unused.js
+
+tests/test_qjsc_modules.c: $(QJSC) tests/test_qjsc_modules.js \
+    tests/fixture_bytes_module.txt tests/fixture_import_attributes.json
+	$(QJSC) -e -fno-unused -fno-module-loader -M examples/fib.so,fib -m -o $@ tests/test_qjsc_modules.js
+
+$(OBJDIR)/tests/test_qjsc_modules.o: CFLAGS+=-I.
+
+tests/test_qjsc_modules: $(OBJDIR)/tests/test_qjsc_modules.o $(OBJDIR)/examples/fib.o libquickjs$(LTOEXT).a
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 # suspension and heap snapshots (see tests/snapshot/Makefile)
 test-snapshot:

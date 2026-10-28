@@ -261,9 +261,11 @@ typedef enum {
     CNAME_TYPE_JSON_MODULE,
 } CNameTypeEnum;
 
+/* 'module_type': 'type' import attribute of a JSON module (NULL if none) */
 static void output_object_code(JSContext *ctx,
                                FILE *fo, JSValueConst obj, const char *c_name,
-                               CNameTypeEnum c_name_type)
+                               CNameTypeEnum c_name_type,
+                               const char *module_type)
 {
     uint8_t *out_buf;
     size_t out_buf_len;
@@ -286,7 +288,7 @@ static void output_object_code(JSContext *ctx,
         exit(1);
     }
 
-    namelist_add(&cname_list, c_name, NULL, c_name_type);
+    namelist_add(&cname_list, c_name, module_type, c_name_type);
 
     fprintf(fo, "const uint32_t %s_size = %u;\n\n",
             c_name, (unsigned int)out_buf_len);
@@ -353,22 +355,25 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
         dynamic_export = TRUE;
         mark_all_used();
     } else {
+        static const char * const module_type_names[] = {
+            [JS_MODULE_TYPE_JSON] = "json",
+            [JS_MODULE_TYPE_JSON5] = "json5",
+            [JS_MODULE_TYPE_TEXT] = "text",
+            [JS_MODULE_TYPE_BYTES] = "bytes",
+        };
         size_t buf_len;
         uint8_t *buf;
         char cname[1024];
-        int type;
+        int type, attr_type;
 
-        type = js_module_get_type(ctx, attributes);
-        if (type < 0)
+        attr_type = js_module_get_type(ctx, attributes);
+        if (attr_type < 0)
             return NULL;
+        type = attr_type;
         if (type == JS_MODULE_TYPE_JS && has_suffix(module_name, ".json"))
             type = JS_MODULE_TYPE_JSON;
         if (type == JS_MODULE_TYPE_BYTES)
             mark_used_name("Uint8Array");
-        /* the module output below has no attributes, so an import with
-           attributes does not find it and loads the file at run time */
-        if (!JS_IsUndefined(attributes))
-            used_feature_bitmap |= (uint64_t)1 << FE_MODULE_LOADER;
         buf = js_load_file(ctx, &buf_len, module_name);
         if (!buf) {
             JS_ThrowReferenceError(ctx, "could not load module filename '%s'",
@@ -402,7 +407,10 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
             dump_hex(outfile, (const uint8_t *)module_name, strlen(module_name) + 1);
             fprintf(outfile, "};\n\n");
 
-            output_object_code(ctx, outfile, val, cname, CNAME_TYPE_JSON_MODULE);
+            /* the 'type' attribute is given to the embedded module so
+               that the imports with this attribute find it */
+            output_object_code(ctx, outfile, val, cname, CNAME_TYPE_JSON_MODULE,
+                               module_type_names[attr_type]);
             JS_FreeValue(ctx, val);
         } else {
             JSValue func_val;
@@ -424,7 +432,8 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
             if (namelist_find(&cname_list, cname)) {
                 find_unique_cname(cname, sizeof(cname));
             }
-            output_object_code(ctx, outfile, func_val, cname, CNAME_TYPE_MODULE);
+            output_object_code(ctx, outfile, func_val, cname, CNAME_TYPE_MODULE,
+                               NULL);
             
             /* the module is already referenced, so we must free it */
             m = JS_VALUE_GET_PTR(func_val);
@@ -480,7 +489,7 @@ static void compile_file(JSContext *ctx, FILE *fo,
             find_unique_cname(c_name, sizeof(c_name));
         }
     }
-    output_object_code(ctx, fo, obj, c_name, CNAME_TYPE_SCRIPT);
+    output_object_code(ctx, fo, obj, c_name, CNAME_TYPE_SCRIPT, NULL);
     JS_FreeValue(ctx, obj);
 }
 
@@ -980,8 +989,12 @@ int main(int argc, char **argv)
                 fprintf(fo, "  js_std_eval_binary(ctx, %s, %s_size, 1);\n",
                         e->name, e->name);
             } else if (e->flags == CNAME_TYPE_JSON_MODULE) {
-                fprintf(fo, "  js_std_eval_binary_json_module(ctx, %s, %s_size, (const char *)%s_module_name);\n",
+                fprintf(fo, "  js_std_eval_binary_json_module(ctx, %s, %s_size, (const char *)%s_module_name, ",
                         e->name, e->name, e->name);
+                if (e->short_name)
+                    fprintf(fo, "\"%s\");\n", e->short_name);
+                else
+                    fprintf(fo, "NULL);\n");
             }
         }
         fprintf(fo,

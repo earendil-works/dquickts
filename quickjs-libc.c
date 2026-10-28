@@ -5120,19 +5120,33 @@ void js_std_eval_binary(JSContext *ctx, const uint8_t *buf, size_t buf_len,
 
 void js_std_eval_binary_json_module(JSContext *ctx,
                                     const uint8_t *buf, size_t buf_len,
-                                    const char *module_name)
+                                    const char *module_name,
+                                    const char *type)
 {
-    JSValue obj;
+    JSValue obj, attributes;
     JSModuleDef *m;
     
     obj = JS_ReadObject(ctx, buf, buf_len, 0);
     if (JS_IsException(obj))
         goto exception;
     m = create_value_module(ctx, module_name, obj);
-    if (!m) {
-    exception:
-        js_std_dump_error(ctx);
-        exit(1);
+    if (!m)
+        goto exception;
+    if (type) {
+        attributes = JS_NewObjectProto(ctx, JS_NULL);
+        if (JS_IsException(attributes))
+            goto exception;
+        if (JS_DefinePropertyValueStr(ctx, attributes, "type",
+                                      JS_NewString(ctx, type),
+                                      JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, attributes);
+            goto exception;
+        }
+        JS_SetModuleAttributes(ctx, m, attributes);
     }
+    return;
+ exception:
+    js_std_dump_error(ctx);
+    exit(1);
 }
 

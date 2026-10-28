@@ -1762,6 +1762,11 @@ int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
 /* associate a JSValue to a C module */
 int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val);
 JSValue JS_GetModulePrivateValue(JSContext *ctx, JSModuleDef *m);
+/* set the import attributes (object or undefined) of a module created
+   before being imported (e.g. a JSON module embedded by qjsc): the
+   imports find a loaded module by name and attributes. 'attributes' is
+   freed by the function. */
+int JS_SetModuleAttributes(JSContext *ctx, JSModuleDef *m, JSValue attributes);
                         
 /* locale specific callbacks to override the default functions */
 typedef struct JSLocaleCallbacks {
