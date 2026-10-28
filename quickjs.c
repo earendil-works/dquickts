@@ -3756,9 +3756,21 @@ static JSAtom __JS_NewAtomInit(JSRuntime *rt, const char *str, int len,
     return __JS_NewAtom(rt, p, atom_type);
 }
 
+/* compare a wide string with an ASCII string of the same length */
+static BOOL js_string16_eq_ascii(const JSString *p, const char *str, size_t len)
+{
+    size_t i;
+
+    for(i = 0; i < len; i++) {
+        if (p->u.str16[i] != (uint8_t)str[i])
+            return FALSE;
+    }
+    return TRUE;
+}
+
 /* Warning: str must be ASCII only */
-static JSAtom __JS_FindAtom(JSRuntime *rt, const char *str, size_t len,
-                            int atom_type)
+static force_inline JSAtom __JS_FindAtom(JSRuntime *rt, const char *str,
+                                         size_t len, int atom_type)
 {
     uint32_t h, h1, i;
     JSAtomStruct *p;
@@ -3772,8 +3784,9 @@ static JSAtom __JS_FindAtom(JSRuntime *rt, const char *str, size_t len,
         if (p->hash == h &&
             p->atom_type == JS_ATOM_TYPE_STRING &&
             p->len == len &&
-            p->is_wide_char == 0 &&
-            memcmp(p->u.str8, str, len) == 0) {
+            (likely(!p->is_wide_char) ?
+             memcmp(p->u.str8, str, len) == 0 :
+             js_string16_eq_ascii(p, str, len))) {
             if (!__JS_AtomIsConst(i))
                 js_rc(p)->ref_count++;
             return i;
@@ -3871,22 +3884,148 @@ static size_t count_ascii(const uint8_t *buf, size_t len)
     return p - buf;
 }
 
-/* str is UTF-8 encoded */
-JSAtom JS_NewAtomLen(JSContext *ctx, const char *str, size_t len)
+/* Decode the next code point of the UTF-8 buffer [*pp, p_end) exactly
+   like JS_NewStringLen() does (an invalid sequence gives U+FFFD and is
+   skipped the same way). *pp < p_end. Keep in sync with
+   JS_NewStringLen(). */
+static uint32_t utf8_decode_lossy(const uint8_t **pp, const uint8_t *p_end)
+{
+    const uint8_t *p = *pp;
+    uint32_t c;
+
+    if (*p < 0x80) {
+        *pp = p + 1;
+        return *p;
+    }
+    c = unicode_from_utf8(p, p_end - p, pp);
+    if (c > 0x10FFFF) {
+        c = 0xfffd;
+        while (p < p_end && (*p >= 0x80 && *p < 0xc0))
+            p++;
+        if (p < p_end) {
+            p++;
+            while (p < p_end && (*p >= 0x80 && *p < 0xc0))
+                p++;
+        }
+        *pp = p;
+    }
+    return c;
+}
+
+/* return TRUE if the code units of 'p' are those of the UTF-8 buffer
+   [buf, buf_end) decoded by JS_NewStringLen(). p->len must be the
+   decoded length. */
+static BOOL js_string_eq_utf8(const JSString *p, const uint8_t *buf,
+                              const uint8_t *buf_end)
+{
+    uint32_t c;
+    int i = 0;
+
+    while (buf < buf_end) {
+        c = utf8_decode_lossy(&buf, buf_end);
+        if (c >= 0x10000) {
+            if (string_get(p, i++) != get_hi_surrogate(c))
+                return FALSE;
+            c = get_lo_surrogate(c);
+        }
+        if (string_get(p, i++) != c)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+/* js_find_atom_utf8() for a string whose first non-ASCII byte is at
+   'len1' */
+static no_inline JSAtom js_find_atom_utf8_non_ascii(JSRuntime *rt,
+                                                   const uint8_t *buf,
+                                                   size_t len, size_t len1)
+{
+    const uint8_t *buf_end = buf + len, *q;
+    uint32_t h, h1, i, c;
+    size_t len16;
+    JSAtomStruct *p;
+
+    h = hash_string8(buf, len1, JS_ATOM_TYPE_STRING);
+    len16 = len1;
+    for(q = buf + len1; q < buf_end;) {
+        c = utf8_decode_lossy(&q, buf_end);
+        if (c >= 0x10000) {
+            h = h * 263 + get_hi_surrogate(c);
+            len16++;
+            c = get_lo_surrogate(c);
+        }
+        h = h * 263 + c;
+        len16++;
+    }
+    if (len16 > JS_STRING_LEN_MAX)
+        return JS_ATOM_NULL;
+    h &= JS_ATOM_HASH_MASK;
+    h1 = h & (rt->atom_hash_size - 1);
+    for(i = rt->atom_hash[h1]; i != 0; i = p->hash_next) {
+        p = rt->atom_array[i];
+        if (p->hash == h &&
+            p->atom_type == JS_ATOM_TYPE_STRING &&
+            p->len == len16 &&
+            js_string_eq_utf8(p, buf, buf_end)) {
+            if (!__JS_AtomIsConst(i))
+                js_rc(p)->ref_count++;
+            return i;
+        }
+    }
+    return JS_ATOM_NULL;
+}
+
+/* Return the atom JS_NewAtomLen() would return for the UTF-8 string
+   'str' if it already exists (with a new reference), JS_ATOM_NULL
+   otherwise. Never allocates nor raises an exception. */
+static force_inline JSAtom js_find_atom_utf8(JSRuntime *rt, const char *str,
+                                             size_t len)
+{
+    size_t len1, i;
+
+    len1 = count_ascii((const uint8_t *)str, len);
+    if (unlikely(len1 != len))
+        return js_find_atom_utf8_non_ascii(rt, (const uint8_t *)str, len, len1);
+    if (unlikely(len != 0 && len <= 10 && is_digit(*str))) {
+        /* same as is_num_string(): canonical array index */
+        uint64_t n = 0;
+        for(i = 0; i < len && is_digit(str[i]); i++)
+            n = n * 10 + (str[i] - '0');
+        if (i == len && (str[0] != '0' || len == 1) &&
+            n <= JS_ATOM_MAX_INT)
+            return __JS_AtomFromUInt32(n);
+    }
+    return __JS_FindAtom(rt, str, len, JS_ATOM_TYPE_STRING);
+}
+
+JSAtom JS_FindAtomLen(JSContext *ctx, const char *str, size_t len)
+{
+    return js_find_atom_utf8(ctx->rt, str, len);
+}
+
+/* create the atom of a UTF-8 string known to be absent from the atom
+   table (JS_ATOM_NULL and exception if error) */
+static JSAtom js_new_atom_utf8_slow(JSContext *ctx, const char *str,
+                                    size_t len)
 {
     JSValue val;
 
-    if (len == 0 ||
-        (!is_digit(*str) &&
-         count_ascii((const uint8_t *)str, len) == len)) {
-        JSAtom atom = __JS_FindAtom(ctx->rt, str, len, JS_ATOM_TYPE_STRING);
-        if (atom)
-            return atom;
-    }
     val = JS_NewStringLen(ctx, str, len);
     if (JS_IsException(val))
         return JS_ATOM_NULL;
     return JS_NewAtomStr(ctx, JS_VALUE_GET_STRING(val));
+}
+
+/* str is UTF-8 encoded */
+JSAtom JS_NewAtomLen(JSContext *ctx, const char *str, size_t len)
+{
+    JSAtom atom;
+
+    /* no temporary string if the atom already exists */
+    atom = js_find_atom_utf8(ctx->rt, str, len);
+    if (atom != JS_ATOM_NULL)
+        return atom;
+    return js_new_atom_utf8_slow(ctx, str, len);
 }
 
 JSAtom JS_NewAtom(JSContext *ctx, const char *str)

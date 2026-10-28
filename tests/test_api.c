@@ -2217,6 +2217,127 @@ static void test_interrupt_polls(void)
     JS_FreeRuntime(rt);
 }
 
+static int64_t ac_allocs; /* allocations made by the runtime so far */
+
+static void *ac_calloc(JSMallocState *s, size_t count, size_t size)
+{
+    void *ptr = calloc(count, size);
+    if (ptr) {
+        ac_allocs++;
+        s->malloc_count++;
+    }
+    return ptr;
+}
+
+static void *ac_malloc(JSMallocState *s, size_t size)
+{
+    void *ptr = malloc(size);
+    if (ptr) {
+        ac_allocs++;
+        s->malloc_count++;
+    }
+    return ptr;
+}
+
+static void ac_free(JSMallocState *s, void *ptr)
+{
+    if (ptr)
+        s->malloc_count--;
+    free(ptr);
+}
+
+static void *ac_realloc(JSMallocState *s, void *ptr, size_t size)
+{
+    if (!ptr)
+        return size ? ac_malloc(s, size) : NULL;
+    if (size == 0) {
+        ac_free(s, ptr);
+        return NULL;
+    }
+    ac_allocs++;
+    return realloc(ptr, size);
+}
+
+static const JSMallocFunctions ac_mf = {
+    ac_calloc, ac_malloc, ac_free, ac_realloc, NULL,
+};
+
+/* JS_FindAtomLen() and JS_NewAtomLen() on existing atoms: no
+   allocation, whatever the key looks like */
+static void test_find_atom(void)
+{
+    static const char *const keys[] = {
+        "s4 plain", "s4 h\xc3\xa9llo", "2fa", "01", "4294967295",
+        "2147483648", "s4 \xf0\x9f\x98\x80 astral", "\xff\xfe", "a\x80\x62",
+    };
+    JSRuntime *rt = JS_NewRuntime2(&ac_mf, NULL);
+    JSContext *ctx = JS_NewContext(rt);
+    JSAtom a, b;
+    JSValue v;
+    int64_t n;
+    size_t i, len;
+
+    for(i = 0; i < countof(keys); i++) {
+        len = strlen(keys[i]);
+        CHECK(JS_FindAtomLen(ctx, keys[i], len) == JS_ATOM_NULL);
+        a = JS_NewAtomLen(ctx, keys[i], len);
+        CHECK(a != JS_ATOM_NULL);
+        n = ac_allocs;
+        b = JS_NewAtomLen(ctx, keys[i], len);
+        CHECK(b == a);
+        JS_FreeAtom(ctx, b);
+        b = JS_FindAtomLen(ctx, keys[i], len);
+        CHECK(b == a);
+        JS_FreeAtom(ctx, b);
+        CHECK(ac_allocs == n);
+        /* same atom as the one of the JS string */
+        v = JS_NewStringLen(ctx, keys[i], len);
+        b = JS_ValueToAtom(ctx, v);
+        JS_FreeValue(ctx, v);
+        CHECK(b == a);
+        JS_FreeAtom(ctx, b);
+        JS_FreeAtom(ctx, a);
+        /* the atom is gone once its last reference is freed */
+        CHECK(JS_FindAtomLen(ctx, keys[i], len) == JS_ATOM_NULL);
+    }
+
+    /* invalid UTF-8 is decoded like JS_NewStringLen() does */
+    a = JS_NewAtomLen(ctx, "a\x80\x62", 3);
+    b = JS_FindAtomLen(ctx, "a\xef\xbf\xbd", 4);
+    CHECK(b == a);
+    JS_FreeAtoms(ctx, a, b);
+    a = JS_NewAtomLen(ctx, "s4\xff\xfe", 4);
+    b = JS_FindAtomLen(ctx, "s4\xef\xbf\xbd\xef\xbf\xbd", 8);
+    CHECK(b == a);
+    JS_FreeAtoms(ctx, a, b);
+
+    /* array indexes are always found, as integer atoms */
+    n = ac_allocs;
+    a = JS_FindAtomLen(ctx, "2147483647", 10);
+    CHECK(a == JS_NewAtomUInt32(ctx, 2147483647));
+    CHECK(JS_FindAtomLen(ctx, "0", 1) == JS_NewAtomUInt32(ctx, 0));
+    CHECK(JS_NewAtomLen(ctx, "123", 3) == JS_NewAtomUInt32(ctx, 123));
+    CHECK(ac_allocs == n);
+    /* not zero terminated, predefined and atoms created by JS code */
+    a = JS_FindAtomLen(ctx, "lengthXYZ", 6);
+    b = JS_NewAtom(ctx, "length");
+    CHECK(a != JS_ATOM_NULL && a == b);
+    JS_FreeAtoms(ctx, a, b);
+    CHECK(JS_FindAtomLen(ctx, "", 0) != JS_ATOM_NULL);
+    CHECK(JS_FindAtomLen(ctx, "s4_\xce\xbb_js", 8) == JS_ATOM_NULL);
+    v = eval_str(ctx, "({ s4_\xce\xbb_js: 1, '\\u{1F600}s4': 2 })");
+    a = JS_FindAtomLen(ctx, "s4_\xce\xbb_js", 8);
+    CHECK(a != JS_ATOM_NULL);
+    JS_FreeAtom(ctx, a);
+    a = JS_FindAtomLen(ctx, "\xf0\x9f\x98\x80s4", 6);
+    CHECK(a != JS_ATOM_NULL);
+    JS_FreeAtom(ctx, a);
+    JS_FreeValue(ctx, v);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     JSRuntime *rt;
@@ -2238,6 +2359,7 @@ int main(void)
     test_trigger_interrupt();
     test_bigint_pow_leak();
     test_interrupt_polls();
+    test_find_atom();
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);

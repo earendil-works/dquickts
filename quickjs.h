@@ -600,6 +600,11 @@ void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt);
 
 JSAtom JS_NewAtomLen(JSContext *ctx, const char *str, size_t len);
 JSAtom JS_NewAtom(JSContext *ctx, const char *str);
+/* Return the atom JS_NewAtomLen() would return for the UTF-8 string
+   'str' if it already exists, JS_ATOM_NULL otherwise. Never creates an
+   atom, allocates memory or raises an exception. A non null result
+   must be freed with JS_FreeAtom(). */
+JSAtom JS_FindAtomLen(JSContext *ctx, const char *str, size_t len);
 JSAtom JS_NewAtomUInt32(JSContext *ctx, uint32_t n);
 JSAtom JS_DupAtom(JSContext *ctx, JSAtom v);
 JSAtom JS_DupAtomRT(JSRuntime *rt, JSAtom v);

@@ -779,6 +779,13 @@ unsafe extern "C" {
     pub fn JS_NewAtom(ctx: *mut JSContext, str_: *const ::core::ffi::c_char) -> JSAtom;
 }
 unsafe extern "C" {
+    pub fn JS_FindAtomLen(
+        ctx: *mut JSContext,
+        str_: *const ::core::ffi::c_char,
+        len: size_t,
+    ) -> JSAtom;
+}
+unsafe extern "C" {
     pub fn JS_NewAtomUInt32(ctx: *mut JSContext, n: u32) -> JSAtom;
 }
 unsafe extern "C" {

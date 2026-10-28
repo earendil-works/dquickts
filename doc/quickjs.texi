@@ -1276,6 +1276,10 @@ call). @code{JS_SetLength()} assigns the @code{length} property, and
 @code{JS_SealObject()}/@code{JS_FreezeObject()} behave like
 @code{Object.seal()}/@code{Object.freeze()}.
 
+@code{JS_FindAtomLen()} returns the atom of a UTF-8 string only if it
+already exists (@code{JS_ATOM_NULL} otherwise) and never allocates
+memory.
+
 @subsection C functions
 
 C functions can be created with
