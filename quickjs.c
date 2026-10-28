@@ -8810,38 +8810,91 @@ static JSValue js_new_callsite(JSContext *ctx, JSStackFrame *sf,
     return obj;
 }
 
-/* add a level of the default stack trace. 'b' is the bytecode function
-   with debug information or NULL. */
-static void js_backtrace_put_frame(JSContext *ctx, DynBuf *dbuf,
-                                   const char *func_name,
-                                   JSFunctionBytecode *b, uint32_t pc,
-                                   BOOL native)
-{
-    const char *atom_str;
-    int line_num, col_num;
-    char buf[16];
+/* source position of the last level formatted by
+   js_backtrace_put_frame() (the same position is frequent in
+   recursions) */
+typedef struct JSBacktracePosCache {
+    JSFunctionBytecode *b; /* NULL if none */
+    uint32_t pc;
+    int line_num;
+    int col_num;
+} JSBacktracePosCache;
 
-    dbuf_putstr(dbuf, "    at ");
-    if (!func_name || func_name[0] == '\0')
-        func_name = "<anonymous>";
-    dbuf_putstr(dbuf, func_name);
-    if (native) {
-        dbuf_putstr(dbuf, " (native)");
-    } else if (b) {
-        line_num = find_line_num(ctx, b, pc, &col_num);
-        atom_str = JS_AtomToCString(ctx, b->debug.filename);
-        dbuf_putstr(dbuf, " (");
-        dbuf_putstr(dbuf, atom_str ? atom_str : "<null>");
-        JS_FreeCString(ctx, atom_str);
-        if (line_num != 0) {
-            dbuf_putc(dbuf, ':');
-            dbuf_put(dbuf, (const uint8_t *)buf, i32toa(buf, line_num));
-            dbuf_putc(dbuf, ':');
-            dbuf_put(dbuf, (const uint8_t *)buf, i32toa(buf, col_num));
-        }
-        dbuf_putc(dbuf, ')');
+/* append 'p' up to its first NUL character: the default stack trace
+   is the one formatted with UTF-8 C strings */
+static int string_buffer_concat_cstr(StringBuffer *sb, const JSString *p)
+{
+    uint32_t len;
+    const uint8_t *q;
+
+    if (p->is_wide_char) {
+        for(len = 0; len < p->len && p->u.str16[len] != 0; len++)
+            continue;
+    } else {
+        q = memchr(p->u.str8, 0, p->len);
+        len = q ? q - p->u.str8 : p->len;
     }
-    dbuf_putc(dbuf, '\n');
+    return string_buffer_concat(sb, p, 0, len);
+}
+
+/* append a number in decimal */
+static int string_buffer_put_int(StringBuffer *sb, int v)
+{
+    char buf[16];
+    return string_buffer_write8(sb, (const uint8_t *)buf, i32toa(buf, v));
+}
+
+/* add a level of the default stack trace. 'func_name' is a string or
+   JS_NULL, 'b' is the bytecode function with debug information or
+   NULL. */
+static void js_backtrace_put_frame(JSContext *ctx, StringBuffer *sb,
+                                   JSValueConst func_name,
+                                   JSFunctionBytecode *b, uint32_t pc,
+                                   BOOL native,
+                                   JSBacktracePosCache *pos_cache)
+{
+    JSValue filename;
+    uint32_t len;
+
+    string_buffer_puts8(sb, "    at ");
+    len = sb->len;
+    if (!JS_IsNull(func_name))
+        string_buffer_concat_cstr(sb, JS_VALUE_GET_STRING(func_name));
+    if (sb->len == len)
+        string_buffer_puts8(sb, "<anonymous>");
+    if (native) {
+        string_buffer_puts8(sb, " (native)");
+    } else if (b) {
+        if (pos_cache->b != b || pos_cache->pc != pc) {
+            pos_cache->b = b;
+            pos_cache->pc = pc;
+            pos_cache->line_num = find_line_num(ctx, b, pc,
+                                                &pos_cache->col_num);
+        }
+        string_buffer_puts8(sb, " (");
+        /* no allocation if the atom is a string */
+        filename = JS_AtomToString(ctx, b->debug.filename);
+        if (JS_IsException(filename)) {
+            string_buffer_puts8(sb, "<null>");
+        } else {
+            string_buffer_concat_cstr(sb, JS_VALUE_GET_STRING(filename));
+            JS_FreeValue(ctx, filename);
+        }
+        if (pos_cache->line_num != 0) {
+            string_buffer_putc8(sb, ':');
+            string_buffer_put_int(sb, pos_cache->line_num);
+            string_buffer_putc8(sb, ':');
+            string_buffer_put_int(sb, pos_cache->col_num);
+        }
+        string_buffer_putc8(sb, ')');
+    }
+    string_buffer_putc8(sb, '\n');
+}
+
+/* initial size of the stack trace string of 'n' levels */
+static inline int js_backtrace_size_hint(int n)
+{
+    return 16 + 64 * min_int(n, 16);
 }
 
 /* Return the stack trace from 'sf' as a string or, if 'callsites' is
@@ -8853,8 +8906,9 @@ static JSValue get_backtrace(JSContext *ctx, JSStackFrame *sf,
                              int backtrace_flags, int limit, BOOL callsites)
 {
     JSValue ret, val;
-    DynBuf dbuf;
-    const char *func_name_str;
+    JSValueConst func_name;
+    StringBuffer sb_s, *sb = &sb_s;
+    JSBacktracePosCache pos_cache = { NULL };
     JSObject *p;
     int level;
 
@@ -8865,7 +8919,7 @@ static JSValue get_backtrace(JSContext *ctx, JSStackFrame *sf,
             return JS_NULL;
     } else {
         ret = JS_UNDEFINED;
-        js_dbuf_init(ctx, &dbuf);
+        string_buffer_init(ctx, sb, js_backtrace_size_hint(limit));
     }
     if (filename && level < limit) {
         if (callsites) {
@@ -8874,10 +8928,23 @@ static JSValue get_backtrace(JSContext *ctx, JSStackFrame *sf,
                 JS_DefinePropertyValueUint32(ctx, ret, level, val, JS_PROP_C_W_E) < 0)
                 goto fail;
         } else {
+            DynBuf dbuf;
+
+            /* the UTF-8 level is decoded in one piece */
+            js_dbuf_init(ctx, &dbuf);
             dbuf_printf(&dbuf, "    at %s", filename);
             if (line_num != -1)
                 dbuf_printf(&dbuf, ":%d:%d", line_num, col_num);
             dbuf_putc(&dbuf, '\n');
+            if (dbuf_error(&dbuf))
+                val = JS_EXCEPTION;
+            else
+                val = JS_NewStringLen(ctx, (char *)dbuf.buf, dbuf.size);
+            dbuf_free(&dbuf);
+            if (JS_IsException(val))
+                string_buffer_set_error(sb);
+            else
+                string_buffer_concat_value_free(sb, val);
         }
         level++;
     }
@@ -8896,32 +8963,28 @@ static JSValue get_backtrace(JSContext *ctx, JSStackFrame *sf,
             level++;
             continue;
         }
-        func_name_str = get_prop_string(ctx, sf->cur_func, JS_ATOM_name);
+        /* no JS code is run while the name is used */
+        func_name = get_prop_string_value(sf->cur_func, JS_ATOM_name);
         p = JS_VALUE_GET_OBJ(sf->cur_func);
         if (js_class_has_bytecode(p->class_id)) {
             JSFunctionBytecode *b = p->u.func.function_bytecode;
             if (b->has_debug) {
-                js_backtrace_put_frame(ctx, &dbuf, func_name_str, b,
+                js_backtrace_put_frame(ctx, sb, func_name, b,
                                        sf->cur_pc - b->byte_code_buf - 1,
-                                       FALSE);
+                                       FALSE, &pos_cache);
             } else {
-                js_backtrace_put_frame(ctx, &dbuf, func_name_str, NULL, 0,
-                                       FALSE);
+                js_backtrace_put_frame(ctx, sb, func_name, NULL, 0, FALSE,
+                                       &pos_cache);
             }
         } else {
-            js_backtrace_put_frame(ctx, &dbuf, func_name_str, NULL, 0, TRUE);
+            js_backtrace_put_frame(ctx, sb, func_name, NULL, 0, TRUE,
+                                   &pos_cache);
         }
-        JS_FreeCString(ctx, func_name_str);
         level++;
     }
     if (callsites)
         return ret;
-    dbuf_putc(&dbuf, '\0');
-    if (dbuf_error(&dbuf))
-        ret = JS_NULL;
-    else
-        ret = JS_NewString(ctx, (char *)dbuf.buf);
-    dbuf_free(&dbuf);
+    ret = string_buffer_end(sb);
     if (JS_IsException(ret))
         ret = JS_NULL;
     return ret;
@@ -8969,7 +9032,7 @@ static JSErrorBacktrace *js_backtrace_capture(JSContext *ctx,
             flags &= ~JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL;
             continue;
         }
-        /* same name as get_prop_string() in get_backtrace() */
+        /* same name as in get_backtrace() */
         fr->func_name = JS_DupValueRT(rt, get_prop_string_value(sf->cur_func,
                                                                 JS_ATOM_name));
         fr->b = NULL;
@@ -9027,8 +9090,8 @@ static JSValue js_backtrace_to_string(JSContext *ctx,
     const JSBacktraceFrame *fr;
     JSValue ret, saved_exception;
     BOOL saved_uncatchable;
-    const char *func_name_str;
-    DynBuf dbuf;
+    StringBuffer sb_s, *sb = &sb_s;
+    JSBacktracePosCache pos_cache = { NULL };
     int i;
 
     saved_exception = rt->current_exception;
@@ -9036,22 +9099,13 @@ static JSValue js_backtrace_to_string(JSContext *ctx,
     rt->current_exception = JS_UNINITIALIZED;
     rt->current_exception_is_uncatchable = FALSE;
 
-    js_dbuf_init(ctx, &dbuf);
+    string_buffer_init(ctx, sb, js_backtrace_size_hint(bt->count));
     for(i = 0; i < bt->count; i++) {
         fr = &bt->frames[i];
-        func_name_str = NULL;
-        if (!JS_IsNull(fr->func_name))
-            func_name_str = JS_ToCString(ctx, fr->func_name);
-        js_backtrace_put_frame(ctx, &dbuf, func_name_str, fr->b, fr->pc,
-                               fr->native);
-        JS_FreeCString(ctx, func_name_str);
+        js_backtrace_put_frame(ctx, sb, fr->func_name, fr->b, fr->pc,
+                               fr->native, &pos_cache);
     }
-    dbuf_putc(&dbuf, '\0');
-    if (dbuf_error(&dbuf))
-        ret = JS_NULL;
-    else
-        ret = JS_NewString(ctx, (char *)dbuf.buf);
-    dbuf_free(&dbuf);
+    ret = string_buffer_end(sb);
     if (JS_IsException(ret))
         ret = JS_NULL;
 
