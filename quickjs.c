@@ -10890,7 +10890,10 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
             kind = JS_AtomGetKind(ctx, atom);
             if ((!(flags & JS_GPN_ENUM_ONLY) || is_enumerable) &&
                 ((flags >> kind) & 1) != 0) {
-                if (JS_AtomIsArrayIndex(ctx, &num_key, atom)) {
+                /* the same properties as counted: no index if none
+                   was counted */
+                if (num_keys_count != 0 &&
+                    JS_AtomIsArrayIndex(ctx, &num_key, atom)) {
                     j = num_index++;
                     num_sorted = FALSE;
                 } else if (kind == JS_ATOM_KIND_STRING) {
