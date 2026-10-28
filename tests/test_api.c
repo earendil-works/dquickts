@@ -2262,6 +2262,13 @@ static const JSMallocFunctions ac_mf = {
     ac_calloc, ac_malloc, ac_free, ac_realloc, NULL,
 };
 
+static int64_t atom_count(JSRuntime *rt)
+{
+    JSMemoryUsage mu;
+    JS_ComputeMemoryUsage(rt, &mu);
+    return mu.atom_count;
+}
+
 /* JS_FindAtomLen() and JS_NewAtomLen() on existing atoms: no
    allocation, whatever the key looks like */
 static void test_find_atom(void)
@@ -2338,6 +2345,114 @@ static void test_find_atom(void)
     JS_FreeRuntime(rt);
 }
 
+/* JS_GetPropertyStrLen()/JS_HasPropertyStrLen() do not create atoms for
+   ordinary objects and behave like JS_GetProperty()/JS_HasProperty()
+   on exotic ones */
+static void test_property_str_len(void)
+{
+    static const char mod_src[] = "export const x = 1; export let y = 2;";
+    JSRuntime *rt = JS_NewRuntime2(&ac_mf, NULL);
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue obj, v, mod;
+    JSModuleDef *m;
+    int64_t n, atoms;
+
+    obj = eval_str(ctx, "var s4p = Object.create({ get s4_g() { return this.s4_own * 2 } });"
+                   "s4p.s4_own = 21; s4p['s4 \\u00e9'] = 3; s4p");
+    atoms = atom_count(rt);
+    n = ac_allocs;
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "s4_absent", 9)));
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "s4 \xc3\xa8", 5)));
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "7up", 3)));
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4_absent", 9) == 0);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4 \xc3\xa8", 5) == 0);
+    v = JS_GetPropertyStrLen(ctx, obj, "s4 \xc3\xa9", 5);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 3);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4 \xc3\xa9", 5) == 1);
+    CHECK(ac_allocs == n);
+    CHECK(atom_count(rt) == atoms);
+    /* inherited getter, key not zero terminated */
+    v = JS_GetPropertyStrLen(ctx, obj, "s4_gXX", 4);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 42);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4_g", 4) == 1);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "toString", 8) == 1);
+    v = JS_GetPropertyStr(ctx, obj, "s4_own");
+    CHECK(JS_VALUE_GET_INT(v) == 21);
+    JS_FreeValue(ctx, obj);
+
+    /* Proxy traps see keys which are not atoms yet, also from the
+       prototype chain */
+    obj = eval_str(ctx, "var s4log = []; var s4px = new Proxy({}, {"
+                   "get(t, k, r) { s4log.push(k); return 'p:' + k },"
+                   "has(t, k) { s4log.push('has:' + k); return k !== 'no' } });"
+                   "s4px");
+    check_string(ctx, JS_GetPropertyStrLen(ctx, obj, "s4_trap_1", 9), "p:s4_trap_1");
+    check_string(ctx, JS_GetPropertyStrLen(ctx, obj, "s4 trap \xc3\xa9", 10),
+                 "p:s4 trap \xc3\xa9");
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4_trap_2", 9) == 1);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "no", 2) == 0);
+    JS_FreeValue(ctx, obj);
+    obj = eval_str(ctx, "Object.create(Object.create(s4px))");
+    check_string(ctx, JS_GetPropertyStrLen(ctx, obj, "s4_trap_3", 9), "p:s4_trap_3");
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4_trap_4", 9) == 1);
+    JS_FreeValue(ctx, obj);
+    CHECK(eval_bool(ctx, "s4log.join() === 's4_trap_1,s4 trap \\u00e9,has:s4_trap_2,"
+                    "has:no,s4_trap_3,has:s4_trap_4'"));
+
+    /* typed arrays: numeric keys are not looked up in the prototype */
+    obj = eval_str(ctx, "Object.prototype['1.5'] = 'proto'; new Uint8Array([5, 6])");
+    v = JS_GetPropertyStrLen(ctx, obj, "1", 1);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 6);
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "1.5", 3)));
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "-0", 2)));
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "s4_ta", 5)));
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "1.5", 3) == 0);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "-0", 2) == 0);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "0", 1) == 1);
+    v = JS_GetPropertyStrLen(ctx, obj, "length", 6);
+    CHECK(JS_VALUE_GET_INT(v) == 2);
+    JS_FreeValue(ctx, obj);
+    CHECK(eval_bool(ctx, "delete Object.prototype['1.5']"));
+
+    /* String objects and primitives */
+    obj = eval_str(ctx, "new String('abc')");
+    check_string(ctx, JS_GetPropertyStrLen(ctx, obj, "1", 1), "b");
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "2", 1) == 1);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "3", 1) == 0);
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "s4_str", 6)));
+    JS_FreeValue(ctx, obj);
+    obj = JS_NewString(ctx, "xyz");
+    v = JS_GetPropertyStrLen(ctx, obj, "length", 6);
+    CHECK(JS_VALUE_GET_INT(v) == 3);
+    check_string(ctx, JS_GetPropertyStrLen(ctx, obj, "2", 1), "z");
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "s4_prim", 7)));
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "length", 6) == 0);
+    JS_FreeValue(ctx, obj);
+    CHECK(JS_IsException(JS_GetPropertyStrLen(ctx, JS_UNDEFINED, "s4_undef", 8)));
+    check_exception(ctx, "TypeError");
+    CHECK(eval_bool(ctx, "exc.message.includes('s4_undef')"));
+
+    /* module namespace */
+    mod = JS_Eval(ctx, mod_src, strlen(mod_src), "<s4mod>",
+                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    CHECK(JS_IsModule(mod));
+    m = JS_VALUE_GET_PTR(mod);
+    v = JS_EvalFunction(ctx, mod);
+    CHECK(!JS_IsException(v));
+    JS_FreeValue(ctx, v);
+    obj = JS_GetModuleNamespace(ctx, m);
+    CHECK(JS_IsObject(obj));
+    v = JS_GetPropertyStrLen(ctx, obj, "y", 1);
+    CHECK(JS_VALUE_GET_INT(v) == 2);
+    CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, "s4_ns", 5)));
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "x", 1) == 1);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4_ns", 5) == 0);
+    JS_FreeValue(ctx, obj);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     JSRuntime *rt;
@@ -2360,6 +2475,7 @@ int main(void)
     test_bigint_pow_leak();
     test_interrupt_polls();
     test_find_atom();
+    test_property_str_len();
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);

@@ -1070,6 +1070,12 @@ static js_force_inline JSValue JS_GetProperty(JSContext *ctx, JSValueConst this_
 }
 JSValue JS_GetPropertyStr(JSContext *ctx, JSValueConst this_obj,
                           const char *prop);
+/* this_obj[prop] where 'prop' is a UTF-8 string of 'len' bytes (not
+   necessarily zero terminated). No atom is created when the key is not
+   already an atom and the lookup cannot observe it (no exotic object
+   such as a Proxy in the prototype chain). */
+JSValue JS_GetPropertyStrLen(JSContext *ctx, JSValueConst this_obj,
+                             const char *prop, size_t len);
 JSValue JS_GetPropertyUint32(JSContext *ctx, JSValueConst this_obj,
                              uint32_t idx);
 JSValue JS_GetPropertyInt64(JSContext *ctx, JSValueConst this_obj,
@@ -1097,6 +1103,10 @@ int JS_SetPropertyStr(JSContext *ctx, JSValueConst this_obj,
 int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                         JSValue prop, JSValue val, int flags);
 int JS_HasProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop);
+/* same as JS_HasProperty() with a UTF-8 key of 'len' bytes, creating no
+   atom in the same cases as JS_GetPropertyStrLen() */
+int JS_HasPropertyStrLen(JSContext *ctx, JSValueConst this_obj,
+                         const char *prop, size_t len);
 int JS_IsExtensible(JSContext *ctx, JSValueConst obj);
 int JS_PreventExtensions(JSContext *ctx, JSValueConst obj);
 /* Object.seal() / Object.freeze(): return -1 if exception. Non objects

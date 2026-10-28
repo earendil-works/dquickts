@@ -1403,6 +1403,14 @@ unsafe extern "C" {
     ) -> JSValue;
 }
 unsafe extern "C" {
+    pub fn JS_GetPropertyStrLen(
+        ctx: *mut JSContext,
+        this_obj: JSValue,
+        prop: *const ::core::ffi::c_char,
+        len: size_t,
+    ) -> JSValue;
+}
+unsafe extern "C" {
     pub fn JS_GetPropertyUint32(ctx: *mut JSContext, this_obj: JSValue, idx: u32) -> JSValue;
 }
 unsafe extern "C" {
@@ -1459,6 +1467,14 @@ unsafe extern "C" {
         ctx: *mut JSContext,
         this_obj: JSValue,
         prop: JSAtom,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn JS_HasPropertyStrLen(
+        ctx: *mut JSContext,
+        this_obj: JSValue,
+        prop: *const ::core::ffi::c_char,
+        len: size_t,
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {

@@ -10819,15 +10819,69 @@ JSValue JS_GetPropertyInt64(JSContext *ctx, JSValueConst obj, int64_t idx)
     return val;
 }
 
-JSValue JS_GetPropertyStr(JSContext *ctx, JSValueConst this_obj,
-                          const char *prop)
+/* Return TRUE if getting or testing a string key which is not an atom
+   is unobservable on 'obj': no object of its prototype chain can have
+   such an own property (its shape would reference the atom) and none
+   has exotic methods which could see the key. Arrays, arguments and
+   typed arrays are fine: they only special case integer and numeric
+   index keys, for which the result is also 'not found'. */
+static BOOL js_absent_key_is_unobservable(JSContext *ctx, JSValueConst obj)
+{
+    JSObject *p;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return FALSE;
+    for(p = JS_VALUE_GET_OBJ(obj); p != NULL; p = p->shape->proto) {
+        if (unlikely(p->is_exotic) && !p->fast_array &&
+            ctx->rt->class_array[p->class_id].exotic)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+JSValue JS_GetPropertyStrLen(JSContext *ctx, JSValueConst this_obj,
+                             const char *prop, size_t len)
 {
     JSAtom atom;
     JSValue ret;
-    atom = JS_NewAtom(ctx, prop);
-    if (atom == JS_ATOM_NULL)
-        return JS_EXCEPTION;
+
+    atom = js_find_atom_utf8(ctx->rt, prop, len);
+    if (atom == JS_ATOM_NULL) {
+        /* avoid creating a short lived atom */
+        if (len <= JS_STRING_LEN_MAX &&
+            js_absent_key_is_unobservable(ctx, this_obj))
+            return JS_UNDEFINED;
+        atom = js_new_atom_utf8_slow(ctx, prop, len);
+        if (atom == JS_ATOM_NULL)
+            return JS_EXCEPTION;
+    }
     ret = JS_GetProperty(ctx, this_obj, atom);
+    JS_FreeAtom(ctx, atom);
+    return ret;
+}
+
+JSValue JS_GetPropertyStr(JSContext *ctx, JSValueConst this_obj,
+                          const char *prop)
+{
+    return JS_GetPropertyStrLen(ctx, this_obj, prop, strlen(prop));
+}
+
+int JS_HasPropertyStrLen(JSContext *ctx, JSValueConst this_obj,
+                         const char *prop, size_t len)
+{
+    JSAtom atom;
+    int ret;
+
+    atom = js_find_atom_utf8(ctx->rt, prop, len);
+    if (atom == JS_ATOM_NULL) {
+        if (len <= JS_STRING_LEN_MAX &&
+            js_absent_key_is_unobservable(ctx, this_obj))
+            return FALSE;
+        atom = js_new_atom_utf8_slow(ctx, prop, len);
+        if (atom == JS_ATOM_NULL)
+            return -1;
+    }
+    ret = JS_HasProperty(ctx, this_obj, atom);
     JS_FreeAtom(ctx, atom);
     return ret;
 }

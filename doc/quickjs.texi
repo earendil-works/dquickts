@@ -1278,7 +1278,11 @@ call). @code{JS_SetLength()} assigns the @code{length} property, and
 
 @code{JS_FindAtomLen()} returns the atom of a UTF-8 string only if it
 already exists (@code{JS_ATOM_NULL} otherwise) and never allocates
-memory.
+memory. @code{JS_GetPropertyStrLen()} and @code{JS_HasPropertyStrLen()}
+take a UTF-8 property name with an explicit length; like
+@code{JS_GetPropertyStr()}, they do not create a temporary atom when
+the name is not an atom yet and no exotic object (such as a
+@code{Proxy}) in the prototype chain can observe it.
 
 @subsection C functions
 
