@@ -233,12 +233,14 @@ impl<const N: usize> PendingElements for TupleElements<N> {
 /// `Array::new()` followed by `Array::set()` of each element right after its conversion.
 ///
 /// While the prototypes of the arrays can't intercept index sets
-/// (`JS_HasStdArrayPrototype()`, checked after each conversion since a conversion can run
+/// (`JS_GetStdArrayPrototypeFlag()`, read after each conversion since a conversion can run
 /// JS), the sets would only define the elements: the elements are kept and defined at once
 /// by `JS_NewArrayFrom()`. From the first element where that doesn't hold on, the array is
 /// made from the kept elements and the next ones are set with `JS_SetPropertyUint32()`.
 pub(crate) struct ArrayBuilder<'a, 'js, P: PendingElements> {
     ctx: &'a Ctx<'js>,
+    /// Changed by the engine only, valid as long as the context.
+    std_array_prototype: *const qjs::c_int,
     pending: P,
     array: Option<Array<'js>>,
     len: usize,
@@ -251,6 +253,7 @@ impl<'a, 'js, P: PendingElements> ArrayBuilder<'a, 'js, P> {
     pub(crate) fn new(ctx: &'a Ctx<'js>, pending: P) -> Self {
         Self {
             ctx,
+            std_array_prototype: unsafe { qjs::JS_GetStdArrayPrototypeFlag(ctx.as_ptr()) },
             pending,
             array: None,
             len: 0,
@@ -267,7 +270,8 @@ impl<'a, 'js, P: PendingElements> ArrayBuilder<'a, 'js, P> {
         let array = match &self.array {
             Some(array) => array.0.as_js_value(),
             None => {
-                if idx < Self::MAX_PENDING && unsafe { qjs::JS_HasStdArrayPrototype(ctx) } != 0 {
+                // a plain read: the pointer is never made a reference
+                if idx < Self::MAX_PENDING && unsafe { *self.std_array_prototype } != 0 {
                     self.pending.push(value);
                     return Ok(());
                 }
