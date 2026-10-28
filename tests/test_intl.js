@@ -217,6 +217,14 @@ function test_dateTimeFormat() {
            "dezembro 12, 2017", "pt-BR dateTimeFormat");
 }
 
+function test_etc_gmt_time_zones() {
+    var i = Temporal.Instant.from('2020-01-01T00:00Z');
+    assert(i.toZonedDateTimeISO('Etc/GMT+5').toString(),
+           "2019-12-31T19:00:00-05:00[Etc/GMT+5]", "Etc/GMT+5 toZonedDateTimeISO");
+    assert(i.toZonedDateTimeISO('2020-01-01T00:00+0100').timeZoneId, "+01:00",
+           "date-time offset toZonedDateTimeISO");
+}
+
 /* zones which are not embedded are loaded from the system tz database */
 function test_system_time_zones() {
     var f, zdt;
@@ -529,6 +537,7 @@ function test_durationFormat() {
 /* Run all tests */
 test_dateTimeFormat();
 test_system_time_zones();
+test_etc_gmt_time_zones();
 test_numberFormat();
 test_collator();
 test_listFormat();

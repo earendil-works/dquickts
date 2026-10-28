@@ -231,12 +231,12 @@ static JSValue ti_canonicalize_timezone_string(JSContext *ctx, JSValue val)
         for (i = 0; i < len; i++) {
             char c = str[i];
             if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                  (c >= '0' && c <= '9') || c == '/' || c == '_' || c == '-')) {
+                  (c >= '0' && c <= '9') || c == '/' || c == '_' || c == '-' || c == '+')) {
                 valid_iana = 0;
                 break;
             }
         }
-        if (valid_iana && len > 0) {
+        if (valid_iana && len > 0 && ti_tz_find_id(str) >= 0) {
             result = JS_NewString(ctx, str);
         } else {
             /* Find offset at end: ±HH:MM */
