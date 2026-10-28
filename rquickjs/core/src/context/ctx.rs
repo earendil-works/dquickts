@@ -500,8 +500,24 @@ impl<'js> Ctx<'js> {
         res != 0
     }
 
+    /// Points the context opaque of `ctx` at the Rust data of its runtime, which
+    /// `Ctx::get_opaque` then reads with one call instead of two.
+    ///
+    /// # Safety
+    /// `ctx` must be a context of a runtime created by rquickjs.
+    pub(crate) unsafe fn init_opaque(ctx: NonNull<qjs::JSContext>) {
+        let opaque = qjs::JS_GetRuntimeOpaque(qjs::JS_GetRuntime(ctx.as_ptr()));
+        qjs::JS_SetContextOpaque(ctx.as_ptr(), opaque);
+    }
+
     pub(crate) unsafe fn get_opaque(&self) -> &Opaque<'js> {
-        Opaque::from_runtime_ptr(qjs::JS_GetRuntime(self.ctx.as_ptr()))
+        let opaque = qjs::JS_GetContextOpaque(self.ctx.as_ptr());
+        if opaque.is_null() {
+            // a context which rquickjs didn't create or wrap (see `Ctx::from_raw`)
+            Opaque::from_runtime_ptr(qjs::JS_GetRuntime(self.ctx.as_ptr()))
+        } else {
+            &*opaque.cast::<Opaque<'js>>()
+        }
     }
 
     /// Spawn future using configured async runtime
@@ -520,6 +536,8 @@ impl<'js> Ctx<'js> {
     /// User must ensure that a lock was acquired over the runtime and that invariant is a unique
     /// lifetime which can't be coerced to a lifetime outside the scope of the lock of to the
     /// lifetime of another runtime.
+    /// The context opaque (`JS_SetContextOpaque`) of the context must be null or the one set by
+    /// rquickjs.
     #[inline]
     pub unsafe fn from_raw_invariant(ctx: NonNull<qjs::JSContext>, inv: Invariant<'js>) -> Self {
         unsafe { qjs::JS_DupContext(ctx.as_ptr()) };
@@ -532,6 +550,8 @@ impl<'js> Ctx<'js> {
     /// User must ensure that a lock was acquired over the runtime and that invariant is a unique
     /// lifetime which can't be coerced to a lifetime outside the scope of the lock of to the
     /// lifetime of another runtime.
+    /// The context opaque (`JS_SetContextOpaque`) of the context must be null or the one set by
+    /// rquickjs.
     #[inline]
     pub unsafe fn from_raw(ctx: NonNull<qjs::JSContext>) -> Self {
         unsafe { qjs::JS_DupContext(ctx.as_ptr()) };
@@ -603,6 +623,9 @@ impl<'js> Ctx<'js> {
     }
 
     /// Returns the pointer to the C library context.
+    ///
+    /// rquickjs keeps its data in the context opaque (`JS_SetContextOpaque`) of the context,
+    /// which must not be changed.
     pub fn as_raw(&self) -> NonNull<qjs::JSContext> {
         self.ctx
     }

@@ -117,6 +117,8 @@ pub struct AsyncContext(pub(crate) ContextOwner<AsyncRuntime>);
 impl AsyncContext {
     /// Create a async context form a raw context pointer.
     ///
+    /// rquickjs keeps its data in the context opaque (`JS_SetContextOpaque`) of the context.
+    ///
     /// # Safety
     /// The context must be of the correct runtime.
     /// The context must also have valid reference count, one which can be decremented when this

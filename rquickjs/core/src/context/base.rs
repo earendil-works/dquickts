@@ -46,6 +46,8 @@ pub struct Context(pub(crate) ContextOwner<Runtime>);
 impl Context {
     /// Create a unused context from a raw context pointer.
     ///
+    /// rquickjs keeps its data in the context opaque (`JS_SetContextOpaque`) of the context.
+    ///
     /// # Safety
     /// Pointer must point to a context from the given runtime.
     /// The context must also have valid reference count, one which can be decremented when this
