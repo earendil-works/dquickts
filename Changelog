@@ -162,6 +162,8 @@ unreleased:
     threads using it and can be posted to a Worker; without a
     SharedArrayBuffer allocator, maxByteLength bytes are allocated
     (#546)
+  - the runtime, context and std/os/bjson initialization report out of
+    memory errors instead of crashing or asserting (#404)
   - added JS_TriggerInterruptHandler() (#387)
   - qjsc: the C modules (-M, std, os, bjson) can be imported with
     import() (#423)
@@ -170,6 +172,7 @@ unreleased:
   found in the executable instead of being loaded at run time (added
   JS_SetModuleAttributes(); js_std_eval_binary_json_module() takes the
   module type)
+- fixed a double free in JSON.parse() with a reviver when out of memory
 - Temporal and Intl load the time zones missing from the embedded data
   from the system zoneinfo, so the default time zone is no longer
   treated as UTC on such hosts; unknown time zone names are rejected
