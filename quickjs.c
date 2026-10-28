@@ -11077,8 +11077,20 @@ JSValue JS_GetPropertyStrLen(JSContext *ctx, JSValueConst this_obj,
     JSAtom atom;
     JSValue ret;
 
-    atom = js_find_atom_utf8(ctx->rt, prop, len);
-    if (atom == JS_ATOM_NULL) {
+    atom = js_find_atom_utf8_noref(ctx->rt, prop, len);
+    if (likely(atom != JS_ATOM_NULL)) {
+        /* own data property: same result as JS_GetProperty(), which
+           looks it up first, without a reference to the atom (held by
+           the shape) */
+        if (likely(JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT)) {
+            JSProperty *pr;
+            JSShapeProperty *prs;
+            prs = find_own_property(&pr, JS_VALUE_GET_OBJ(this_obj), atom);
+            if (prs && likely(!(prs->flags & JS_PROP_TMASK)))
+                return JS_DupValue(ctx, pr->u.value);
+        }
+        atom = js_dup_atom_rt(ctx->rt, atom);
+    } else {
         /* avoid creating a short lived atom */
         if (len <= JS_STRING_LEN_MAX &&
             js_absent_key_is_unobservable(ctx, this_obj))
@@ -11104,8 +11116,23 @@ int JS_HasPropertyStrLen(JSContext *ctx, JSValueConst this_obj,
     JSAtom atom;
     int ret;
 
-    atom = js_find_atom_utf8(ctx->rt, prop, len);
-    if (atom == JS_ATOM_NULL) {
+    atom = js_find_atom_utf8_noref(ctx->rt, prop, len);
+    if (likely(atom != JS_ATOM_NULL)) {
+        /* own data property of an ordinary object: same result as
+           JS_HasProperty(), without a reference to the atom (held by
+           the shape) */
+        if (likely(JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT)) {
+            JSObject *p = JS_VALUE_GET_OBJ(this_obj);
+            JSProperty *pr;
+            JSShapeProperty *prs;
+            if (likely(!p->is_exotic)) {
+                prs = find_own_property(&pr, p, atom);
+                if (prs && likely(!(prs->flags & JS_PROP_TMASK)))
+                    return TRUE;
+            }
+        }
+        atom = js_dup_atom_rt(ctx->rt, atom);
+    } else {
         if (len <= JS_STRING_LEN_MAX &&
             js_absent_key_is_unobservable(ctx, this_obj))
             return FALSE;

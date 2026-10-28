@@ -2676,7 +2676,8 @@ static void test_property_str_len(void)
 }
 
 /* the UTF-8 key lookups find the keys of any length and only them (also
-   when another key has the same length and atom hash) */
+   when another key has the same length and atom hash), and read own
+   properties like JS_GetProperty() */
 static void test_property_str_lookup(void)
 {
     /* pairs of keys of the same length and atom hash */
@@ -2744,6 +2745,26 @@ static void test_property_str_lookup(void)
         CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 1000);
         JS_FreeAtoms(ctx, a, b, b);
     }
+    JS_FreeValue(ctx, obj);
+
+    /* own accessors and the length of arrays */
+    obj = eval_str(ctx, "({ get s4_og() { return this.s4_d + 1 }, s4_d: 8 })");
+    v = JS_GetPropertyStrLen(ctx, obj, "s4_og", 5);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 9);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "s4_og", 5) == 1);
+    JS_FreeValue(ctx, obj);
+    obj = eval_str(ctx, "[4, 5, 6]");
+    v = JS_GetPropertyStrLen(ctx, obj, "length", 6);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 3);
+    v = JS_GetPropertyStrLen(ctx, obj, "2", 1);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 6);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "length", 6) == 1);
+    JS_FreeValue(ctx, obj);
+    obj = JS_GetGlobalObject(ctx);
+    v = JS_GetPropertyStrLen(ctx, obj, "Math", 4);
+    CHECK(JS_IsObject(v));
+    JS_FreeValue(ctx, v);
+    CHECK(JS_HasPropertyStrLen(ctx, obj, "JSON", 4) == 1);
     JS_FreeValue(ctx, obj);
 
     JS_FreeContext(ctx);
