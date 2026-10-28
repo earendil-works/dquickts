@@ -44,8 +44,23 @@ impl<'js> FromJs<'js> for StdString {
 
 impl<'js> FromJs<'js> for char {
     fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+        use crate::value::string::StringData;
+
         let type_name = value.type_name();
-        let s = String::from_value(value)?.to_string()?;
+        let string = String::from_value(value)?;
+        // one code point: no allocation
+        match string.data()? {
+            StringData::Latin1(&[b]) => return Ok(b as char),
+            StringData::Utf16(units) => {
+                if let Some(Ok(c)) = char::decode_utf16(units.iter().copied()).next() {
+                    if c.len_utf16() == units.len() {
+                        return Ok(c);
+                    }
+                }
+            }
+            StringData::Latin1(_) => {}
+        }
+        let s = string.to_string()?;
 
         let mut chars = s.chars();
         let (c, more) = (chars.next(), chars.next());

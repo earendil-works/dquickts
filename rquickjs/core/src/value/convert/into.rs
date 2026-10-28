@@ -7,7 +7,6 @@ use crate::{
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, BTreeSet, LinkedList, VecDeque},
-    string::ToString as _,
     vec::Vec,
 };
 use core::cell::{Cell, RefCell};
@@ -58,7 +57,7 @@ impl<'js> IntoJs<'js> for &str {
 
 impl<'js> IntoJs<'js> for char {
     fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        String::from_str(ctx.clone(), self.to_string().as_str()).map(|String(value)| value)
+        String::from_str(ctx.clone(), self.encode_utf8(&mut [0; 4])).map(|String(value)| value)
     }
 }
 
