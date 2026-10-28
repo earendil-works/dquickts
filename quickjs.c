@@ -3370,13 +3370,25 @@ static inline BOOL is_num_string(uint32_t *pval, const JSString *p)
     }
 }
 
-/* XXX: could use faster version ? */
+/* The hash of the string functions is h = h * 263 + c for each code
+   unit c. It is computed 4 code units at a time (the same value modulo
+   2^32) so that the dependency chain has one multiplication per 4 code
+   units instead of one per code unit. */
+#define HASH_K1 ((uint32_t)263)
+#define HASH_K2 (HASH_K1 * HASH_K1)
+#define HASH_K3 (HASH_K2 * HASH_K1)
+#define HASH_K4 (HASH_K3 * HASH_K1)
+
 static inline uint32_t hash_string8(const uint8_t *str, size_t len, uint32_t h)
 {
     size_t i;
 
-    for(i = 0; i < len; i++)
-        h = h * 263 + str[i];
+    for(i = 0; i + 4 <= len; i += 4) {
+        h = h * HASH_K4 + (str[i] * HASH_K3 + str[i + 1] * HASH_K2 +
+                           str[i + 2] * HASH_K1 + str[i + 3]);
+    }
+    for(; i < len; i++)
+        h = h * HASH_K1 + str[i];
     return h;
 }
 
@@ -3385,8 +3397,12 @@ static inline uint32_t hash_string16(const uint16_t *str,
 {
     size_t i;
 
-    for(i = 0; i < len; i++)
-        h = h * 263 + str[i];
+    for(i = 0; i + 4 <= len; i += 4) {
+        h = h * HASH_K4 + (str[i] * HASH_K3 + str[i + 1] * HASH_K2 +
+                           str[i + 2] * HASH_K1 + str[i + 3]);
+    }
+    for(; i < len; i++)
+        h = h * HASH_K1 + str[i];
     return h;
 }
 
