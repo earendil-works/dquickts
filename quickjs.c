@@ -3648,7 +3648,8 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
         start = rt->atom_size;
         if (start == 0) {
             /* JS_ATOM_NULL entry */
-            p = js_mallocz_rt(rt, sizeof(JSAtomStruct));
+            /* with an empty zero terminated string */
+            p = js_mallocz_rt(rt, sizeof(JSAtomStruct) + 1);
             if (!p) {
                 js_free_rt(rt, new_array);
                 goto fail;
@@ -47501,6 +47502,14 @@ static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
     return -1;
 }
 
+/* JS_ATOM_NULL is used for the missing names (anonymous functions...) */
+static void js_enum_code_name(JSContext *ctx, JSAtom name,
+                              JSCodeNameFunc *func, void *opaque)
+{
+    if (name != JS_ATOM_NULL)
+        func(ctx, name, opaque);
+}
+
 int JS_EnumCodeNames(JSContext *ctx, JSValueConst obj,
                      JSCodeNameFunc *func, void *opaque)
 {
@@ -47513,7 +47522,8 @@ int JS_EnumCodeNames(JSContext *ctx, JSValueConst obj,
             /* the evaluation of a module returns a promise */
             func(ctx, JS_ATOM_Promise, opaque);
             for(i = 0; i < m->import_entries_count; i++)
-                func(ctx, m->import_entries[i].import_name, opaque);
+                js_enum_code_name(ctx, m->import_entries[i].import_name,
+                                  func, opaque);
             return JS_EnumCodeNames(ctx, m->func_obj, func, opaque);
         }
     case JS_TAG_FUNCTION_BYTECODE:
@@ -47525,7 +47535,8 @@ int JS_EnumCodeNames(JSContext *ctx, JSValueConst obj,
                 func(ctx, JS_ATOM_Promise, opaque);
             /* the global variables are closure variables */
             for(i = 0; i < b->closure_var_count; i++)
-                func(ctx, b->closure_var[i].var_name, opaque);
+                js_enum_code_name(ctx, b->closure_var[i].var_name,
+                                  func, opaque);
             for(pos = 0; pos < b->byte_code_len;
                 pos += short_opcode_info(op).size) {
                 op = b->byte_code_buf[pos];
@@ -47540,7 +47551,8 @@ int JS_EnumCodeNames(JSContext *ctx, JSValueConst obj,
                     case OP_FMT_atom_u16:
                     case OP_FMT_atom_label_u8:
                     case OP_FMT_atom_label_u16:
-                        func(ctx, get_u32(b->byte_code_buf + pos + 1), opaque);
+                        js_enum_code_name(ctx, get_u32(b->byte_code_buf + pos + 1),
+                                          func, opaque);
                         break;
                     default:
                         break;
