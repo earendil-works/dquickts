@@ -1125,6 +1125,46 @@ static void test_autoinit_oom(void)
     CHECK(n_failed > 0);
 }
 
+/* regression test: JSON.parse() with a reviver freed the parsed value
+   twice when out of memory while storing it in the root holder. The
+   sweep reaches every allocation only when all the blocks come from
+   malloc() (JS_MALLOC_LARGE_BLOCKS_ONLY: gcc ASan builds); otherwise
+   the small blocks come from arenas and nothing fails. */
+static void test_json_parse_oom(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSMemoryUsage stats;
+    JSValue parse, args[2], v;
+    size_t limit;
+    int n_failed = 0, n_ok = 0;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    parse = eval_str(ctx, "JSON.parse");
+    args[0] = JS_NewString(ctx, "{\"a\":[1,2],\"b\":{}}");
+    args[1] = eval_str(ctx, "(k, v) => v");
+    for(limit = 0; limit < 64 * 1024 && n_ok < 4; limit += 8) {
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, stats.malloc_size + limit);
+        v = JS_Call(ctx, parse, JS_UNDEFINED, 2, (JSValueConst *)args);
+        JS_SetMemoryLimit(rt, -1);
+        if (JS_IsException(v)) {
+            n_failed++;
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        } else {
+            n_ok++;
+            JS_FreeValue(ctx, v);
+        }
+    }
+    CHECK(n_ok > 0);
+    JS_FreeValue(ctx, args[1]);
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, parse);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt); /* asserts that no object is leaked */
+}
+
 /* regression test: out of memory errors during the compilation were
    ignored in some places (variable resolution, constant pool, lookahead,
    bytecode patches), which led to crashes and assertion failures or to
@@ -2110,6 +2150,7 @@ int main(void)
     test_promise_hooks();
     test_with_resolvers_oom();
     test_autoinit_oom();
+    test_json_parse_oom();
     test_parser_oom();
     test_detect_module();
     printf("test_api: OK\n");
