@@ -243,7 +243,7 @@ macro_rules! from_js_impls {
                     tuple_match_size(array_len, tuple_len)?;
 
                     Ok(List((
-                        $(array.get::<$type>(from_js_impls!(@idx $type))?,)*
+                        $(array.get_element::<$type>(from_js_impls!(@idx $type))?,)*
                     )))
                 }
             }
