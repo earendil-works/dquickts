@@ -341,9 +341,7 @@ impl<'js, C: JsClass<'js>> Class<'js, C> {
     /// returns a pointer to the class object.
     #[inline]
     pub(crate) fn get_class_ptr(&self) -> NonNull<ClassCell<JsCell<'js, C>>> {
-        let id = class_id::<C>();
-
-        let ptr = unsafe { qjs::JS_GetOpaque2(self.0.ctx.as_ptr(), self.0 .0.as_js_value(), id) };
+        let ptr = unsafe { qjs::JS_GetOpaque(self.0.as_js_value(), class_id::<C>()) };
 
         NonNull::new(ptr.cast()).expect("invalid class object, object didn't have opaque value")
     }
@@ -363,14 +361,11 @@ impl<'js, C: JsClass<'js>> Class<'js, C> {
     /// Convert from value.
     #[inline]
     pub fn from_value(value: &Value<'js>) -> Result<Self> {
-        if let Some(cls) = value.as_object().and_then(Self::from_object) {
-            return Ok(cls);
+        if unsafe { class_cell_of::<C>(value.as_js_value()) }.is_some() {
+            // SAFETY: only an object can be an instance of a class
+            return Ok(Class(unsafe { value.ref_object() }.clone(), PhantomData));
         }
-        Err(Error::FromJs {
-            from: value.type_name(),
-            to: C::NAME,
-            message: None,
-        })
+        Err(not_an_instance::<C>(value))
     }
 
     /// Turn the class into a value.
@@ -389,35 +384,7 @@ impl<'js, C: JsClass<'js>> Class<'js, C> {
 impl<'js> Object<'js> {
     /// Returns if the object is of a certain Rust class.
     pub fn instance_of<C: JsClass<'js>>(&self) -> bool {
-        let id = class_id::<C>();
-
-        // This checks if the class is of the right class id.
-        let Some(x) = NonNull::new(unsafe {
-            qjs::JS_GetOpaque2(self.0.ctx.as_ptr(), self.0.as_js_value(), id)
-        }) else {
-            // `JS_GetOpaque2` throws a `TypeError` internally whenever the class id
-            // doesn't match, leaving it pending on the runtime even though a
-            // negative result here is an ordinary, expected outcome. Clear it so a
-            // failed `instance_of` can't be mistaken for a real exception by code
-            // that later checks `Ctx::has_exception`/`Ctx::catch` for something
-            // unrelated (e.g. a pending `Promise`).
-            self.ctx.catch();
-            return false;
-        };
-
-        let v_table = unsafe { x.cast::<ClassCell<()>>().as_ref().v_table };
-
-        // If the pointer is equal it must be of the right type, as the inclusion of a call to
-        // generate a TypeId means that each type must have a unique v table.
-        // however if it is not equal then it can still be the right type if the v_table is
-        // duplicated, which is possible when compilation with multiple code-gen units.
-        //
-        // Doing check avoids a lookup and an dynamic function call in some cases.
-        if core::ptr::eq(v_table, VTable::get::<C>()) {
-            return true;
-        }
-
-        v_table.is_of_class::<C>()
+        unsafe { class_cell_of::<C>(self.0.as_js_value()) }.is_some()
     }
 
     /// Turn the object into the class if it is an instance of that class.
@@ -462,6 +429,40 @@ fn class_id<'js, C: JsClass<'js>>() -> qjs::JSClassID {
     }
 }
 
+/// Returns the cell of `value` if it is an instance of the class `C`.
+#[inline]
+unsafe fn class_cell_of<'js, C: JsClass<'js>>(
+    value: qjs::JSValueConst,
+) -> Option<NonNull<ClassCell<JsCell<'js, C>>>> {
+    // `JS_GetOpaque` checks the tag and the class id, and returns NULL on a mismatch without
+    // throwing (unlike `JS_GetOpaque2`, which creates a `TypeError`): a negative answer is an
+    // ordinary outcome here.
+    let ptr = qjs::JS_GetOpaque(value, class_id::<C>());
+    let cell = NonNull::new(ptr)?.cast::<ClassCell<()>>();
+    let v_table = cell.as_ref().v_table;
+
+    // If the pointer is equal it must be of the right type, as the inclusion of a call to
+    // generate a TypeId means that each type must have a unique v table.
+    // however if it is not equal then it can still be the right type if the v_table is
+    // duplicated, which is possible when compilation with multiple code-gen units.
+    //
+    // Doing check avoids a lookup and an dynamic function call in some cases.
+    if core::ptr::eq(v_table, VTable::get::<C>()) || v_table.is_of_class::<C>() {
+        Some(cell.cast())
+    } else {
+        None
+    }
+}
+
+#[cold]
+fn not_an_instance<'js, C: JsClass<'js>>(value: &Value<'js>) -> Error {
+    Error::FromJs {
+        from: value.type_name(),
+        to: C::NAME,
+        message: None,
+    }
+}
+
 #[cfg(test)]
 mod test {
     use core::sync::atomic::AtomicI32;
@@ -471,7 +472,9 @@ mod test {
     };
 
     use crate::{
-        class::{ClassKind, JsClass, Readable, Trace, Tracer, Writable},
+        class::{
+            ClassKind, JsClass, OwnedBorrow, OwnedBorrowMut, Readable, Trace, Tracer, Writable,
+        },
         function::This,
         test_with,
         value::Constructor,
@@ -676,34 +679,34 @@ mod test {
         })
     }
 
+    pub struct X;
+
+    impl<'js> Trace<'js> for X {
+        fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+    }
+
+    unsafe impl<'js> JsLifetime<'js> for X {
+        type Changed<'to> = X;
+    }
+
+    impl<'js> JsClass<'js> for X {
+        const NAME: &'static str = "X";
+
+        type Mutable = Readable;
+
+        fn prototype(ctx: &crate::Ctx<'js>) -> crate::Result<Option<Object<'js>>> {
+            let object = Object::new(ctx.clone())?;
+            object.set("foo", "bar")?;
+            Ok(Some(object))
+        }
+
+        fn constructor(_ctx: &crate::Ctx<'js>) -> crate::Result<Option<Constructor<'js>>> {
+            Ok(None)
+        }
+    }
+
     #[test]
     fn get_prototype() {
-        pub struct X;
-
-        impl<'js> Trace<'js> for X {
-            fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
-        }
-
-        unsafe impl<'js> JsLifetime<'js> for X {
-            type Changed<'to> = X;
-        }
-
-        impl<'js> JsClass<'js> for X {
-            const NAME: &'static str = "X";
-
-            type Mutable = Readable;
-
-            fn prototype(ctx: &crate::Ctx<'js>) -> crate::Result<Option<Object<'js>>> {
-                let object = Object::new(ctx.clone())?;
-                object.set("foo", "bar")?;
-                Ok(Some(object))
-            }
-
-            fn constructor(_ctx: &crate::Ctx<'js>) -> crate::Result<Option<Constructor<'js>>> {
-                Ok(None)
-            }
-        }
-
         test_with(|ctx| {
             let proto = Class::<X>::prototype(&ctx).unwrap().unwrap();
             assert_eq!(proto.get::<_, String>("foo").unwrap(), "bar")
@@ -730,6 +733,27 @@ mod test {
             // The context must still be perfectly usable afterwards.
             let sum: i32 = ctx.eval("1 + 1").unwrap();
             assert_eq!(sum, 2);
+        })
+    }
+
+    #[test]
+    fn class_check_keeps_pending_exception() {
+        test_with(|ctx| {
+            let plain = Object::new(ctx.clone()).unwrap();
+            // an instance of another Rust class, with the same class id as `Vec3`
+            let other = Class::instance(ctx.clone(), X).unwrap();
+            let int = 1.into_js(&ctx).unwrap();
+            let thrown = 42.into_js(&ctx).unwrap();
+
+            let _ = ctx.throw(thrown);
+            // a negative answer creates no `TypeError`: the pending exception stays
+            assert!(!plain.instance_of::<Vec3>());
+            assert!(!other.instance_of::<Vec3>());
+            assert!(Class::<Vec3>::from_value(plain.as_value()).is_err());
+            assert!(Class::<Vec3>::from_js(&ctx, other.into_value()).is_err());
+            assert!(OwnedBorrow::<Vec3>::from_js(&ctx, int.clone()).is_err());
+            assert!(OwnedBorrowMut::<Vec3>::from_js(&ctx, int).is_err());
+            assert_eq!(ctx.catch().as_int(), Some(42));
         })
     }
 
