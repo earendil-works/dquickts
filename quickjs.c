@@ -574,6 +574,9 @@ struct JSContext {
     JSShape *mapped_arguments_shape;  /* shape for mapped arguments objects */
     JSShape *regexp_shape;  /* shape for regexp objects */
     JSShape *regexp_result_shape;  /* shape for regexp result objects */
+    /* shapes of the Error objects with a 'message' property, created
+       on first use (see js_get_error_shape()) */
+    JSShape *error_shape[JS_NATIVE_ERROR_COUNT + 1];
 
     JSValue *class_proto;
     JSValue function_proto;
@@ -3191,6 +3194,11 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
 
     if (ctx->regexp_result_shape)
         mark_func(rt, &ctx->regexp_result_shape->header);
+
+    for(i = 0; i <= JS_NATIVE_ERROR_COUNT; i++) {
+        if (ctx->error_shape[i])
+            mark_func(rt, &ctx->error_shape[i]->header);
+    }
 }
 
 /* called by JS_FreeContext() when the last reference is released */
@@ -3263,6 +3271,8 @@ void __JS_FreeContext(JSContext *ctx)
     js_free_shape_null(ctx->rt, ctx->mapped_arguments_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
+    for(i = 0; i <= JS_NATIVE_ERROR_COUNT; i++)
+        js_free_shape_null(ctx->rt, ctx->error_shape[i]);
 
     list_del(&ctx->link);
     remove_gc_object(&ctx->header);
@@ -9236,8 +9246,96 @@ JSValue JS_NewError(JSContext *ctx)
     return JS_NewObjectClass(ctx, JS_CLASS_ERROR);
 }
 
+/* prototype of the Error objects of kind 'error_num' */
+static inline JSValueConst js_get_error_proto(JSContext *ctx,
+                                              JSErrorEnum error_num)
+{
+    if (error_num == JS_PLAIN_ERROR)
+        return ctx->class_proto[JS_CLASS_ERROR];
+    else
+        return ctx->native_error_proto[error_num];
+}
+
+/* Set and return the hashed shape of the Error objects of prototype
+   'proto' (the prototype of the errors of kind 'error_num') having
+   only an own 'message' property (the shape that adding the message
+   to a new error gives) or return NULL if out of memory. It is kept
+   by the context so that creating an error does not create and free
+   shapes. */
+static no_inline JSShape *js_new_error_shape(JSContext *ctx,
+                                             JSErrorEnum error_num,
+                                             JSObject *proto)
+{
+    JSShape *sh, *sh0;
+    const int flags = JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE;
+
+    sh = NULL;
+    sh0 = find_hashed_shape_proto(ctx->rt, proto);
+    if (sh0)
+        sh = find_hashed_shape_prop(ctx->rt, sh0, JS_ATOM_message, flags);
+    if (sh) {
+        sh = js_dup_shape(sh);
+    } else {
+        sh = js_new_shape(ctx, proto);
+        if (!sh)
+            return NULL;
+        if (add_shape_property(ctx, &sh, NULL, JS_ATOM_message, flags)) {
+            js_free_shape(ctx->rt, sh);
+            return NULL;
+        }
+    }
+    /* the previous one may have been created during the context
+       initialization with a different prototype */
+    js_free_shape_null(ctx->rt, ctx->error_shape[error_num]);
+    ctx->error_shape[error_num] = sh;
+    return sh;
+}
+
+/* Return a new Error object of prototype 'proto' whose message is
+   'msg' (string, freed) or none if 'msg' is not a string, or
+   JS_EXCEPTION. Same as creating the object and defining 'message'
+   but the error shape of the context is used if 'proto' is the
+   prototype of the errors of kind 'error_num'. */
+static JSValue js_new_error_object(JSContext *ctx, JSValueConst proto,
+                                   JSErrorEnum error_num, JSValue msg)
+{
+    JSValue obj;
+    JSShape *sh;
+    JSProperty prop;
+    JSObject *proto_obj;
+
+    if (likely(JS_IsString(msg))) {
+        proto_obj = get_proto_obj(proto);
+        sh = ctx->error_shape[error_num];
+        if (unlikely(!sh || sh->proto != proto_obj)) {
+            if (proto_obj == get_proto_obj(js_get_error_proto(ctx, error_num)))
+                sh = js_new_error_shape(ctx, error_num, proto_obj);
+            else
+                sh = NULL; /* subclass or other realm */
+        }
+        if (likely(sh)) {
+            prop.u.value = msg;
+            return JS_NewObjectFromShape(ctx, js_dup_shape(sh),
+                                         JS_CLASS_ERROR, &prop);
+        }
+    }
+    obj = JS_NewObjectProtoClass(ctx, proto, JS_CLASS_ERROR);
+    if (unlikely(JS_IsException(obj))) {
+        JS_FreeValue(ctx, msg);
+        return obj;
+    }
+    if (JS_IsString(msg)) {
+        JS_DefinePropertyValue(ctx, obj, JS_ATOM_message, msg,
+                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    } else {
+        JS_FreeValue(ctx, msg);
+    }
+    return obj;
+}
+
 /* return an error object of type 'error_num' whose message is the
-   UTF-8 string 'msg' of 'len' bytes or JS_EXCEPTION */
+   UTF-8 string 'msg' of 'len' bytes or JS_EXCEPTION. The message is
+   omitted if out of memory. */
 static JSValue JS_MakeErrorLen(JSContext *ctx, JSErrorEnum error_num,
                                const char *msg, size_t len,
                                BOOL add_backtrace)
@@ -9245,15 +9343,10 @@ static JSValue JS_MakeErrorLen(JSContext *ctx, JSErrorEnum error_num,
     JSValue obj;
 
     assert(error_num <= JS_PLAIN_ERROR);
-    obj = JS_NewObjectProtoClass(ctx, error_num == JS_PLAIN_ERROR ?
-                                 ctx->class_proto[JS_CLASS_ERROR] :
-                                 ctx->native_error_proto[error_num],
-                                 JS_CLASS_ERROR);
+    obj = js_new_error_object(ctx, js_get_error_proto(ctx, error_num),
+                              error_num, JS_NewStringLen(ctx, msg, len));
     if (unlikely(JS_IsException(obj)))
         return obj;
-    JS_DefinePropertyValue(ctx, obj, JS_ATOM_message,
-                           JS_NewStringLen(ctx, msg, len),
-                           JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
     if (add_backtrace) {
         build_backtrace(ctx, obj, NULL, 0, 0, 0);
     }
@@ -52459,10 +52552,6 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
         }
         proto = JS_DupValue(ctx, proto1);
     }
-    obj = JS_NewObjectProtoClass(ctx, proto, JS_CLASS_ERROR);
-    JS_FreeValue(ctx, proto);
-    if (JS_IsException(obj))
-        return obj;
     if (magic == JS_AGGREGATE_ERROR)
         arg_index = 1;
     else if (magic == JS_SUPPRESSED_ERROR)
@@ -52470,14 +52559,22 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
     else
         arg_index = 0;
 
+    /* the object is created after the message conversion (not
+       observable) so that it is created with its final shape */
     message = argv[arg_index++];
+    msg = JS_UNDEFINED;
     if (!JS_IsUndefined(message)) {
         msg = JS_ToString(ctx, message);
-        if (unlikely(JS_IsException(msg)))
-            goto exception;
-        JS_DefinePropertyValue(ctx, obj, JS_ATOM_message, msg,
-                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+        if (unlikely(JS_IsException(msg))) {
+            JS_FreeValue(ctx, proto);
+            return msg;
+        }
     }
+    obj = js_new_error_object(ctx, proto,
+                              magic < 0 ? JS_PLAIN_ERROR : magic, msg);
+    JS_FreeValue(ctx, proto);
+    if (JS_IsException(obj))
+        return obj;
 
     /* SuppressedError has no options argument */
     if (arg_index < argc && magic != JS_SUPPRESSED_ERROR) {
