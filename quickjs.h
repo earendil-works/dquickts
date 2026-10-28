@@ -1140,6 +1140,10 @@ int JS_SetPropertyInt64(JSContext *ctx, JSValueConst this_obj,
                         int64_t idx, JSValue val);
 int JS_SetPropertyStr(JSContext *ctx, JSValueConst this_obj,
                       const char *prop, JSValue val);
+/* same as JS_SetPropertyStr() with a UTF-8 key of 'len' bytes (not
+   necessarily zero terminated) */
+int JS_SetPropertyStrLen(JSContext *ctx, JSValueConst this_obj,
+                         const char *prop, size_t len, JSValue val);
 /* this_obj[prop] = val. 'prop' and 'val' are freed. 'flags' can be
    JS_PROP_THROW or JS_PROP_THROW_STRICT */
 int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,

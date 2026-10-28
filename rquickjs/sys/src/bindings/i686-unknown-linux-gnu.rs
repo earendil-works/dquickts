@@ -1452,6 +1452,15 @@ unsafe extern "C" {
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    pub fn JS_SetPropertyStrLen(
+        ctx: *mut JSContext,
+        this_obj: JSValue,
+        prop: *const ::core::ffi::c_char,
+        len: size_t,
+        val: JSValue,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn JS_SetPropertyValue(
         ctx: *mut JSContext,
         this_obj: JSValue,

@@ -12622,9 +12622,15 @@ int JS_SetPropertyInt64(JSContext *ctx, JSValueConst this_obj,
 int JS_SetPropertyStr(JSContext *ctx, JSValueConst this_obj,
                       const char *prop, JSValue val)
 {
+    return JS_SetPropertyStrLen(ctx, this_obj, prop, strlen(prop), val);
+}
+
+int JS_SetPropertyStrLen(JSContext *ctx, JSValueConst this_obj,
+                         const char *prop, size_t len, JSValue val)
+{
     JSAtom atom;
     int ret;
-    atom = JS_NewAtom(ctx, prop);
+    atom = JS_NewAtomLen(ctx, prop, len);
     if (atom == JS_ATOM_NULL) {
         JS_FreeValue(ctx, val);
         return -1;

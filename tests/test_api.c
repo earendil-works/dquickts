@@ -284,6 +284,32 @@ static void test_atom_string_data(JSContext *ctx)
     check_atom_data(ctx, eval_str(ctx, "Symbol.iterator"), "Symbol.iterator", NULL, 15);
 }
 
+static void test_set_property_str_len(JSContext *ctx)
+{
+    JSValue obj;
+
+    obj = JS_NewObject(ctx);
+    /* not zero terminated, non ASCII, embedded zero, integer key */
+    CHECK(JS_SetPropertyStrLen(ctx, obj, "abc", 2, JS_NewInt32(ctx, 1)) == 1);
+    CHECK(JS_SetPropertyStrLen(ctx, obj, "h\xc3\xa9llo", 6, JS_NewInt32(ctx, 2)) == 1);
+    CHECK(JS_SetPropertyStrLen(ctx, obj, "a\0b", 3, JS_NewInt32(ctx, 3)) == 1);
+    CHECK(JS_SetPropertyStrLen(ctx, obj, "12", 2, JS_NewInt32(ctx, 4)) == 1);
+    set_global(ctx, "o", obj);
+    CHECK(eval_bool(ctx, "JSON.stringify(o) === "
+                    "'{\"12\":4,\"ab\":1,\"h\\u00e9llo\":2,\"a\\\\u0000b\":3}'"));
+    /* setters are called, failures throw */
+    CHECK(eval_bool(ctx, "o = { set s(v) { this.r = v } };"
+                    "Object.defineProperty(o, 'ro', { value: 0 }); true"));
+    obj = eval_str(ctx, "o");
+    CHECK(JS_SetPropertyStrLen(ctx, obj, "s", 1, JS_NewInt32(ctx, 5)) == 1);
+    CHECK(JS_SetPropertyStrLen(ctx, obj, "ro", 2, JS_NewInt32(ctx, 6)) == -1);
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    CHECK(JS_SetPropertyStrLen(ctx, JS_UNDEFINED, "x", 1, JS_NewInt32(ctx, 7)) == -1);
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, obj);
+    CHECK(eval_bool(ctx, "o.r === 5 && o.ro === 0"));
+}
+
 static void test_numbers(JSContext *ctx)
 {
     JSValue v;
@@ -3168,6 +3194,7 @@ int main(void)
     test_promises(ctx);
     test_own_property_count(ctx);
     test_atom_string_data(ctx);
+    test_set_property_str_len(ctx);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 
