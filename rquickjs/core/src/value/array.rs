@@ -44,32 +44,26 @@ impl<'js> Array<'js> {
     }
 
     /// Get the value at an index in the JavaScript array.
-    #[inline]
     pub fn get<V: FromJs<'js>>(&self, idx: usize) -> Result<V> {
-        let val = self.get_value(idx)?;
-        V::from_js(self.ctx(), val)
-    }
-
-    /// Read the element at `idx`, borrowed from the fast array storage when it is there.
-    #[inline]
-    fn get_value(&self, idx: usize) -> Result<Value<'js>> {
         let ctx = self.ctx();
         let obj = self.0.as_js_value();
-        unsafe {
-            match fast_elements(ctx, obj) {
-                // Elements stored in a fast array are own data properties: reading them
-                // directly is what JS_GetPropertyUint32() would do. The pointer is used
-                // before any JS code can run.
-                Some((values, count)) if idx < count => {
-                    Ok(Value::from_js_value_const(ctx.clone(), *values.add(idx)))
-                }
-                _ => {
-                    let val = qjs::JS_GetPropertyUint32(ctx.as_ptr(), obj, idx as _);
-                    let val = ctx.handle_exception(val)?;
-                    Ok(Value::from_js_value(ctx.clone(), val))
-                }
+        let val = unsafe {
+            let mut values: *mut qjs::JSValue = ptr::null_mut();
+            let mut count: u32 = 0;
+            // Elements stored in a fast array are own data properties: reading them
+            // directly is what JS_GetPropertyUint32() would do. The pointer is used
+            // before any JS code can run.
+            if qjs::JS_GetFastArray(ctx.as_ptr(), obj, &mut values, &mut count) != 0
+                && idx < count as usize
+            {
+                Value::from_js_value_const(ctx.clone(), *values.add(idx))
+            } else {
+                let val = qjs::JS_GetPropertyUint32(ctx.as_ptr(), obj, idx as _);
+                let val = ctx.handle_exception(val)?;
+                Value::from_js_value(ctx.clone(), val)
             }
-        }
+        };
+        V::from_js(ctx, val)
     }
 
     /// Convert the elements `0..len()` in order, `len()` being read once at the start.

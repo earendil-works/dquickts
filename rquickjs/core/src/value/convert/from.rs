@@ -535,8 +535,8 @@ mod test {
         test_with(|ctx| {
             let src = "({ b: 2, a: 1, 0: 0 })";
             let map: BTreeMap<StdString, i32> = ctx.eval(src).unwrap();
-            let expected = [("0", 0), ("a", 1), ("b", 2)].map(|(k, v)| (StdString::from(k), v));
-            assert_eq!(map, BTreeMap::from(expected));
+            assert_eq!(map.keys().collect::<Vec<_>>(), ["0", "a", "b"]);
+            assert_eq!(map.values().copied().collect::<Vec<_>>(), [0, 1, 2]);
             let map: HashMap<StdString, i32> = ctx.eval(src).unwrap();
             assert_eq!(map.len(), 3);
             assert_eq!((map["0"], map["a"], map["b"]), (0, 1, 2));
@@ -547,7 +547,8 @@ mod test {
             let err = ctx.eval::<BTreeMap<StdString, i32>, _>(src).unwrap_err();
             assert!(matches!(err, Error::Exception));
             assert_eq!(ctx.catch().get::<StdString>().unwrap(), "getter");
-            assert!(ctx.eval::<HashMap<StdString, i32>, _>("({ a: 'x' })").is_err());
+            let src = "({ a: 'x' })";
+            assert!(ctx.eval::<HashMap<StdString, i32>, _>(src).is_err());
             assert!(ctx.eval::<HashMap<StdString, i32>, _>("1").is_err());
         })
     }
