@@ -1451,7 +1451,10 @@ are only compiled if @code{ENABLE_DUMPS} is defined (Makefile:
 
 Use @code{JS_SetInterruptHandler()} to set a callback which is
 regularly called by the engine when it is executing code. This
-callback can be used to implement an execution timeout.
+callback can be used to implement an execution timeout. It is also
+called during the long BigInt operations (multiplication, division,
+power, conversions from and to strings) so that they can be
+interrupted.
 
 It is used by the command line interpreter to implement a
 @code{Ctrl-C} handler.

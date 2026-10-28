@@ -9012,6 +9012,27 @@ static inline __exception int js_poll_interrupts(JSContext *ctx)
     }
 }
 
+static no_inline __exception int __js_poll_interrupts_cost(JSContext *ctx,
+                                                           int cost)
+{
+    /* the early polls to reach a suspension point count the work too */
+    if (ctx->suspend_poll_budget > 0)
+        ctx->suspend_poll_budget = max_int(ctx->suspend_poll_budget - cost, 0) + 1;
+    return __js_poll_interrupts(ctx);
+}
+
+/* poll for a native operation doing about the work of 'cost' polls
+   (0 <= cost <= INT32_MAX) before it is done */
+static inline __exception int js_poll_interrupts_cost(JSContext *ctx, int cost)
+{
+    if (likely(ctx->interrupt_counter > cost)) {
+        ctx->interrupt_counter -= cost;
+        return 0;
+    } else {
+        return __js_poll_interrupts_cost(ctx, cost);
+    }
+}
+
 static void JS_SetImmutablePrototype(JSContext *ctx, JSValueConst obj)
 {
     JSObject *p;
@@ -12613,6 +12634,31 @@ static inline int to_digit(int c)
 
 #define JS_BIGINT_MAX_SIZE ((1024 * 1024) / JS_LIMB_BITS) /* in limbs */
 
+/* Interrupt counter cost of 'n' limb multiply-accumulates: one poll
+   is about the time of 4 of them. The quadratic BigInt operations
+   poll before each row of work so that they can be interrupted and
+   the interrupt handler is called at its usual rate. */
+static inline int js_bigint_poll_cost(int n)
+{
+    return n >> 2;
+}
+
+/* minimum row length polled individually (the polls of shorter rows
+   would be a measurable overhead) */
+#define JS_BIGINT_POLL_ROW_LEN 64
+
+/* Poll for 'n_rows' rows of 'row_len' limb multiply-accumulates. If
+   the rows are short, the whole operation is charged now. Return the
+   cost to charge before each row (0 if none) or -1 if interrupted. */
+static inline int js_bigint_poll_rows(JSContext *ctx, int row_len, int n_rows)
+{
+    if (row_len >= JS_BIGINT_POLL_ROW_LEN)
+        return js_bigint_poll_cost(row_len);
+    if (js_poll_interrupts_cost(ctx, js_bigint_poll_cost(row_len * n_rows)))
+        return -1;
+    return 0;
+}
+
 /* it is currently assumed that JS_SHORT_BIG_INT_BITS = JS_LIMB_BITS */
 #if JS_SHORT_BIG_INT_BITS == 32
 #define JS_SHORT_BIG_INT_MIN INT32_MIN
@@ -12745,19 +12791,25 @@ static js_limb_t mp_add_mul1(js_limb_t *tabr, const js_limb_t *taba, js_limb_t n
     return l;
 }
 
-/* size of the result : op1_size + op2_size. */
-static void mp_mul_basecase(js_limb_t *result,
-                            const js_limb_t *op1, js_limb_t op1_size,
-                            const js_limb_t *op2, js_limb_t op2_size)
+/* size of the result : op1_size + op2_size. Return -1 if interrupted. */
+static __exception int mp_mul_basecase(JSContext *ctx, js_limb_t *result,
+                                       const js_limb_t *op1, js_limb_t op1_size,
+                                       const js_limb_t *op2, js_limb_t op2_size)
 {
-    int i;
+    int i, cost;
     js_limb_t r;
     
+    cost = js_bigint_poll_rows(ctx, op1_size, op2_size);
+    if (cost < 0)
+        return -1;
     result[op1_size] = mp_mul1(result, op1, op1_size, op2[0], 0);
     for(i=1;i<op2_size;i++) {
+        if (cost > 0 && js_poll_interrupts_cost(ctx, cost))
+            return -1;
         r = mp_add_mul1(result + i, op1, op1_size, op2[i]);
         result[i + op1_size] = r;
     }
+    return 0;
 }
 
 /* tabr[] -= taba[] * b. Return the value to substract to the high
@@ -12836,17 +12888,19 @@ static js_limb_t mp_div1norm(js_limb_t *tabr, const js_limb_t *taba, js_limb_t n
 /* base case division: divides taba[0..na-1] by tabb[0..nb-1]. tabb[nb
    - 1] must be >= 1 << (JS_LIMB_BITS - 1). na - nb must be >= 0. 'taba'
    is modified and contains the remainder (nb limbs). tabq[0..na-nb]
-   contains the quotient with tabq[na - nb] <= 1. */
-static void mp_divnorm(js_limb_t *tabq, js_limb_t *taba, js_limb_t na,
-                       const js_limb_t *tabb, js_limb_t nb)
+   contains the quotient with tabq[na - nb] <= 1. Return -1 if
+   interrupted. */
+static __exception int mp_divnorm(JSContext *ctx, js_limb_t *tabq,
+                                  js_limb_t *taba, js_limb_t na,
+                                  const js_limb_t *tabb, js_limb_t nb)
 {
     js_limb_t r, a, c, q, v, b1, b1_inv, n, dummy_r;
-    int i, j;
+    int i, j, cost;
 
     b1 = tabb[nb - 1];
     if (nb == 1) {
         taba[0] = mp_div1norm(tabq, taba, na, b1, 0);
-        return;
+        return 0;
     }
     n = na - nb;
 
@@ -12869,7 +12923,12 @@ static void mp_divnorm(js_limb_t *tabq, js_limb_t *taba, js_limb_t na,
         mp_sub(taba + n, taba + n, tabb, nb, 0);
     }
 
+    cost = js_bigint_poll_rows(ctx, nb, n);
+    if (cost < 0)
+        return -1;
     for(i = n - 1; i >= 0; i--) {
+        if (cost > 0 && js_poll_interrupts_cost(ctx, cost))
+            return -1;
         if (unlikely(taba[i + nb] >= b1)) {
             q = -1;
         } else if (b1_inv) {
@@ -12902,6 +12961,7 @@ static void mp_divnorm(js_limb_t *tabq, js_limb_t *taba, js_limb_t na,
         }
         tabq[i] = q;
     }
+    return 0;
 }
 
 /* 1 <= shift <= JS_LIMB_BITS - 1 */
@@ -13213,7 +13273,10 @@ static JSBigInt *js_bigint_mul(JSContext *ctx, const JSBigInt *a,
     r = js_bigint_new(ctx, a->len + b->len);
     if (!r)
         return NULL;
-    mp_mul_basecase(r->tab, a->tab, a->len, b->tab, b->len);
+    if (mp_mul_basecase(ctx, r->tab, a->tab, a->len, b->tab, b->len)) {
+        js_free(ctx, r);
+        return NULL;
+    }
     /* correct the result if negative operands (no overflow is
        possible) */
     if (js_bigint_sign(a))
@@ -13303,7 +13366,12 @@ static JSBigInt *js_bigint_divrem(JSContext *ctx, const JSBigInt *a,
 
     //    js_bigint_dump1(ctx, "a", r->tab, na);
     //    js_bigint_dump1(ctx, "b", tabb, nb);
-    mp_divnorm(q->tab, r->tab, na, tabb, nb);
+    if (mp_divnorm(ctx, q->tab, r->tab, na, tabb, nb)) {
+        js_free(ctx, q);
+        js_free(ctx, r);
+        js_free(ctx, tabb);
+        return NULL;
+    }
     js_free(ctx, tabb);
 
     if (is_rem) {
@@ -13855,6 +13923,11 @@ static JSBigInt *js_bigint_from_string(JSContext *ctx,
             if (len == 1 && r->tab[0] == 0) {
                 r->tab[0] = v;
             } else {
+                if (len >= JS_BIGINT_POLL_ROW_LEN &&
+                    js_poll_interrupts_cost(ctx, js_bigint_poll_cost(len))) {
+                    js_free(ctx, r);
+                    return NULL;
+                }
                 h = mp_mul1(r->tab, r->tab, len, js_pow_dec[i], v);
                 if (h != 0) {
                     r->tab[len++] = h;
@@ -13982,7 +14055,9 @@ static const js_limb_t radix_base_table[JS_RADIX_MAX - 1] = {
 #endif
 };
 
-static JSValue js_bigint_to_string1(JSContext *ctx, JSValueConst val, int radix)
+/* the conversion polls for interrupts if 'is_interruptible' is TRUE */
+static JSValue js_bigint_to_string1(JSContext *ctx, JSValueConst val, int radix,
+                                    BOOL is_interruptible)
 {
     if (JS_VALUE_GET_TAG(val) == JS_TAG_SHORT_BIG_INT) {
         char buf[66];
@@ -14047,6 +14122,14 @@ static JSValue js_bigint_to_string1(JSContext *ctx, JSValueConst val, int radix)
                     }
                     break;
                 } else {
+                    /* a limb division costs about 16 multiply-accumulates
+                       so polling each row is not an overhead */
+                    if (is_interruptible &&
+                        js_poll_interrupts_cost(ctx, js_bigint_poll_cost(16 * len))) {
+                        js_free(ctx, tmp);
+                        js_free(ctx, buf);
+                        return JS_EXCEPTION;
+                    }
                     v = mp_div1(r->tab, r->tab, len, radix_base, 0);
                     q = limb_to_a(q, v, radix, digits_per_limb_table[radix - 2]);
                 }
@@ -14935,7 +15018,7 @@ static BOOL JS_NumberIsNegativeOrMinusZero(JSContext *ctx, JSValueConst val)
 
 static JSValue js_bigint_to_string(JSContext *ctx, JSValueConst val)
 {
-    return js_bigint_to_string1(ctx, val, 10);
+    return js_bigint_to_string1(ctx, val, 10, TRUE);
 }
 
 static JSValue js_dtoa2(JSContext *ctx,
@@ -15694,7 +15777,8 @@ static void js_print_value(JSPrintValueState *s, JSValueConst val)
         break;
     case JS_TAG_BIG_INT:
         if (!s->options.raw_dump && s->ctx) {
-            JSValue str = js_bigint_to_string(s->ctx, val);
+            /* not interruptible: the exception could not be reported */
+            JSValue str = js_bigint_to_string1(s->ctx, val, 10, FALSE);
             if (JS_IsException(str))
                 goto raw_bigint;
             js_print_raw_string(s, str);
@@ -17018,12 +17102,20 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
               tag_is_string(tag1)))) {
             if (tag_is_string(tag1)) {
                 op1 = JS_StringToBigInt(ctx, op1);
+                if (JS_IsException(op1)) {
+                    JS_FreeValue(ctx, op2);
+                    goto exception;
+                }
                 if (JS_VALUE_GET_TAG(op1) != JS_TAG_BIG_INT &&
                     JS_VALUE_GET_TAG(op1) != JS_TAG_SHORT_BIG_INT)
                     goto invalid_bigint_string;
             }
             if (tag_is_string(tag2)) {
                 op2 = JS_StringToBigInt(ctx, op2);
+                if (JS_IsException(op2)) {
+                    JS_FreeValue(ctx, op1);
+                    goto exception;
+                }
                 if (JS_VALUE_GET_TAG(op2) != JS_TAG_BIG_INT &&
                     JS_VALUE_GET_TAG(op2) != JS_TAG_SHORT_BIG_INT) {
                 invalid_bigint_string:
@@ -17153,12 +17245,20 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
             tag2 == JS_TAG_BIG_INT || tag2 == JS_TAG_SHORT_BIG_INT) {
             if (tag_is_string(tag1)) {
                 op1 = JS_StringToBigInt(ctx, op1);
+                if (JS_IsException(op1)) {
+                    JS_FreeValue(ctx, op2);
+                    goto exception;
+                }
                 if (JS_VALUE_GET_TAG(op1) != JS_TAG_BIG_INT &&
                     JS_VALUE_GET_TAG(op1) != JS_TAG_SHORT_BIG_INT)
                     goto invalid_bigint_string;
             }
             if (tag_is_string(tag2)) {
                 op2 = JS_StringToBigInt(ctx, op2);
+                if (JS_IsException(op2)) {
+                    JS_FreeValue(ctx, op1);
+                    goto exception;
+                }
                 if (JS_VALUE_GET_TAG(op2) != JS_TAG_BIG_INT &&
                     JS_VALUE_GET_TAG(op2) != JS_TAG_SHORT_BIG_INT ) {
                 invalid_bigint_string:
@@ -69249,7 +69349,7 @@ static JSValue js_bigint_toString(JSContext *ctx, JSValueConst this_val,
         if (base < 0)
             goto fail;
     }
-    ret = js_bigint_to_string1(ctx, val, base);
+    ret = js_bigint_to_string1(ctx, val, base, TRUE);
     JS_FreeValue(ctx, val);
     return ret;
  fail:

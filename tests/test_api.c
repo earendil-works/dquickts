@@ -1942,6 +1942,68 @@ static void test_bigint_pow_leak(void)
     JS_FreeRuntime(rt);
 }
 
+static int poll_count, poll_limit;
+
+static int counting_interrupt_handler(JSRuntime *rt, void *opaque)
+{
+    poll_count++;
+    return poll_limit > 0 && poll_count >= poll_limit;
+}
+
+/* return the number of interrupt polls during the evaluation of 'str'
+   which is interrupted at the poll 'limit' if limit > 0 */
+static int count_polls(JSContext *ctx, const char *str, int limit)
+{
+    JSValue val;
+
+    poll_count = 0;
+    poll_limit = limit;
+    val = eval_str(ctx, str);
+    if (limit > 0) {
+        CHECK(JS_IsException(val));
+        CHECK(JS_IsUncatchableException(ctx));
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    } else {
+        CHECK(!JS_IsException(val));
+        JS_FreeValue(ctx, val);
+    }
+    return poll_count;
+}
+
+/* the long BigInt operations and regexp executions poll the interrupt
+   handler at its usual rate and can be interrupted (upstream
+   bellard/quickjs issue 546) */
+static void test_interrupt_polls(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSValue val;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    val = eval_str(ctx, "var a = BigInt('0x' + 'f'.repeat(20000)),"
+                   "b = BigInt('0x' + 'f'.repeat(10000)),"
+                   "c = (1n << 500000n) - 1n, d = '9'.repeat(100000);");
+    CHECK(!JS_IsException(val));
+    JS_FreeValue(ctx, val);
+    JS_SetInterruptHandler(rt, counting_interrupt_handler, NULL);
+
+    CHECK(count_polls(ctx, "for (let i = 0; i < 10; i++) a / b;", 0) >= 50);
+    CHECK(count_polls(ctx, "for (let i = 0; i < 10; i++) a * b;", 0) >= 50);
+    CHECK(count_polls(ctx, "for (let i = 0; i < 10; i++) b ** 2n;", 0) >= 50);
+    /* a single long operation is interrupted */
+    count_polls(ctx, "try { c * c } catch (e) {}", 3);
+    count_polls(ctx, "try { c / (c >> 250000n) } catch (e) {}", 3);
+    count_polls(ctx, "try { String(c) } catch (e) {}", 3);
+    count_polls(ctx, "try { BigInt(d) } catch (e) {}", 3);
+    /* the interruption is not ignored by the comparison */
+    count_polls(ctx, "try { d < 1n } catch (e) {}", 3);
+    count_polls(ctx, "try { d == 1n } catch (e) {}", 3);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     JSRuntime *rt;
@@ -1961,6 +2023,7 @@ int main(void)
     test_weak_map_ephemeron();
     test_trigger_interrupt();
     test_bigint_pow_leak();
+    test_interrupt_polls();
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);
