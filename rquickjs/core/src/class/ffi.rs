@@ -19,6 +19,7 @@ unsafe fn throw_missing_data(ctx: *mut qjs::JSContext) -> qjs::JSValue {
 
 /// An uncounted copy of the context of a value given to an exotic hook, which the hook lends to
 /// the class: the engine keeps the context alive while it runs the hook.
+#[inline]
 unsafe fn hook_ctx<'js>(ctx: &Ctx<'js>) -> mem::ManuallyDrop<Ctx<'js>> {
     mem::ManuallyDrop::new(core::ptr::read(ctx))
 }
