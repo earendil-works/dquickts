@@ -115,8 +115,10 @@ function test_write_file()
 {
     var fname = "tmp_write_file.txt", ta, f;
 
-    /* only the bytes of the typed array view are written */
-    ta = new Uint16Array([0x6968, 0x6a6b, 0x6c6d]);
+    /* only the bytes of the typed array view are written (the bytes are
+       set with an Uint8Array so that the test does not depend on the
+       endianness) */
+    ta = new Uint16Array(new Uint8Array([0x68, 0x69, 0x6b, 0x6a, 0x6d, 0x6c]).buffer);
     std.writeFile(fname, ta.subarray(1, 2));
     assert(std.loadFile(fname), "kj");
     std.writeFile(fname, ta.buffer);
