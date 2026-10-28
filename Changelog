@@ -150,10 +150,29 @@ unreleased:
     handled (#527); os.Worker throws a TypeError if no worker context
     function is set (#538)
   - Cygwin build (#575)
-  - crash when compiling under memory pressure (#531): a DynBuf stops
-    appending after an allocation error, a function whose bytecode
-    could not be emitted is not compiled, and push_scope() failures
-    stop the parser
+  - crashes when compiling under memory pressure (#528, #530, #531,
+    #532): a DynBuf stops appending after an allocation error, a
+    function whose bytecode could not be emitted is not compiled, and
+    the parser and the variable and label resolution no longer ignore
+    allocation failures
+  - long BigInt operations (multiplication, division, power, string
+    conversions) charge the interrupt counter and can be interrupted,
+    and the regexp steps use the context interrupt counter (#546)
+  - a growable SharedArrayBuffer shares its byte length between the
+    threads using it and can be posted to a Worker; without a
+    SharedArrayBuffer allocator, maxByteLength bytes are allocated
+    (#546)
+  - added JS_TriggerInterruptHandler() (#387)
+  - qjsc: the C modules (-M, std, os, bjson) can be imported with
+    import() (#423)
+  - the REPL prompt is "qjs> " (#564)
+- qjsc: the JSON, text and bytes modules imported with attributes are
+  found in the executable instead of being loaded at run time (added
+  JS_SetModuleAttributes(); js_std_eval_binary_json_module() takes the
+  module type)
+- Temporal and Intl load the time zones missing from the embedded data
+  from the system zoneinfo, so the default time zone is no longer
+  treated as UTC on such hosts; unknown time zone names are rejected
 
 2026-06-04:
 
