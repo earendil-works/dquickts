@@ -175,6 +175,7 @@ unsafe fn fast_elements(
 
 /// Storage of the converted elements of an [`ArrayBuilder`], owned until the array is made.
 pub(crate) trait PendingElements {
+    fn len(&self) -> usize;
     fn as_slice(&self) -> &[qjs::JSValue];
     /// Add a value, there is room for it.
     fn push(&mut self, value: qjs::JSValue);
@@ -183,6 +184,11 @@ pub(crate) trait PendingElements {
 }
 
 impl PendingElements for Vec<qjs::JSValue> {
+    #[inline]
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
     fn as_slice(&self) -> &[qjs::JSValue] {
         self
     }
@@ -213,6 +219,11 @@ impl<const N: usize> TupleElements<N> {
 }
 
 impl<const N: usize> PendingElements for TupleElements<N> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
     fn as_slice(&self) -> &[qjs::JSValue] {
         // the first `len` values are initialized
         unsafe { core::slice::from_raw_parts(self.values.as_ptr().cast(), self.len) }
@@ -239,12 +250,16 @@ impl<const N: usize> PendingElements for TupleElements<N> {
 /// made from the kept elements and the next ones are set with `JS_SetPropertyUint32()`.
 pub(crate) struct ArrayBuilder<'a, 'js, P: PendingElements> {
     ctx: &'a Ctx<'js>,
-    /// Changed by the engine only, valid as long as the context.
-    std_array_prototype: *const qjs::c_int,
+    /// Non zero while the elements are kept: the engine's flag (changed by the engine only,
+    /// valid as long as the context) until the array is made, then `KEEP_NONE`.
+    keep: *const qjs::c_int,
     pending: P,
+    /// The array once made, and the index of its next element.
     array: Option<Array<'js>>,
     len: usize,
 }
+
+static KEEP_NONE: qjs::c_int = 0;
 
 impl<'a, 'js, P: PendingElements> ArrayBuilder<'a, 'js, P> {
     /// JS_NewArrayFrom() takes at most i32::MAX values
@@ -253,7 +268,7 @@ impl<'a, 'js, P: PendingElements> ArrayBuilder<'a, 'js, P> {
     pub(crate) fn new(ctx: &'a Ctx<'js>, pending: P) -> Self {
         Self {
             ctx,
-            std_array_prototype: unsafe { qjs::JS_GetStdArrayPrototypeFlag(ctx.as_ptr()) },
+            keep: unsafe { qjs::JS_GetStdArrayPrototypeFlag(ctx.as_ptr()) },
             pending,
             array: None,
             len: 0,
@@ -261,31 +276,43 @@ impl<'a, 'js, P: PendingElements> ArrayBuilder<'a, 'js, P> {
     }
 
     /// Set the next element.
+    ///
+    /// # Safety
+    /// `value` must be a value of the context, owned by the caller (consumed, even on failure).
     #[inline]
-    pub(crate) fn push(&mut self, value: Value<'js>) -> Result<()> {
-        let value = value.into_js_value();
+    pub(crate) unsafe fn push(&mut self, value: qjs::JSValue) -> Result<()> {
+        // a plain read: the pointer is never made a reference
+        if *self.keep != 0 && self.pending.len() < Self::MAX_PENDING {
+            self.pending.push(value);
+            Ok(())
+        } else {
+            self.set(value)
+        }
+    }
+
+    /// Set the next element with `JS_SetPropertyUint32()`, making the array first.
+    #[cold]
+    #[inline(never)]
+    unsafe fn set(&mut self, value: qjs::JSValue) -> Result<()> {
         let ctx = self.ctx.as_ptr();
-        let idx = self.len;
-        self.len += 1;
         let array = match &self.array {
             Some(array) => array.0.as_js_value(),
             None => {
-                // a plain read: the pointer is never made a reference
-                if idx < Self::MAX_PENDING && unsafe { *self.std_array_prototype } != 0 {
-                    self.pending.push(value);
-                    return Ok(());
-                }
+                self.keep = &KEEP_NONE;
+                self.len = self.pending.len();
                 match self.make_array() {
                     Ok(array) => self.array.insert(array).0.as_js_value(),
                     Err(error) => {
-                        unsafe { qjs::JS_FreeValue(ctx, value) };
+                        qjs::JS_FreeValue(ctx, value);
                         return Err(error);
                     }
                 }
             }
         };
+        let idx = self.len;
+        self.len += 1;
         // consumes the value, even on failure
-        if unsafe { qjs::JS_SetPropertyUint32(ctx, array, idx as _, value) } < 0 {
+        if qjs::JS_SetPropertyUint32(ctx, array, idx as _, value) < 0 {
             return Err(self.ctx.raise_exception());
         }
         Ok(())
@@ -404,7 +431,9 @@ where
         let capacity = iter.size_hint().0.min(i32::MAX as usize);
         let mut array = ArrayBuilder::new(ctx, Vec::with_capacity(capacity));
         for item in iter {
-            array.push(item.into_js(ctx)?)?;
+            let value = item.into_js_raw(ctx)?;
+            // an owned value of `ctx`
+            unsafe { array.push(value) }?;
         }
         array.finish()
     }

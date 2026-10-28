@@ -306,7 +306,11 @@ macro_rules! into_js_impls {
                     let ($($type,)*) = self.0;
                     const LEN: usize = 0 $(+ into_js_impls!(@one $type))*;
                     let mut array = ArrayBuilder::new(ctx, TupleElements::<LEN>::new());
-                    $(array.push($type.into_js(ctx)?)?;)*
+                    $(
+                        let value = $type.into_js_raw(ctx)?;
+                        // an owned value of `ctx`
+                        unsafe { array.push(value) }?;
+                    )*
                     Ok(array.finish()?.into_value())
                 }
             }
