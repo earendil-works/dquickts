@@ -368,6 +368,18 @@ impl<'js, C: JsClass<'js>> Class<'js, C> {
         Err(not_an_instance::<C>(value))
     }
 
+    /// Converts a value into the class, with the cell of the class, if it is an instance of the
+    /// class.
+    #[inline]
+    pub(crate) fn from_value_with_cell(
+        value: Value<'js>,
+    ) -> Result<(Self, NonNull<ClassCell<JsCell<'js, C>>>)> {
+        match unsafe { class_cell_of::<C>(value.as_js_value()) } {
+            Some(cell) => Ok((Class(Object(value), PhantomData), cell)),
+            None => Err(not_an_instance::<C>(&value)),
+        }
+    }
+
     /// Turn the class into a value.
     #[inline]
     pub fn into_value(self) -> Value<'js> {
@@ -410,7 +422,7 @@ impl<'js> Object<'js> {
 
 impl<'js, C: JsClass<'js>> FromJs<'js> for Class<'js, C> {
     fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-        Self::from_value(&value)
+        Self::from_value_with_cell(value).map(|(class, _)| class)
     }
 }
 
