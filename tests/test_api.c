@@ -2000,6 +2000,11 @@ static void test_interrupt_polls(void)
     count_polls(ctx, "try { d < 1n } catch (e) {}", 3);
     count_polls(ctx, "try { d == 1n } catch (e) {}", 3);
 
+    /* many short regexp executions */
+    CHECK(count_polls(ctx, "let re = /(a|aa)+b/, s = 'a'.repeat(13);"
+                      "for (let i = 0; i < 100; i++) re.test(s);", 0) >= 20);
+    count_polls(ctx, "try { /(a+)+b/.test('a'.repeat(40)) } catch (e) {}", 3);
+
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 }

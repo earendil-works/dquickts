@@ -59721,18 +59721,20 @@ int lre_check_stack_overflow(void *opaque, size_t alloca_size)
     return js_check_stack_overflow(ctx->rt, alloca_size);
 }
 
+/* the steps of the regexp execution are counted as interrupt polls so
+   that the interrupt handler is called at its usual rate when there
+   are many short executions */
+int *lre_get_interrupt_counter(void *opaque)
+{
+    JSContext *ctx = opaque;
+    return &ctx->interrupt_counter;
+}
+
+/* the interrupted exception is raised here */
 int lre_check_timeout(void *opaque)
 {
     JSContext *ctx = opaque;
-    JSRuntime *rt = ctx->rt;
-    JSStackFrame *saved_caller;
-    int interrupted;
-    if (!rt->interrupt_handler)
-        return 0;
-    saved_caller = js_host_callback_enter(rt);
-    interrupted = rt->interrupt_handler(rt, rt->interrupt_opaque);
-    js_host_callback_leave(rt, saved_caller);
-    return interrupted;
+    return __js_poll_interrupts(ctx);
 }
 
 void *lre_realloc(void *opaque, void *ptr, size_t size)
@@ -59891,11 +59893,9 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
                     goto fail;
             }
         } else {
-            if (rc == LRE_RET_TIMEOUT) {
-                JS_ThrowInterrupted(ctx);
-            } else {
+            /* the exception is already raised in case of timeout */
+            if (rc != LRE_RET_TIMEOUT)
                 JS_ThrowInternalError(ctx, "out of memory in regexp execution");
-            }
             goto fail;
         }
     } else {
@@ -60117,11 +60117,8 @@ static JSValue js_regexp_replace(JSContext *ctx, JSValueConst this_val, JSValueC
                         goto fail;
                 }
             } else {
-                if (ret == LRE_RET_TIMEOUT) {
-                    JS_ThrowInterrupted(ctx);
-                } else {
+                if (ret != LRE_RET_TIMEOUT)
                     JS_ThrowInternalError(ctx, "out of memory in regexp execution");
-                }
                 goto fail;
             }
             break;
