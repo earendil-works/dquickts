@@ -2661,12 +2661,10 @@ JSContext *JS_GetPendingJobContext(JSRuntime *rt)
     return list_entry(rt->job_list.next, JSJobEntry, link)->realm;
 }
 
-/* return < 0 if exception, 0 if no job pending, 1 if a job was
-   executed successfully. The context of the job is stored in '*pctx'
-   if pctx != NULL. It may be NULL if the context was already
-   destroyed or if no job was pending. The 'pctx' parameter is now
-   absolete. */
-int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
+/* Execute the first pending job ('rt->job_list' must not be empty).
+   Return -1 if it threw, 1 otherwise. The context of the job is stored
+   in '*pctx' if pctx != NULL (NULL if it was destroyed by the job). */
+static int js_execute_first_job(JSRuntime *rt, JSContext **pctx)
 {
     JSContext *ctx;
     JSJobEntry *e;
@@ -2674,13 +2672,6 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     int i, ret;
     BOOL saved_in_job;
 
-    if (list_empty(&rt->job_list)) {
-        if (pctx)
-            *pctx = NULL;
-        return 0;
-    }
-
-    /* get the first pending job and execute it */
     e = list_entry(rt->job_list.next, JSJobEntry, link);
     list_del(&e->link);
     ctx = e->realm;
@@ -2706,6 +2697,42 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     }
     JS_FreeContext(ctx);
     return ret;
+}
+
+/* return < 0 if exception, 0 if no job pending, 1 if a job was
+   executed successfully. The context of the job is stored in '*pctx'
+   if pctx != NULL. It may be NULL if the context was already
+   destroyed or if no job was pending. The 'pctx' parameter is now
+   absolete. */
+int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
+{
+    if (list_empty(&rt->job_list)) {
+        if (pctx)
+            *pctx = NULL;
+        return 0;
+    }
+    return js_execute_first_job(rt, pctx);
+}
+
+/* Execute the pending jobs in order, including the jobs they enqueue,
+   until the queue is empty or 'max_jobs' jobs were executed ('max_jobs'
+   < 0: no limit). Return the number of executed jobs and set '*pctx' to
+   NULL, or stop at the first job which throws and return -1 with
+   '*pctx' set as JS_ExecutePendingJob() does (the exception is pending
+   in it). Equivalent to calling JS_ExecutePendingJob() in a loop. */
+int JS_ExecutePendingJobs(JSRuntime *rt, int max_jobs, JSContext **pctx)
+{
+    int n;
+
+    if (max_jobs < 0)
+        max_jobs = INT_MAX;
+    for(n = 0; n < max_jobs && !list_empty(&rt->job_list); n++) {
+        if (js_execute_first_job(rt, pctx) < 0)
+            return -1;
+    }
+    if (pctx)
+        *pctx = NULL;
+    return n;
 }
 
 static inline uint32_t atom_get_free(const JSAtomStruct *p)

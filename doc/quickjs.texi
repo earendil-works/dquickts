@@ -1500,6 +1500,22 @@ are only compiled if @code{ENABLE_DUMPS} is defined (Makefile:
 @code{JS_GetDumpFlags()} returns 0. @code{JS_ABORT_ON_LEAKS} makes
 @code{JS_FreeRuntime()} abort on leaked objects, strings or atoms.
 
+@subsection Pending jobs
+
+Promise reactions and other jobs are queued in the runtime and run by
+the host. @code{JS_ExecutePendingJob(rt, &ctx)} runs the oldest one and
+returns 1, 0 if there was none, or -1 if it threw: @code{ctx} is then
+the context of the job, where the exception is pending (NULL if the
+job destroyed it). @code{JS_ExecutePendingJobs(rt, max_jobs, &ctx)}
+does the same in a loop, in one call: it runs the jobs in order,
+including the jobs they enqueue, until none is left or
+@code{max_jobs} were run (no limit if @code{max_jobs} is negative), and
+returns their number with @code{ctx} set to NULL, or stops at the
+first job which throws and returns -1 with @code{ctx} set as
+above. Jobs cannot be suspended (see @code{JS_RequestSuspend()}), so
+the batch does not change when a suspension can happen; a host which
+must regain control regularly bounds the batch with @code{max_jobs}.
+
 @subsection Execution timeout and interrupts
 
 Use @code{JS_SetInterruptHandler()} to set a callback which is

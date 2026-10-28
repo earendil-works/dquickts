@@ -1362,7 +1362,8 @@ void JS_TriggerInterruptHandler(JSContext *ctx);
      JS_Call(), JS_CallConstructor(), JS_CallConstructor2(), JS_Invoke()
      or the script run by JS_Eval()/JS_EvalThis()/JS_EvalFunction(),
      with no JS or native code running (in particular not from a C
-     function, a class call handler or JS_ExecutePendingJob()),
+     function, a class call handler, JS_ExecutePendingJob() or
+     JS_ExecutePendingJobs()),
    - every other frame was called by the previous one through a plain
      call, method call, 'new', spread call or tail call, possibly
      through bound functions.
@@ -1491,6 +1492,18 @@ JS_BOOL JS_IsJobPending(JSRuntime *rt);
 /* the realm of the next pending job, NULL if none */
 JSContext *JS_GetPendingJobContext(JSRuntime *rt);
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
+/* Execute the pending jobs in order, including the jobs enqueued
+   meanwhile, until none is left or 'max_jobs' were executed (no limit
+   if 'max_jobs' < 0). Return the number of executed jobs and set
+   '*pctx' (if pctx != NULL) to NULL. If a job throws, stop there and
+   return -1 with '*pctx' set to its context, in which the exception is
+   pending (NULL if the job destroyed it), like JS_ExecutePendingJob().
+   Same as calling JS_ExecutePendingJob() in a loop, without the host
+   regaining control between the jobs: jobs are never suspendable, and
+   a suspension requested meanwhile (JS_RequestSuspend()) stays pending
+   for the next host call as with the loop. Use 'max_jobs' to bound the
+   work done in one call. */
+int JS_ExecutePendingJobs(JSRuntime *rt, int max_jobs, JSContext **pctx);
 
 /* Object Writer/Reader (currently only used to handle precompiled code) */
 #define JS_WRITE_OBJ_BYTECODE  (1 << 0) /* allow function/module */

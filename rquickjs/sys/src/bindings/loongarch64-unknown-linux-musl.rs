@@ -2097,6 +2097,13 @@ unsafe extern "C" {
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
+    pub fn JS_ExecutePendingJobs(
+        rt: *mut JSRuntime,
+        max_jobs: ::core::ffi::c_int,
+        pctx: *mut *mut JSContext,
+    ) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
     pub fn JS_WriteObject(
         ctx: *mut JSContext,
         psize: *mut size_t,

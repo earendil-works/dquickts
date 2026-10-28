@@ -2726,6 +2726,86 @@ static void test_own_property_count(JSContext *ctx)
     }
 }
 
+static int job_runs;
+
+static JSValue count_job(JSContext *ctx, int argc, JSValueConst *argv)
+{
+    job_runs++;
+    return JS_UNDEFINED;
+}
+
+static JSValue throw_job(JSContext *ctx, int argc, JSValueConst *argv)
+{
+    job_runs++;
+    return JS_ThrowTypeError(ctx, "job %d", job_runs);
+}
+
+static JSValue throw_int_job(JSContext *ctx, int argc, JSValueConst *argv)
+{
+    return JS_Throw(ctx, JS_NewInt32(ctx, 42));
+}
+
+/* JS_ExecutePendingJobs(): count, limit, jobs enqueued by jobs, stop at
+   the first job which throws and its context */
+static void test_pending_jobs(void)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSContext *ctx2 = JS_NewContext(rt);
+    JSContext *c;
+    JSValue v;
+
+    c = ctx;
+    CHECK(JS_ExecutePendingJobs(rt, -1, &c) == 0);
+    CHECK(c == NULL);
+
+    /* the first reaction enqueues the third one */
+    v = eval_str(ctx, "globalThis.log = [];"
+                 "Promise.resolve().then(() => { log.push(1);"
+                 "  Promise.resolve().then(() => log.push(3)); });"
+                 "Promise.resolve().then(() => log.push(2));");
+    CHECK(!JS_IsException(v));
+    JS_FreeValue(ctx, v);
+    CHECK(JS_ExecutePendingJobs(rt, 0, NULL) == 0);
+    c = ctx;
+    CHECK(JS_ExecutePendingJobs(rt, 1, &c) == 1);
+    CHECK(c == NULL);
+    CHECK(eval_bool(ctx, "log.join() === '1'"));
+    CHECK(JS_ExecutePendingJobs(rt, -1, &c) == 2);
+    CHECK(c == NULL);
+    CHECK(!JS_IsJobPending(rt));
+    CHECK(eval_bool(ctx, "log.join() === '1,2,3'"));
+
+    /* stop at the job which throws, with its context */
+    job_runs = 0;
+    CHECK(JS_EnqueueJob(ctx, count_job, 0, NULL) == 0);
+    CHECK(JS_EnqueueJob(ctx2, throw_job, 0, NULL) == 0);
+    CHECK(JS_EnqueueJob(ctx, count_job, 0, NULL) == 0);
+    CHECK(JS_ExecutePendingJobs(rt, -1, &c) == -1);
+    CHECK(c == ctx2);
+    CHECK(job_runs == 2);
+    CHECK(JS_HasException(ctx2));
+    v = JS_GetException(ctx2);
+    CHECK(JS_IsError(ctx2, v));
+    JS_FreeValue(ctx2, v);
+    CHECK(JS_IsJobPending(rt));
+    CHECK(JS_ExecutePendingJobs(rt, -1, NULL) == 1);
+    CHECK(job_runs == 3);
+
+    /* the first job throws, with a limit */
+    CHECK(JS_EnqueueJob(ctx, throw_int_job, 0, NULL) == 0);
+    c = NULL;
+    CHECK(JS_ExecutePendingJobs(rt, 5, &c) == -1);
+    CHECK(c == ctx);
+    v = JS_GetException(ctx);
+    CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 42);
+    CHECK(!JS_IsJobPending(rt));
+
+    JS_FreeContext(ctx2);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     JSRuntime *rt;
@@ -2749,6 +2829,7 @@ int main(void)
     test_interrupt_polls();
     test_find_atom();
     test_property_str_len();
+    test_pending_jobs();
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);
