@@ -71741,6 +71741,46 @@ uint8_t *JS_GetUint8Array(JSContext *ctx, size_t *psize, JSValueConst obj)
     return NULL;
 }
 
+/* return NULL, without raising an exception, if 'obj' is not a typed
+   array or if it is out of bounds (or its buffer is detached). WARNING:
+   any JS call can detach or resize the buffer and render the returned
+   pointer invalid */
+uint8_t *JS_GetTypedArrayData(JSContext *ctx, JSValueConst obj,
+                              size_t *pbyte_offset,
+                              size_t *pbyte_length,
+                              size_t *pbytes_per_element)
+{
+    JSObject *p;
+    JSTypedArray *ta;
+    int size_log2;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        goto fail;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (!(p->class_id >= JS_CLASS_UINT8C_ARRAY &&
+          p->class_id <= JS_CLASS_FLOAT64_ARRAY))
+        goto fail;
+    if (typed_array_is_oob(p))
+        goto fail;
+    ta = p->u.typed_array;
+    size_log2 = typed_array_size_log2(p->class_id);
+    if (pbyte_offset)
+        *pbyte_offset = ta->offset;
+    if (pbyte_length)
+        *pbyte_length = (size_t)p->u.array.count << size_log2;
+    if (pbytes_per_element)
+        *pbytes_per_element = (size_t)1 << size_log2;
+    return ta->buffer->u.array_buffer->data + ta->offset;
+ fail:
+    if (pbyte_offset)
+        *pbyte_offset = 0;
+    if (pbyte_length)
+        *pbyte_length = 0;
+    if (pbytes_per_element)
+        *pbytes_per_element = 0;
+    return NULL;
+}
+
 /* return a Uint8Array covering the whole (Shared)ArrayBuffer 'buffer'
    which is freed */
 static JSValue js_new_uint8_array(JSContext *ctx, JSValue buffer)

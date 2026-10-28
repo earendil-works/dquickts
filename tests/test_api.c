@@ -873,6 +873,91 @@ static void test_uint8_arrays(JSContext *ctx)
     check_exception(ctx, "TypeError");
 }
 
+/* JS_GetTypedArrayData() on 'v' (freed): NULL and no exception, or the
+   data with the expected byte offset, byte length and element size */
+static uint8_t *check_ta_data(JSContext *ctx, JSValue v, int64_t offset,
+                              int64_t len, int64_t elem_size)
+{
+    size_t off1, len1, elem1;
+    uint8_t *p;
+
+    CHECK(!JS_IsException(v));
+    off1 = len1 = elem1 = 1;
+    p = JS_GetTypedArrayData(ctx, v, &off1, &len1, &elem1);
+    CHECK(!JS_HasException(ctx));
+    if (offset < 0) {
+        CHECK(p == NULL && off1 == 0 && len1 == 0 && elem1 == 0);
+    } else {
+        CHECK(p != NULL && off1 == offset && len1 == len &&
+              elem1 == elem_size);
+        /* NULL output pointers are allowed */
+        CHECK(JS_GetTypedArrayData(ctx, v, NULL, NULL, NULL) == p);
+    }
+    JS_FreeValue(ctx, v);
+    return p;
+}
+
+static void test_typed_array_data(JSContext *ctx)
+{
+    static const char *bad_src[] = {
+        "new DataView(new ArrayBuffer(4))",
+        "new ArrayBuffer(4)",
+        "[1, 2]",
+        "({ length: 1, 0: 1 })",
+        "1",
+        "var td = new Float64Array(4); td.buffer.transfer(); td",
+        /* fixed length view out of bounds of a shrunk buffer */
+        "var tr = new ArrayBuffer(16, { maxByteLength: 16 }); var to = new Int16Array(tr, 2, 4); tr.resize(8); to",
+    };
+    static const int elem_sizes[] = { 1, 1, 1, 2, 2, 4, 4, 8, 8, 2, 4, 8 };
+    JSValue v, buf, arg;
+    uint8_t *p, *base;
+    size_t size;
+    int t, i;
+
+    CHECK(countof(elem_sizes) == JS_TYPED_ARRAY_FLOAT64 + 1);
+    for(t = 0; t <= JS_TYPED_ARRAY_FLOAT64; t++) {
+        arg = JS_NewInt32(ctx, 3);
+        v = JS_NewTypedArray(ctx, 1, &arg, t);
+        buf = JS_GetTypedArrayBuffer(ctx, v, NULL, NULL, NULL);
+        base = JS_GetArrayBuffer(ctx, &size, buf);
+        CHECK(base != NULL && size == 3 * elem_sizes[t]);
+        JS_FreeValue(ctx, buf);
+        p = check_ta_data(ctx, v, 0, 3 * elem_sizes[t], elem_sizes[t]);
+        CHECK(p == base);
+    }
+
+    /* view with an offset: the pointer is the start of the view */
+    v = eval_str(ctx, "var tab = new ArrayBuffer(16); "
+                 "var t32 = new Int32Array(tab, 4, 2); t32[1] = -2; t32");
+    buf = JS_GetTypedArrayBuffer(ctx, v, NULL, NULL, NULL);
+    base = JS_GetArrayBuffer(ctx, &size, buf);
+    JS_FreeValue(ctx, buf);
+    p = check_ta_data(ctx, v, 4, 8, 4);
+    CHECK(p == base + 4 && ((int32_t *)p)[1] == -2);
+    ((int32_t *)p)[0] = 42;
+    CHECK(eval_bool(ctx, "t32[0] === 42"));
+
+    /* length-tracking view of a resizable buffer */
+    v = eval_str(ctx, "var rab = new ArrayBuffer(8, { maxByteLength: 32 }); "
+                 "var tl = new Float32Array(rab, 4); rab.resize(20); tl");
+    check_ta_data(ctx, v, 4, 16, 4);
+    check_ta_data(ctx, eval_str(ctx, "rab.resize(10); tl"), 4, 4, 4);
+    check_ta_data(ctx, eval_str(ctx, "rab.resize(6); tl"), 4, 0, 4);
+    check_ta_data(ctx, eval_str(ctx, "rab.resize(4); tl"), 4, 0, 4);
+    check_ta_data(ctx, eval_str(ctx, "rab.resize(2); tl"), -1, 0, 0);
+    check_ta_data(ctx, eval_str(ctx, "rab.resize(32); tl"), 4, 28, 4);
+
+    /* length-tracking view of a growable SharedArrayBuffer */
+    v = eval_str(ctx, "var gsab = new SharedArrayBuffer(4, { maxByteLength: 16 }); "
+                 "var tg = new Uint16Array(gsab, 2); gsab.grow(12); tg");
+    check_ta_data(ctx, v, 2, 10, 2);
+
+    for(i = 0; i < countof(bad_src); i++)
+        check_ta_data(ctx, eval_str(ctx, bad_src[i]), -1, 0, 0);
+    check_ta_data(ctx, JS_UNDEFINED, -1, 0, 0);
+}
+
 static void test_free_macros(JSContext *ctx)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
@@ -1929,8 +2014,8 @@ static void test_growable_sab(void)
     JSRuntime *rt;
     JSContext *ctx;
     JSValue sab, copy;
-    uint8_t *buf, **wtab, **rtab, *data;
-    size_t len, wlen, rlen, size;
+    uint8_t *buf, **wtab, **rtab, *data, *p16;
+    size_t len, wlen, rlen, size, off, blen, elem;
     int i;
 
     /* without SharedArrayBuffer allocator */
@@ -1970,11 +2055,21 @@ static void test_growable_sab(void)
                     "catch(e) { ok = e instanceof RangeError; } "
                     "ok && view.length === 12 && copy.byteLength === 12"));
     CHECK(eval_bool(ctx, "sab.grow(12); sab.byteLength === 12"));
+    /* the views of a clone that was not used since the growth follow it */
+    CHECK(eval_bool(ctx, "globalThis.v16 = new Uint16Array(copy2, 2); "
+                    "copy.grow(16); copy.byteLength === 16"));
+    copy = eval_str(ctx, "v16");
+    p16 = JS_GetTypedArrayData(ctx, copy, &off, &blen, &elem);
+    data = JS_GetArrayBuffer(ctx, &size, sab);
+    CHECK(p16 != NULL && p16 == data + 2 && off == 2 && blen == 14 &&
+          elem == 2);
+    JS_FreeValue(ctx, copy);
     js_free(ctx, wtab);
     js_free(ctx, buf);
     JS_FreeValue(ctx, sab);
     eval_bool(ctx, "delete globalThis.sab; delete globalThis.view; "
-              "delete globalThis.copy; delete globalThis.copy2");
+              "delete globalThis.copy; delete globalThis.copy2; "
+              "delete globalThis.v16");
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 }
@@ -2670,6 +2765,7 @@ int main(void)
     test_fast_array(ctx);
     test_conversions(ctx);
     test_uint8_arrays(ctx);
+    test_typed_array_data(ctx);
     test_free_macros(ctx);
     test_function_list_flags(ctx);
     test_promises(ctx);

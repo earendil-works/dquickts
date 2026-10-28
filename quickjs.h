@@ -1267,6 +1267,19 @@ JSValue JS_NewUint8ArrayCopy(JSContext *ctx, const uint8_t *buf, size_t len);
    Return NULL if exception. WARNING: any JS call can detach or resize
    the buffer and render the returned pointer invalid */
 uint8_t *JS_GetUint8Array(JSContext *ctx, size_t *psize, JSValueConst obj);
+/* data of a typed array view of any element type (the start of the view,
+   not of its buffer), its current byte length (which follows the buffer
+   for a length-tracking view), its byte offset in the buffer and its
+   element size. pbyte_offset, pbyte_length or pbytes_per_element can be
+   NULL. Unlike JS_GetTypedArrayBuffer(), the buffer object is not
+   referenced and no exception is raised: return NULL if 'obj' is not a
+   typed array (see JS_GetTypedArrayType()) or if the view is out of
+   bounds or its buffer is detached. WARNING: any JS call can detach or
+   resize the buffer and render the returned pointer invalid */
+uint8_t *JS_GetTypedArrayData(JSContext *ctx, JSValueConst obj,
+                              size_t *pbyte_offset,
+                              size_t *pbyte_length,
+                              size_t *pbytes_per_element);
 /* sab_free(), sab_dup() and the SharedArrayBuffer memory returned by
    JS_WriteObject2()/JS_ReadObject2() use the pointer returned by
    sab_alloc(). For a growable SharedArrayBuffer, the engine stores the

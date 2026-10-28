@@ -1789,6 +1789,15 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn JS_GetUint8Array(ctx: *mut JSContext, psize: *mut size_t, obj: JSValue) -> *mut u8;
 }
+unsafe extern "C" {
+    pub fn JS_GetTypedArrayData(
+        ctx: *mut JSContext,
+        obj: JSValue,
+        pbyte_offset: *mut size_t,
+        pbyte_length: *mut size_t,
+        pbytes_per_element: *mut size_t,
+    ) -> *mut u8;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct JSSharedArrayBufferFunctions {

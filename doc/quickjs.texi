@@ -1274,6 +1274,12 @@ held.
 @code{Uint8Array} over a new @code{ArrayBuffer};
 @code{JS_GetUint8Array()} returns the bytes viewed by a
 @code{Uint8Array}, taking its offset into account.
+@code{JS_GetTypedArrayData()} returns the bytes viewed by a typed array
+of any element type with their byte length, byte offset and element
+size. It does not reference the @code{ArrayBuffer} and does not raise
+an exception: it returns @code{NULL} if the value is not a typed array
+(see @code{JS_GetTypedArrayType()}), or if the view is out of bounds or
+its buffer is detached.
 
 @code{JS_GetPropertyValue()} and @code{JS_SetPropertyValue()} access a
 property whose key is an arbitrary @code{JSValue} (freed by the
