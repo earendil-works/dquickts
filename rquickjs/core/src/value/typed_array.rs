@@ -5,7 +5,7 @@ use crate::{
     Value,
 };
 use core::{
-    assert, debug_assert_eq, fmt,
+    debug_assert_eq, fmt,
     marker::PhantomData,
     mem,
     ops::Deref,
@@ -141,15 +141,12 @@ impl<'js, T> TypedArray<'js, T> {
     }
 
     /// Get the length of the typed array in elements.
+    ///
+    /// Like the intrinsic `length` getter, returns 0 if the array is detached or out of bounds.
     pub fn len(&self) -> usize {
-        //Self::get_raw(&self.0).expect("Not a TypedArray").0
-        let ctx = &self.0.ctx;
-        let value = self.0.as_js_value();
-        unsafe {
-            let val = qjs::JS_GetProperty(ctx.as_ptr(), value, PredefinedAtom::Length as _);
-            assert!(qjs::JS_IsInt(val));
-            qjs::JS_VALUE_GET_INT(val) as _
-        }
+        Self::get_raw_bytes(&self.0)
+            .map(|(stp, len, _)| len / stp)
+            .unwrap_or(0)
     }
 
     /// Returns whether a typed array is empty.
@@ -530,6 +527,18 @@ mod test {
             assert_eq!(unsafe { oob.as_bytes() }.unwrap().len(), 4);
             assert_eq!(oob.len(), 2);
             // probing does not leave a pending exception behind
+            assert!(!ctx.has_exception());
+        });
+    }
+
+    #[test]
+    fn len_is_the_intrinsic_length() {
+        test_with(|ctx| {
+            let val: TypedArray<i8> = ctx
+                .eval("var t = new Int8Array(3); Object.defineProperty(t, 'length', { get() { throw 1; } }); t")
+                .unwrap();
+            assert_eq!(val.len(), 3);
+            assert!(!val.is_empty());
             assert!(!ctx.has_exception());
         });
     }
