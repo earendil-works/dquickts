@@ -114,8 +114,9 @@ static void test_objects(JSContext *ctx)
    separated) set to 0, 1, ... */
 static JSValue new_object_from(JSContext *ctx, const char *names)
 {
-    JSAtom atoms[128];
-    JSValue values[128], obj;
+    /* initialized so that gcc doesn't warn when no name is given */
+    JSAtom atoms[128] = { 0 };
+    JSValue values[128] = { 0 }, obj;
     const char *p, *q;
     int i, n;
 
