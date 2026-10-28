@@ -1651,6 +1651,22 @@ static void test_read_object2(void)
     JS_FreeRuntime(rt);
 }
 
+/* growable SharedArrayBuffer: the memory is allocated upfront */
+static void test_growable_sab(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+
+    /* without SharedArrayBuffer allocator */
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    CHECK(eval_bool(ctx, "var s = new SharedArrayBuffer(1, { maxByteLength: 4096 }); "
+                    "var a = new Uint8Array(s); s.grow(4096); a.fill(7); "
+                    "s.byteLength === 4096 && a.length === 4096 && a[4095] === 7"));
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static char finalizer_log[8];
 
 static void runtime_finalizer(JSRuntime *rt, void *arg)
@@ -1875,6 +1891,7 @@ int main(void)
     test_eval2();
     test_write_strip();
     test_read_object2();
+    test_growable_sab();
     test_runtime();
     test_normalize2();
     test_calloc();

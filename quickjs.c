@@ -69783,16 +69783,24 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
     abuf->byte_length = len;
     abuf->max_byte_length = max_len ? *max_len : -1;
     if (alloc_flag) {
-        if (class_id == JS_CLASS_SHARED_ARRAY_BUFFER &&
-            rt->sab_funcs.sab_alloc) {
-            // TOOD(bnoordhuis) resizing backing memory for SABs atomically
-            // is hard so we cheat and allocate |maxByteLength| bytes upfront
+        if (class_id == JS_CLASS_SHARED_ARRAY_BUFFER) {
+            /* a growable SharedArrayBuffer is never reallocated
+               (js_array_buffer_resize()): allocate |maxByteLength|
+               bytes upfront */
             sab_alloc_len = max_len ? *max_len : len;
-            abuf->data = rt->sab_funcs.sab_alloc(rt->sab_funcs.sab_opaque,
-                                                 max_int(sab_alloc_len, 1));
-            if (!abuf->data)
-                goto fail;
-            memset(abuf->data, 0, sab_alloc_len);
+            if (rt->sab_funcs.sab_alloc) {
+                abuf->data = rt->sab_funcs.sab_alloc(rt->sab_funcs.sab_opaque,
+                                                     max_int(sab_alloc_len, 1));
+                if (!abuf->data) {
+                    JS_ThrowOutOfMemory(ctx);
+                    goto fail;
+                }
+                memset(abuf->data, 0, sab_alloc_len);
+            } else {
+                abuf->data = js_mallocz(ctx, max_int(sab_alloc_len, 1));
+                if (!abuf->data)
+                    goto fail;
+            }
         } else {
             /* the allocation must be done after the object creation */
             abuf->data = js_mallocz(ctx, max_int(len, 1));
