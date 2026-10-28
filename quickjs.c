@@ -3379,17 +3379,30 @@ static inline BOOL is_num_string(uint32_t *pval, const JSString *p)
 #define HASH_K3 (HASH_K2 * HASH_K1)
 #define HASH_K4 (HASH_K3 * HASH_K1)
 
-static inline uint32_t hash_string8(const uint8_t *str, size_t len, uint32_t h)
+/* also return the bitwise or of the characters in '*pbits' */
+static force_inline uint32_t hash_string8_bits(const uint8_t *str, size_t len,
+                                               uint32_t h, uint32_t *pbits)
 {
     size_t i;
+    uint32_t bits = 0;
 
     for(i = 0; i + 4 <= len; i += 4) {
+        bits |= str[i] | str[i + 1] | str[i + 2] | str[i + 3];
         h = h * HASH_K4 + (str[i] * HASH_K3 + str[i + 1] * HASH_K2 +
                            str[i + 2] * HASH_K1 + str[i + 3]);
     }
-    for(; i < len; i++)
+    for(; i < len; i++) {
+        bits |= str[i];
         h = h * HASH_K1 + str[i];
+    }
+    *pbits = bits;
     return h;
+}
+
+static inline uint32_t hash_string8(const uint8_t *str, size_t len, uint32_t h)
+{
+    uint32_t bits;
+    return hash_string8_bits(str, len, h, &bits);
 }
 
 static inline uint32_t hash_string16(const uint16_t *str,
@@ -3812,14 +3825,41 @@ static BOOL js_string16_eq_ascii(const JSString *p, const char *str, size_t len)
     return TRUE;
 }
 
-/* Warning: str must be ASCII only */
-static force_inline JSAtom __JS_FindAtom(JSRuntime *rt, const char *str,
-                                         size_t len, int atom_type)
+/* memcmp(a, b, len) == 0 without a library call for the short
+   strings of the property names */
+static force_inline BOOL js_mem_eq(const uint8_t *a, const uint8_t *b,
+                                   size_t len)
 {
-    uint32_t h, h1, i;
+    if (len >= 8) {
+        if (len > 16)
+            return memcmp(a, b, len) == 0;
+        /* two overlapping 8 byte words */
+        return ((get_u64(a) ^ get_u64(b)) |
+                (get_u64(a + len - 8) ^ get_u64(b + len - 8))) == 0;
+    } else if (len >= 4) {
+        return ((get_u32(a) ^ get_u32(b)) |
+                (get_u32(a + len - 4) ^ get_u32(b + len - 4))) == 0;
+    } else {
+        size_t i;
+        for(i = 0; i < len; i++) {
+            if (a[i] != b[i])
+                return FALSE;
+        }
+        return TRUE;
+    }
+}
+
+/* Return the atom of type JS_ATOM_TYPE_STRING of the ASCII string 'str'
+   of hash 'h' (hash_string8(str, len, JS_ATOM_TYPE_STRING)) if it
+   exists, JS_ATOM_NULL otherwise. No reference is taken: the atom must
+   be used or duplicated before anything can free an atom. */
+static force_inline JSAtom js_find_atom_ascii_noref(JSRuntime *rt,
+                                                    const char *str,
+                                                    size_t len, uint32_t h)
+{
+    uint32_t h1, i;
     JSAtomStruct *p;
 
-    h = hash_string8((const uint8_t *)str, len, JS_ATOM_TYPE_STRING);
     h &= JS_ATOM_HASH_MASK;
     h1 = h & (rt->atom_hash_size - 1);
     i = rt->atom_hash[h1];
@@ -3829,15 +3869,29 @@ static force_inline JSAtom __JS_FindAtom(JSRuntime *rt, const char *str,
             p->atom_type == JS_ATOM_TYPE_STRING &&
             p->len == len &&
             (likely(!p->is_wide_char) ?
-             memcmp(p->u.str8, str, len) == 0 :
+             js_mem_eq(p->u.str8, (const uint8_t *)str, len) :
              js_string16_eq_ascii(p, str, len))) {
-            if (!__JS_AtomIsConst(i))
-                js_rc(p)->ref_count++;
             return i;
         }
         i = p->hash_next;
     }
     return JS_ATOM_NULL;
+}
+
+/* take a reference to the existing atom 'v' (JS_ATOM_NULL allowed) */
+static force_inline JSAtom js_dup_atom_rt(JSRuntime *rt, JSAtom v)
+{
+    if (!__JS_AtomIsConst(v))
+        js_rc(rt->atom_array[v])->ref_count++;
+    return v;
+}
+
+/* Warning: str must be ASCII only */
+static force_inline JSAtom __JS_FindAtom(JSRuntime *rt, const char *str,
+                                         size_t len, int atom_type)
+{
+    uint32_t h = hash_string8((const uint8_t *)str, len, JS_ATOM_TYPE_STRING);
+    return js_dup_atom_rt(rt, js_find_atom_ascii_noref(rt, str, len, h));
 }
 
 static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
@@ -3978,8 +4032,8 @@ static BOOL js_string_eq_utf8(const JSString *p, const uint8_t *buf,
     return TRUE;
 }
 
-/* js_find_atom_utf8() for a string whose first non-ASCII byte is at
-   'len1' */
+/* js_find_atom_utf8_noref() for a string whose first non-ASCII byte is
+   at 'len1' */
 static no_inline JSAtom js_find_atom_utf8_non_ascii(JSRuntime *rt,
                                                    const uint8_t *buf,
                                                    size_t len, size_t len1)
@@ -4011,8 +4065,6 @@ static no_inline JSAtom js_find_atom_utf8_non_ascii(JSRuntime *rt,
             p->atom_type == JS_ATOM_TYPE_STRING &&
             p->len == len16 &&
             js_string_eq_utf8(p, buf, buf_end)) {
-            if (!__JS_AtomIsConst(i))
-                js_rc(p)->ref_count++;
             return i;
         }
     }
@@ -4020,16 +4072,18 @@ static no_inline JSAtom js_find_atom_utf8_non_ascii(JSRuntime *rt,
 }
 
 /* Return the atom JS_NewAtomLen() would return for the UTF-8 string
-   'str' if it already exists (with a new reference), JS_ATOM_NULL
-   otherwise. Never allocates nor raises an exception. */
-static force_inline JSAtom js_find_atom_utf8(JSRuntime *rt, const char *str,
-                                             size_t len)
+   'str' if it already exists, JS_ATOM_NULL otherwise. Never allocates
+   nor raises an exception. No reference is taken: the atom must be used
+   or duplicated before anything can free an atom. */
+static force_inline JSAtom js_find_atom_utf8_noref(JSRuntime *rt,
+                                                   const char *str,
+                                                   size_t len)
 {
-    size_t len1, i;
+    const uint8_t *buf = (const uint8_t *)str;
+    uint32_t h, bits;
+    size_t i;
 
-    len1 = count_ascii((const uint8_t *)str, len);
-    if (unlikely(len1 != len))
-        return js_find_atom_utf8_non_ascii(rt, (const uint8_t *)str, len, len1);
+    /* a canonical array index is ASCII */
     if (unlikely(len != 0 && len <= 10 && is_digit(*str))) {
         /* same as is_num_string(): canonical array index */
         uint64_t n = 0;
@@ -4039,7 +4093,18 @@ static force_inline JSAtom js_find_atom_utf8(JSRuntime *rt, const char *str,
             n <= JS_ATOM_MAX_INT)
             return __JS_AtomFromUInt32(n);
     }
-    return __JS_FindAtom(rt, str, len, JS_ATOM_TYPE_STRING);
+    /* the hash of the bytes is the one of the string if they are ASCII */
+    h = hash_string8_bits(buf, len, JS_ATOM_TYPE_STRING, &bits);
+    if (unlikely(bits >= 0x80))
+        return js_find_atom_utf8_non_ascii(rt, buf, len, count_ascii(buf, len));
+    return js_find_atom_ascii_noref(rt, str, len, h);
+}
+
+/* js_find_atom_utf8_noref() with a new reference to the atom */
+static force_inline JSAtom js_find_atom_utf8(JSRuntime *rt, const char *str,
+                                             size_t len)
+{
+    return js_dup_atom_rt(rt, js_find_atom_utf8_noref(rt, str, len));
 }
 
 JSAtom JS_FindAtomLen(JSContext *ctx, const char *str, size_t len)

@@ -2675,6 +2675,81 @@ static void test_property_str_len(void)
     JS_FreeRuntime(rt);
 }
 
+/* the UTF-8 key lookups find the keys of any length and only them (also
+   when another key has the same length and atom hash) */
+static void test_property_str_lookup(void)
+{
+    /* pairs of keys of the same length and atom hash */
+    static const char *const same_hash[][2] = {
+        { "qKgiNI", "q732ga" },
+        { "qk9ZqoarNL7f", "qeKzUdkKT2a8" },
+        { "qzPOmw_0Fom2Vfj0k7iJ", "qWcOM4g1UZCGbvhiQL66" },
+    };
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    char key[64];
+    JSValue obj, v;
+    JSAtom a, b;
+    size_t i, j, len;
+
+    /* ASCII, Latin-1 and wide keys of all lengths, the non-ASCII part
+       after ASCII prefixes of all lengths */
+    obj = eval_str(ctx, "var s4k = {}; for (let i = 0; i <= 40; i++) {"
+                   "s4k['k'.repeat(i)] = i; s4k['k'.repeat(i) + '\\u00e9'] = 100 + i;"
+                   "s4k['k'.repeat(i) + '\\u03bb' + 'k'.repeat(i % 7)] = 200 + i } s4k");
+    for(i = 0; i <= 40; i++) {
+        memset(key, 'k', i);
+        v = JS_GetPropertyStrLen(ctx, obj, key, i);
+        CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == i);
+        CHECK(JS_HasPropertyStrLen(ctx, obj, key, i) == 1);
+        /* same length, another first or last character */
+        if (i > 0) {
+            key[i - 1] = 'j';
+            CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, key, i)));
+            key[i - 1] = 'k';
+            key[0] = 'j';
+            CHECK(JS_HasPropertyStrLen(ctx, obj, key, i) == 0);
+        }
+        memset(key, 'k', i);
+        memcpy(key + i, "\xc3\xa9", 2);
+        v = JS_GetPropertyStrLen(ctx, obj, key, i + 2);
+        CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 100 + i);
+        memcpy(key + i, "\xce\xbb", 2);
+        len = i + 2;
+        for(j = 0; j < i % 7; j++)
+            key[len++] = 'k';
+        v = JS_GetPropertyStrLen(ctx, obj, key, len);
+        CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 200 + i);
+        a = JS_FindAtomLen(ctx, key, len);
+        CHECK(a != JS_ATOM_NULL);
+        JS_FreeAtom(ctx, a);
+    }
+
+    for(i = 0; i < countof(same_hash); i++) {
+        const char *k0 = same_hash[i][0], *k1 = same_hash[i][1];
+        len = strlen(k0);
+        CHECK(JS_SetPropertyStr(ctx, obj, k0, JS_NewInt32(ctx, 1000)) == 1);
+        CHECK(JS_FindAtomLen(ctx, k1, len) == JS_ATOM_NULL);
+        CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, k1, len)));
+        CHECK(JS_HasPropertyStrLen(ctx, obj, k1, len) == 0);
+        a = JS_NewAtomLen(ctx, k0, len);
+        b = JS_NewAtomLen(ctx, k1, len);
+        CHECK(a != JS_ATOM_NULL && b != JS_ATOM_NULL && a != b);
+        JS_FreeAtom(ctx, a);
+        a = JS_FindAtomLen(ctx, k0, len);
+        CHECK(a != JS_ATOM_NULL && a != b);
+        CHECK(JS_FindAtomLen(ctx, k1, len) == b);
+        CHECK(JS_IsUndefined(JS_GetPropertyStrLen(ctx, obj, k1, len)));
+        v = JS_GetPropertyStrLen(ctx, obj, k0, len);
+        CHECK(JS_VALUE_GET_TAG(v) == JS_TAG_INT && JS_VALUE_GET_INT(v) == 1000);
+        JS_FreeAtoms(ctx, a, b, b);
+    }
+    JS_FreeValue(ctx, obj);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 /* JS_GetOwnPropertyCount() returns the JS_GetOwnPropertyNames() count */
 static void check_own_count(JSContext *ctx, const char *src, int flags,
                             uint32_t expected)
@@ -2829,6 +2904,7 @@ int main(void)
     test_interrupt_polls();
     test_find_atom();
     test_property_str_len();
+    test_property_str_lookup();
     test_pending_jobs();
 
     rt = JS_NewRuntime();
