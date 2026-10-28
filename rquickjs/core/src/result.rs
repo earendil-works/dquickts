@@ -674,20 +674,36 @@ impl Display for AsyncJobException {
 }
 
 impl<'js> Ctx<'js> {
+    /// Calls `f` from a callback of the engine, which a panic must not unwind through.
+    ///
+    /// Inlined into the callbacks: when nothing panics, the catch costs nothing but its
+    /// landing pad.
+    #[inline]
     fn handle_panic_inner<R, F>(&self, f: F, err_val: R) -> R
     where
         F: FnOnce() -> R + UnwindSafe,
     {
         match crate::util::catch_unwind(f) {
             Ok(x) => x,
-            Err(e) => unsafe {
-                self.get_opaque().set_panic(e);
-                qjs::JS_Throw(self.as_ptr(), qjs::JS_MKVAL(qjs::JS_TAG_EXCEPTION, 0));
+            Err(e) => {
+                self.raise_panic(e);
                 err_val
-            },
+            }
         }
     }
 
+    /// Keeps the panic `payload` for resuming it when the engine returns to Rust, and throws
+    /// the uncatchable exception that unwinds the JavaScript frames until then.
+    #[cold]
+    #[inline(never)]
+    fn raise_panic(&self, payload: alloc::boxed::Box<dyn core::any::Any + Send + 'static>) {
+        unsafe {
+            self.get_opaque().set_panic(payload);
+            qjs::JS_Throw(self.as_ptr(), qjs::JS_MKVAL(qjs::JS_TAG_EXCEPTION, 0));
+        }
+    }
+
+    #[inline]
     pub(crate) fn handle_panic<F>(&self, f: F) -> qjs::JSValue
     where
         F: FnOnce() -> qjs::JSValue + UnwindSafe,
@@ -696,6 +712,7 @@ impl<'js> Ctx<'js> {
         self.handle_panic_inner(f, qjs::JS_EXCEPTION)
     }
 
+    #[inline]
     pub(crate) fn handle_panic_exotic<F>(&self, f: F) -> qjs::c_int
     where
         F: FnOnce() -> qjs::c_int + UnwindSafe,
