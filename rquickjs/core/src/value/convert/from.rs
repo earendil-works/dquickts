@@ -36,9 +36,18 @@ impl<'js> FromJs<'js> for Value<'js> {
     }
 }
 
+/// The JavaScript string in `value`, checked from its tag alone.
+fn js_string(value: Value<'_>) -> Result<String<'_>> {
+    if value.is_string() {
+        Ok(String(value))
+    } else {
+        Err(Error::new_from_js(value.type_name(), "string"))
+    }
+}
+
 impl<'js> FromJs<'js> for StdString {
     fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-        String::from_value(value).and_then(|string| string.to_string())
+        js_string(value)?.to_string()
     }
 }
 
@@ -46,39 +55,32 @@ impl<'js> FromJs<'js> for char {
     fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
         use crate::value::string::StringData;
 
-        let type_name = value.type_name();
-        let string = String::from_value(value)?;
+        let string = js_string(value)?;
         // one code point: no allocation
         match string.data()? {
             StringData::Latin1(&[b]) => return Ok(b as char),
+            StringData::Latin1(_) => {}
             StringData::Utf16(units) => {
                 if let Some(Ok(c)) = char::decode_utf16(units.iter().copied()).next() {
                     if c.len_utf16() == units.len() {
                         return Ok(c);
                     }
                 }
+                // an unpaired surrogate is reported as an UTF-8 error
+                string.to_string()?;
             }
-            StringData::Latin1(_) => {}
         }
-        let s = string.to_string()?;
-
-        let mut chars = s.chars();
-        let (c, more) = (chars.next(), chars.next());
-
-        match (c, more) {
-            (Some(c), None) => Ok(c),
-            _ => Err(Error::FromJs {
-                from: type_name,
-                to: "char",
-                message: Some("The length of the string converted to char must be 1".into()),
-            }),
-        }
+        Err(Error::FromJs {
+            from: "string",
+            to: "char",
+            message: Some("The length of the string converted to char must be 1".into()),
+        })
     }
 }
 
 impl<'js> FromJs<'js> for CString<'js> {
     fn from_js(_ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-        String::from_value(value)?.to_cstring()
+        js_string(value)?.to_cstring()
     }
 }
 
