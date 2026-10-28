@@ -448,7 +448,7 @@ fn class_id<'js, C: JsClass<'js>>() -> qjs::JSClassID {
 
 /// Returns the cell of `value` if it is an instance of the class `C`.
 #[inline]
-unsafe fn class_cell_of<'js, C: JsClass<'js>>(
+pub(crate) unsafe fn class_cell_of<'js, C: JsClass<'js>>(
     value: qjs::JSValueConst,
 ) -> Option<NonNull<ClassCell<JsCell<'js, C>>>> {
     // `JS_GetOpaque` checks the tag and the class id, and returns NULL on a mismatch without

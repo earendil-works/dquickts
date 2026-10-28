@@ -211,8 +211,9 @@ impl JsFunction {
 
     /// The body of `IntoJsFunc::call_raw`.
     pub fn expand_to_js_function_body(&self, lib_crate: &Ident) -> TokenStream {
-        let arg_extract = self.params.expand_extract(lib_crate);
-        let arg_apply = self.params.expand_apply();
+        // the future of an async function owns its borrows, a sync one borrows for the call
+        let arg_extract = self.params.expand_extract(lib_crate, !self.is_async);
+        let arg_apply = self.params.expand_apply(!self.is_async);
         let rust_function = &self.rust_function;
 
         if self.is_async {
@@ -264,6 +265,8 @@ impl JsFunction {
                 // (`Function::new`, `Constructor::new_class`) before it calls this
                 #[inline]
                 fn call_raw<'a>(&self, params: #lib_crate::function::Params<'a,'js>) -> #lib_crate::Result<#lib_crate::qjs::JSValue>{
+                    // only the arguments need it mutably, not the borrows of `self`
+                    #[allow(unused_mut)]
                     let mut _params = params.access();
                     #body
                 }
@@ -279,8 +282,8 @@ pub(crate) struct JsParams {
 }
 
 impl JsParams {
-    pub fn expand_apply(&self) -> TokenStream {
-        let iter = self.params.iter().map(|x| x.expand_apply());
+    pub fn expand_apply(&self, call_borrows: bool) -> TokenStream {
+        let iter = self.params.iter().map(|x| x.expand_apply(call_borrows));
         quote! { #(#iter),* }
     }
 
@@ -291,8 +294,11 @@ impl JsParams {
             .collect()
     }
 
-    pub fn expand_extract(&self, lib_crate: &Ident) -> TokenStream {
-        let res = self.params.iter().map(|x| x.expand_extract(lib_crate));
+    pub fn expand_extract(&self, lib_crate: &Ident, call_borrows: bool) -> TokenStream {
+        let res = self
+            .params
+            .iter()
+            .map(|x| x.expand_extract(lib_crate, call_borrows));
         quote!(#(#res)*)
     }
 }
@@ -322,18 +328,25 @@ impl JsParam {
         }
     }
 
-    pub fn expand_apply(&self) -> TokenStream {
+    /// The argument of the parameter, `call_borrows` if it was extracted as a borrow of the
+    /// call (see [`JsParam::expand_extract`]).
+    pub fn expand_apply(&self, call_borrows: bool) -> TokenStream {
         let t = format_ident!("tmp_{}", self.number);
-        let apply = match self.kind {
-            ParamKind::Value => quote!(#t),
+        // a call borrow is the borrow itself, the others are in `This`
+        let t = if self.is_this && !(call_borrows && self.is_borrow()) {
+            quote!(#t.0)
+        } else {
+            quote!(#t)
+        };
+        match self.kind {
+            ParamKind::Value => t,
             ParamKind::Borrow => quote!(&*#t),
             ParamKind::BorrowMut => quote!(&mut *#t),
-        };
-        if self.is_this {
-            quote!(#apply.0)
-        } else {
-            apply
         }
+    }
+
+    fn is_borrow(&self) -> bool {
+        matches!(self.kind, ParamKind::Borrow | ParamKind::BorrowMut)
     }
 
     pub fn expand_type(&self, lib_crate: &Ident) -> TokenStream {
@@ -352,11 +365,23 @@ impl JsParam {
         }
     }
 
-    pub fn expand_extract(&self, lib_crate: &Ident) -> TokenStream {
-        let ty = self.expand_type(lib_crate);
+    /// Extracts the parameter from `_params`, the borrows as borrows of the call (which don't
+    /// hold the object) if `call_borrows`, else as owned borrows.
+    pub fn expand_extract(&self, lib_crate: &Ident, call_borrows: bool) -> TokenStream {
         let binding = self.expand_binding();
+        let t = &self.tokens;
+        let extract = match (call_borrows, self.kind, self.is_this) {
+            (true, ParamKind::Borrow, true) => quote!(_params.this_borrow::<#t>()),
+            (true, ParamKind::Borrow, false) => quote!(_params.arg_borrow::<#t>()),
+            (true, ParamKind::BorrowMut, true) => quote!(_params.this_borrow_mut::<#t>()),
+            (true, ParamKind::BorrowMut, false) => quote!(_params.arg_borrow_mut::<#t>()),
+            _ => {
+                let ty = self.expand_type(lib_crate);
+                quote!(<#ty as #lib_crate::function::FromParam>::from_param(&mut _params))
+            }
+        };
         quote! {
-            let #binding = <#ty as #lib_crate::function::FromParam>::from_param(&mut _params)?;
+            let #binding = #extract?;
         }
     }
 }

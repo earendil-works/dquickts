@@ -1,6 +1,7 @@
 use crate::{
+    class::{Borrow, BorrowMut, JsCell, JsClass},
     function::{Exhaustive, Flat, FuncArg, Opt, Rest, This},
-    qjs, Ctx, FromJs, Result, Value,
+    qjs, Ctx, Error, FromJs, Result, Value,
 };
 use alloc::vec::Vec;
 use core::{marker::PhantomData, mem::ManuallyDrop};
@@ -219,6 +220,73 @@ impl<'a, 'js> ParamsAccessor<'a, 'js> {
         unsafe { T::from_js_raw(self.params.ctx(), arg) }
     }
 
+    /// Borrows the instance of the class `C` which the function is called on.
+    ///
+    /// Used by the `#[methods]` macro for `&self`: unlike `This<OwnedBorrow<C>>` the borrow
+    /// doesn't hold a reference to the object, which the caller keeps alive during the call.
+    #[doc(hidden)]
+    #[inline]
+    pub fn this_borrow<C>(&self) -> Result<Borrow<'a, 'js, C>>
+    where
+        C: JsClass<'js> + 'a,
+    {
+        // SAFETY: `this` is kept alive by the caller during the call, which outlives `'a`
+        let cell = unsafe { call_value_cell::<C>(self.params.ctx(), self.params.this)? };
+        cell.try_borrow().map_err(Error::ClassBorrow)
+    }
+
+    /// Borrows the instance of the class `C` which the function is called on mutably.
+    ///
+    /// Used by the `#[methods]` macro for `&mut self`, see [`ParamsAccessor::this_borrow`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn this_borrow_mut<C>(&self) -> Result<BorrowMut<'a, 'js, C>>
+    where
+        C: JsClass<'js> + 'a,
+    {
+        // SAFETY: `this` is kept alive by the caller during the call, which outlives `'a`
+        let cell = unsafe { call_value_cell::<C>(self.params.ctx(), self.params.this)? };
+        cell.try_borrow_mut().map_err(Error::ClassBorrow)
+    }
+
+    /// Borrows the next argument, an instance of the class `C`.
+    ///
+    /// Used by the `#[function]` and `#[methods]` macros for `&C` parameters, see
+    /// [`ParamsAccessor::this_borrow`].
+    ///
+    /// # Panic
+    /// This function panics if it is called more times then there are arguments.
+    #[doc(hidden)]
+    #[inline]
+    pub fn arg_borrow<C>(&mut self) -> Result<Borrow<'a, 'js, C>>
+    where
+        C: JsClass<'js> + 'a,
+    {
+        let arg = self.next_raw();
+        // SAFETY: the arguments are kept alive by the caller during the call, which outlives `'a`
+        let cell = unsafe { call_value_cell::<C>(self.params.ctx(), arg)? };
+        cell.try_borrow().map_err(Error::ClassBorrow)
+    }
+
+    /// Borrows the next argument, an instance of the class `C`, mutably.
+    ///
+    /// Used by the `#[function]` and `#[methods]` macros for `&mut C` parameters, see
+    /// [`ParamsAccessor::this_borrow`].
+    ///
+    /// # Panic
+    /// This function panics if it is called more times then there are arguments.
+    #[doc(hidden)]
+    #[inline]
+    pub fn arg_borrow_mut<C>(&mut self) -> Result<BorrowMut<'a, 'js, C>>
+    where
+        C: JsClass<'js> + 'a,
+    {
+        let arg = self.next_raw();
+        // SAFETY: the arguments are kept alive by the caller during the call, which outlives `'a`
+        let cell = unsafe { call_value_cell::<C>(self.params.ctx(), arg)? };
+        cell.try_borrow_mut().map_err(Error::ClassBorrow)
+    }
+
     /// returns the number of arguments remaining
     #[inline]
     pub fn len(&self) -> usize {
@@ -228,6 +296,36 @@ impl<'a, 'js> ParamsAccessor<'a, 'js> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// The cell of `value`, a value of a call alive for `'a`, if it is an instance of the class `C`.
+///
+/// # Safety
+/// `value` must be kept alive for `'a`.
+#[inline]
+unsafe fn call_value_cell<'a, 'js, C>(
+    ctx: &Ctx<'js>,
+    value: qjs::JSValueConst,
+) -> Result<&'a JsCell<'js, C>>
+where
+    C: JsClass<'js> + 'a,
+{
+    match crate::class::class_cell_of::<C>(value) {
+        // SAFETY: the cell lives as long as `value`
+        Some(cell) => Ok(&cell.as_ref().data),
+        None => Err(not_an_instance::<C>(ctx, value)),
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn not_an_instance<'js, C: JsClass<'js>>(ctx: &Ctx<'js>, value: qjs::JSValueConst) -> Error {
+    let value = Value::from_js_value_const(ctx.clone(), value);
+    Error::FromJs {
+        from: value.type_name(),
+        to: C::NAME,
+        message: None,
     }
 }
 
