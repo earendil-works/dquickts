@@ -1102,9 +1102,13 @@ static int snap_write_payload(SnapWriter *w, JSObject *p)
         if (p->u.error.backtrace) {
             /* stack trace not formatted yet: the string is written
                without modifying the heap (the string is kept by
-               snap_put_string()) */
-            JSValue stack = js_backtrace_to_string(ctx, p->u.error.backtrace);
-            int ret = snap_put_value(w, stack);
+               snap_put_string()). The write fails if it cannot be
+               formatted (no null stack trace saved instead) */
+            JSValue stack = js_backtrace_format(ctx, p->u.error.backtrace);
+            int ret;
+            if (JS_IsException(stack))
+                return -1;
+            ret = snap_put_value(w, stack);
             JS_FreeValue(ctx, stack);
             return ret;
         }

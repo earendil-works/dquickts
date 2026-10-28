@@ -8875,7 +8875,7 @@ static void js_backtrace_put_frame(JSContext *ctx, StringBuffer *sb,
         /* no allocation if the atom is a string */
         filename = JS_AtomToString(ctx, b->debug.filename);
         if (JS_IsException(filename)) {
-            string_buffer_puts8(sb, "<null>");
+            string_buffer_set_error(sb);
         } else {
             string_buffer_concat_cstr(sb, JS_VALUE_GET_STRING(filename));
             JS_FreeValue(ctx, filename);
@@ -9081,23 +9081,14 @@ static void js_backtrace_mark(JSRuntime *rt, JSErrorBacktrace *bt,
 }
 
 /* Return the stack trace string of 'bt' (same as get_backtrace() at
-   capture time) or JS_NULL. The pending exception is preserved and no
-   exception is returned. */
-static JSValue js_backtrace_to_string(JSContext *ctx,
-                                      const JSErrorBacktrace *bt)
+   capture time) or JS_EXCEPTION (out of memory). No JS code is
+   run. */
+static JSValue js_backtrace_format(JSContext *ctx, const JSErrorBacktrace *bt)
 {
-    JSRuntime *rt = ctx->rt;
     const JSBacktraceFrame *fr;
-    JSValue ret, saved_exception;
-    BOOL saved_uncatchable;
     StringBuffer sb_s, *sb = &sb_s;
     JSBacktracePosCache pos_cache = { NULL };
     int i;
-
-    saved_exception = rt->current_exception;
-    saved_uncatchable = rt->current_exception_is_uncatchable;
-    rt->current_exception = JS_UNINITIALIZED;
-    rt->current_exception_is_uncatchable = FALSE;
 
     string_buffer_init(ctx, sb, js_backtrace_size_hint(bt->count));
     for(i = 0; i < bt->count; i++) {
@@ -9105,7 +9096,25 @@ static JSValue js_backtrace_to_string(JSContext *ctx,
         js_backtrace_put_frame(ctx, sb, fr->func_name, fr->b, fr->pc,
                                fr->native, &pos_cache);
     }
-    ret = string_buffer_end(sb);
+    return string_buffer_end(sb);
+}
+
+/* Return the stack trace string of 'bt' or JS_NULL if out of memory
+   (see js_backtrace_format()). The pending exception is preserved and
+   no exception is returned. */
+static JSValue js_backtrace_to_string(JSContext *ctx,
+                                      const JSErrorBacktrace *bt)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue ret, saved_exception;
+    BOOL saved_uncatchable;
+
+    saved_exception = rt->current_exception;
+    saved_uncatchable = rt->current_exception_is_uncatchable;
+    rt->current_exception = JS_UNINITIALIZED;
+    rt->current_exception_is_uncatchable = FALSE;
+
+    ret = js_backtrace_format(ctx, bt);
     if (JS_IsException(ret))
         ret = JS_NULL;
 
