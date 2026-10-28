@@ -426,6 +426,45 @@ function test_proxy_is_array()
     assertThrows(TypeError, () => Array.isArray(r));
 }
 
+/* bellard/quickjs#563: an exception thrown by PromiseResolve() in 'await'
+   (here by the 'constructor' getter) is thrown at the await point */
+async function test_issue_563()
+{
+    var log = [], e, n, i;
+    function poisoned() {
+        var p = Promise.resolve(1);
+        Object.defineProperty(p, "constructor", {
+            get() { throw new Error("boom"); } });
+        return p;
+    }
+    try {
+        await poisoned();
+    } catch (ex) {
+        e = ex;
+    } finally {
+        log.push("finally");
+    }
+    assert(e.message, "boom");
+    assert(log.join(), "finally");
+    n = 0;
+    for(i = 0; i < 3; i++) {
+        try {
+            await poisoned();
+        } catch (ex) {
+            n++;
+        }
+    }
+    assert(n, 3);
+    assert(await 2, 2);
+    /* uncaught: the promise of the async function is rejected */
+    e = await (async function() {
+        await poisoned();
+        log.push("not reached");
+    })().then(() => null, ex => ex);
+    assert(e.message, "boom");
+    assert(log.join(), "finally");
+}
+
 /* ng #1577, #1580: for-await does not call return() on normal completion
    and awaits its result on break or return */
 async function test_for_await_close()
@@ -544,5 +583,6 @@ test_template_tostring_order();
 test_syntax_error_column();
 test_date_parse_spaces();
 test_proxy_is_array();
+await test_issue_563();
 await test_for_await_close();
 await test_modules();

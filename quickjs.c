@@ -24110,11 +24110,11 @@ static void js_async_function_resume(JSContext *ctx, JSAsyncFunctionState *s)
 {
     JSValue func_ret, ret2;
 
+ resume:
     func_ret = async_func_resume(ctx, s);
     if (s->is_completed) {
         if (JS_IsException(func_ret)) {
             JSValue error;
-        fail:
             error = JS_GetException(ctx);
             ret2 = js_call(ctx, s->resolving_funcs[1], JS_UNDEFINED,
                            1, (JSValueConst *)&error);
@@ -24156,8 +24156,12 @@ static void js_async_function_resume(JSContext *ctx, JSAsyncFunctionState *s)
         JS_FreeValue(ctx, promise);
         for(i = 0; i < 2; i++)
             JS_FreeValue(ctx, resolving_funcs[i]);
-        if (res)
-            goto fail;
+        if (res) {
+        fail:
+            /* exception: throw it at the await point */
+            s->throw_flag = TRUE;
+            goto resume;
+        }
     }
 }
 
