@@ -17,6 +17,12 @@ unsafe fn throw_missing_data(ctx: *mut qjs::JSContext) -> qjs::JSValue {
     qjs::JS_ThrowTypeError(ctx, c"Rust object without its Rust data".as_ptr())
 }
 
+/// An uncounted copy of the context of a value given to an exotic hook, which the hook lends to
+/// the class: the engine keeps the context alive while it runs the hook.
+unsafe fn hook_ctx<'js>(ctx: &Ctx<'js>) -> mem::ManuallyDrop<Ctx<'js>> {
+    mem::ManuallyDrop::new(core::ptr::read(ctx))
+}
+
 /// FFI finalizer, destroying the object once it is delete by the Gc.
 pub(crate) unsafe extern "C" fn class_finalizer(_rt: *mut qjs::JSRuntime, val: qjs::JSValue) {
     let class_id = Opaque::class_id();
@@ -308,9 +314,9 @@ impl VTable {
         receiver: qjs::JSValueConst,
     ) -> qjs::JSValue {
         let this_ptr = this_ptr.cast::<ClassCell<JsCell<C>>>();
-        let ctx = Ctx::from_ptr(ctx);
-        let atom = Atom::from_atom_val_dup(ctx.clone(), atom);
-        let receiver = Value::from_js_value_const(ctx.clone(), receiver);
+        let receiver = Value::from_js_value_const(Ctx::from_ptr(ctx), receiver);
+        let ctx = hook_ctx(receiver.ctx());
+        let atom = Atom::from_atom_val_dup((*ctx).clone(), atom);
 
         ctx.handle_panic(AssertUnwindSafe(|| {
             C::exotic_get_property(&this_ptr.as_ref().data, &ctx, atom, receiver)
@@ -329,10 +335,10 @@ impl VTable {
         _flags: qjs::c_int,
     ) -> qjs::c_int {
         let this_ptr = this_ptr.cast::<ClassCell<JsCell<C>>>();
-        let ctx = Ctx::from_ptr(ctx);
-        let atom = Atom::from_atom_val_dup(ctx.clone(), atom);
-        let receiver = Value::from_js_value_const(ctx.clone(), receiver);
-        let value = Value::from_js_value_const(ctx.clone(), value);
+        let value = Value::from_js_value_const(Ctx::from_ptr(ctx), value);
+        let ctx = hook_ctx(value.ctx());
+        let atom = Atom::from_atom_val_dup((*ctx).clone(), atom);
+        let receiver = Value::from_js_value_const((*ctx).clone(), receiver);
 
         ctx.handle_panic_exotic(AssertUnwindSafe(|| {
             match C::exotic_set_property(&this_ptr.as_ref().data, &ctx, atom, receiver, value) {
@@ -358,8 +364,8 @@ impl VTable {
         atom: qjs::JSAtom,
     ) -> qjs::c_int {
         let this_ptr = this_ptr.cast::<ClassCell<JsCell<C>>>();
-        let ctx = Ctx::from_ptr(ctx);
-        let atom = Atom::from_atom_val_dup(ctx.clone(), atom);
+        let atom = Atom::from_atom_val_dup(Ctx::from_ptr(ctx), atom);
+        let ctx = hook_ctx(&atom.ctx);
 
         ctx.handle_panic_exotic(AssertUnwindSafe(|| {
             match C::exotic_has_property(&this_ptr.as_ref().data, &ctx, atom) {
@@ -385,8 +391,8 @@ impl VTable {
         atom: qjs::JSAtom,
     ) -> qjs::c_int {
         let this_ptr = this_ptr.cast::<ClassCell<JsCell<C>>>();
-        let ctx = Ctx::from_ptr(ctx);
-        let atom = Atom::from_atom_val_dup(ctx.clone(), atom);
+        let atom = Atom::from_atom_val_dup(Ctx::from_ptr(ctx), atom);
+        let ctx = hook_ctx(&atom.ctx);
 
         ctx.handle_panic_exotic(AssertUnwindSafe(|| {
             match C::exotic_delete_property(&this_ptr.as_ref().data, &ctx, atom) {
@@ -413,8 +419,8 @@ impl VTable {
         prop: qjs::JSAtom,
     ) -> qjs::c_int {
         let this_ptr = this_ptr.cast::<ClassCell<JsCell<C>>>();
-        let ctx = Ctx::from_ptr(ctx);
-        let atom = Atom::from_atom_val_dup(ctx.clone(), prop);
+        let atom = Atom::from_atom_val_dup(Ctx::from_ptr(ctx), prop);
+        let ctx = hook_ctx(&atom.ctx);
 
         ctx.handle_panic_exotic(AssertUnwindSafe(|| {
             match C::exotic_get_own_property(&this_ptr.as_ref().data, &ctx, atom) {
