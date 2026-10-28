@@ -440,7 +440,7 @@ mod test {
         assert_eq!(a,2);
     });
 
-    async_test_case!(idle_runs_jobs_after_error => (rt,ctx){
+    async_test_case!(idle_stops_at_job_error => (rt,ctx){
         ctx.async_with(async |ctx|{
             ctx.eval::<(), _>("globalThis.ran = 0; globalThis.f = () => { ran++ };").unwrap();
             let f: Function = ctx.globals().get("f").unwrap();
@@ -450,6 +450,13 @@ mod test {
             f.defer(()).unwrap();
         }).await;
         assert!(rt.is_job_pending().await);
+        // idle() reports the error of the second job and returns, as the scheduler is empty:
+        // the third job stays pending
+        rt.idle().await;
+        assert!(rt.is_job_pending().await);
+        ctx.async_with(async |ctx|{
+            assert_eq!(ctx.globals().get::<_, i32>("ran").unwrap(), 1);
+        }).await;
         rt.idle().await;
         assert!(!rt.is_job_pending().await);
         ctx.async_with(async |ctx|{
