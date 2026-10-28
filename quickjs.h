@@ -1240,6 +1240,11 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
    opaque in '*popaque' if 'popaque' is not NULL. Used to chain
    handlers. */
 JSInterruptHandler *JS_GetInterruptHandler(JSRuntime *rt, void **popaque);
+/* Call the interrupt handler at the next poll of the code running in
+   'ctx' instead of at the end of the current polling period (every
+   10000 bytecode instructions). Must be called from the thread running
+   'ctx', e.g. in a native function. */
+void JS_TriggerInterruptHandler(JSContext *ctx);
 
 /* Suspension
 

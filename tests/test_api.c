@@ -1299,6 +1299,42 @@ static void test_cfunctions(void)
     CHECK(closure_finalized == 2);
 }
 
+static int trigger_polls;
+
+static int count_interrupt(JSRuntime *rt, void *opaque)
+{
+    trigger_polls++;
+    return 0;
+}
+
+static JSValue trigger_interrupt(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    JS_TriggerInterruptHandler(ctx);
+    return JS_UNDEFINED;
+}
+
+/* JS_TriggerInterruptHandler(): the handler is called at the next poll
+   instead of after 10000 instructions */
+static void test_trigger_interrupt(void)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+
+    JS_SetInterruptHandler(rt, count_interrupt, NULL);
+    set_global(ctx, "trigger", JS_NewCFunction(ctx, trigger_interrupt,
+                                               "trigger", 0));
+    /* the first poll of a new context may call the handler */
+    CHECK(eval_bool(ctx, "for (var i = 0; i < 10; i++); true"));
+    trigger_polls = 0;
+    CHECK(eval_bool(ctx, "for (var i = 0; i < 10; i++); true"));
+    CHECK(trigger_polls == 0);
+    CHECK(eval_bool(ctx, "trigger(); for (var i = 0; i < 10; i++); true"));
+    CHECK(trigger_polls == 1);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 /* proxy handler logging every trap call in 'traps' */
 static const char proxy_handler_src[] =
     "globalThis.traps = [];"
@@ -1843,6 +1879,7 @@ int main(void)
     test_normalize2();
     test_calloc();
     test_weak_map_ephemeron();
+    test_trigger_interrupt();
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);

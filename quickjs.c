@@ -2529,6 +2529,11 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
     rt->interrupt_opaque = opaque;
 }
 
+void JS_TriggerInterruptHandler(JSContext *ctx)
+{
+    ctx->interrupt_counter = 1;
+}
+
 JSInterruptHandler *JS_GetInterruptHandler(JSRuntime *rt, void **popaque)
 {
     if (popaque)
