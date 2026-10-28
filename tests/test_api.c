@@ -1137,7 +1137,7 @@ static void test_json_parse_oom(void)
     JSMemoryUsage stats;
     JSValue parse, args[2], v;
     size_t limit;
-    int n_failed = 0, n_ok = 0;
+    int n_ok = 0;
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);
@@ -1150,7 +1150,6 @@ static void test_json_parse_oom(void)
         v = JS_Call(ctx, parse, JS_UNDEFINED, 2, (JSValueConst *)args);
         JS_SetMemoryLimit(rt, -1);
         if (JS_IsException(v)) {
-            n_failed++;
             JS_FreeValue(ctx, JS_GetException(ctx));
         } else {
             n_ok++;
