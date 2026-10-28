@@ -127,6 +127,33 @@ unreleased:
     decorator syntax errors
 - snapshot format version 8
 - fixed an atom leak when reading truncated bytecode
+- qjsc -fno-unused: omits the built-ins the compiled code does not
+  reference (added JS_EnumCodeNames()); the qjsc executables are linked
+  with the unused functions removed (the library is compiled with
+  -ffunction-sections -fdata-sections), so the -fno-x options make them
+  smaller without LTO; they now have DOMException, atob(), btoa() and
+  performance like qjs (-fno-domexception, -fno-atob, -fno-performance)
+- fixed bellard/quickjs issues:
+  - an exception from the promise 'constructor' getter is thrown at the
+    'await' instead of rejecting the async function (#563)
+  - out of memory while creating a lazy property (JSON.parse,
+    prototype, ...) no longer leaves it undefined or leaks it, and no
+    longer increments the array length without adding the element
+    (#580, #576)
+  - WeakMap and WeakSet entries whose value references their key are
+    collected in one GC (#581)
+  - wrong Math.sumPrecise() result after more than 127 large values,
+    and an overflow check in push_scope() (#546)
+  - Number to string gives the shortest round trip string for the
+    powers of two (#449)
+  - use after free when a Worker is collected while its message is
+    handled (#527); os.Worker throws a TypeError if no worker context
+    function is set (#538)
+  - Cygwin build (#575)
+  - crash when compiling under memory pressure (#531): a DynBuf stops
+    appending after an allocation error, a function whose bytecode
+    could not be emitted is not compiled, and push_scope() failures
+    stop the parser
 
 2026-06-04:
 
