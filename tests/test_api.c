@@ -411,6 +411,43 @@ static void test_string_data(JSContext *ctx)
     check_exception(ctx, "TypeError");
 }
 
+/* JS_NewStringLen() with ASCII runs of every length around 2 and 3 byte
+   sequences and an invalid byte (which also consumes the next byte) */
+static void test_new_string_utf8(JSContext *ctx)
+{
+    JSValue f, v, expected, arg;
+    char buf[128], *p;
+    int k, i;
+
+    f = eval_str(ctx, "(k) => 'x'.repeat(k) + '\\xe9' + 'y'.repeat(k) + "
+                 "'\\u2713' + 'z'.repeat(k) + '\\ufffd' + "
+                 "'w'.repeat(Math.max(k - 1, 0))");
+    CHECK(JS_IsFunction(ctx, f));
+    for(k = 0; k < 20; k++) {
+        p = buf;
+        for(i = 0; i < k; i++)
+            *p++ = 'x';
+        memcpy(p, "\xc3\xa9", 2);
+        p += 2;
+        for(i = 0; i < k; i++)
+            *p++ = 'y';
+        memcpy(p, "\xe2\x9c\x93", 3);
+        p += 3;
+        for(i = 0; i < k; i++)
+            *p++ = 'z';
+        *p++ = '\x80';
+        for(i = 0; i < k; i++)
+            *p++ = 'w';
+        v = JS_NewStringLen(ctx, buf, p - buf);
+        arg = JS_NewInt32(ctx, k);
+        expected = JS_Call(ctx, f, JS_UNDEFINED, 1, &arg);
+        CHECK(JS_StrictEq(ctx, v, expected));
+        JS_FreeValue(ctx, expected);
+        JS_FreeValue(ctx, v);
+    }
+    JS_FreeValue(ctx, f);
+}
+
 static JSValue make_type_error(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
@@ -2939,6 +2976,7 @@ int main(void)
     test_cstring(ctx);
     test_utf16_strings(ctx);
     test_string_data(ctx);
+    test_new_string_utf8(ctx);
     test_new_errors(ctx);
     test_error_len(ctx);
     test_integrity(ctx);

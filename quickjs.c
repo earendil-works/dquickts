@@ -5172,7 +5172,15 @@ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
         string_buffer_write8(b, p_start, len1);
         while (p < p_end) {
             if (*p < 128) {
-                string_buffer_putc8(b, *p++);
+                if (p_end - p >= 8 &&
+                    !(get_u64(p) & UINT64_C(0x8080808080808080))) {
+                    /* copy a run of at least 8 ASCII bytes at once */
+                    len1 = count_ascii(p, p_end - p);
+                    string_buffer_write8(b, p, len1);
+                    p += len1;
+                } else {
+                    string_buffer_putc8(b, *p++);
+                }
             } else {
                 /* parse utf-8 sequence, return 0xFFFFFFFF for error */
                 c = unicode_from_utf8(p, p_end - p, &p_next);
