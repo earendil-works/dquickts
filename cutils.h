@@ -322,9 +322,13 @@ void dbuf_free(DynBuf *s);
 static inline BOOL dbuf_error(DynBuf *s) {
     return s->error;
 }
+/* After an error nothing more is appended, so that the content is a
+   prefix of the expected content: the fast paths of the dbuf_put*()
+   functions call dbuf_claim(), which fails. */
 static inline void dbuf_set_error(DynBuf *s)
 {
     s->error = TRUE;
+    s->allocated_size = s->size;
 }
 
 #define UTF8_CHAR_LEN_MAX 6

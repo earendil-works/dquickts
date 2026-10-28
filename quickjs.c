@@ -31230,7 +31230,8 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
     }
 
     outer_scope = fd->scope_level;
-    push_scope(s);
+    if (push_scope(s) < 0)
+        goto fail;
 
     if (s->token.val == TOK_EXTENDS) {
         class_flags = JS_DEFINE_CLASS_HAS_HERITAGE;
@@ -31266,7 +31267,8 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         goto fail;
 
     /* this scope contains the private fields */
-    push_scope(s);
+    if (push_scope(s) < 0)
+        goto fail;
 
     emit_op(s, OP_push_const);
     ctor_cpool_offset = fd->byte_code.size;
@@ -31375,7 +31377,8 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                     goto fail;
                 }
                 // stack is now: fclosure
-                push_scope(s);
+                if (push_scope(s) < 0)
+                    goto fail;
                 emit_op(s, OP_scope_get_var);
                 emit_atom(s, JS_ATOM_this);
                 emit_u16(s, 0);
@@ -35103,7 +35106,8 @@ static __exception int js_parse_block(JSParseState *s)
     if (js_parse_expect(s, '{'))
         return -1;
     if (s->token.val != '}') {
-        push_scope(s);
+        if (push_scope(s) < 0)
+            return -1;
         using_scope_init(s, &using_be);
         for(;;) {
             if (js_parse_statement_or_decl(s, DECL_MASK_ALL))
@@ -35369,7 +35373,8 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
     /* create scope for the lexical variables declared in the enumeration
        expressions. XXX: Not completely correct because of weird capturing
        semantics in `for (i of o) a.push(function(){return i})` */
-    push_scope(s);
+    if (push_scope(s) < 0)
+        return -1;
 
     /* local for_in scope starts here so individual elements
        can be closed in statement. */
@@ -36956,7 +36961,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             if (next_token(s))
                 goto fail;
             /* create a new scope for `let f;if(1) function f(){}` */
-            push_scope(s);
+            if (push_scope(s) < 0)
+                goto fail;
             set_eval_ret_undefined(s);
             if (js_parse_expr_paren(s))
                 goto fail;
@@ -37092,7 +37098,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
 
             /* create scope for the lexical variables declared in the initial,
                test and increment expressions */
-            push_scope(s);
+            if (push_scope(s) < 0)
+                goto fail;
             /* the resources of a 'using' declaration are disposed
                at the end of the loop */
             using_scope_init(s, &using_be);
@@ -37252,7 +37259,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             if (js_parse_expr_paren(s))
                 goto fail;
 
-            push_scope(s);
+            if (push_scope(s) < 0)
+                goto fail;
             label_break = new_label(s);
             push_break_entry(s->cur_func, &break_entry,
                              label_name, label_break, -1, 1);
@@ -37377,7 +37385,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 if (next_token(s))
                     goto fail;
 
-                push_scope(s);  /* catch variable */
+                if (push_scope(s) < 0)  /* catch variable */
+                    goto fail;
                 emit_label(s, label_catch);
 
                 if (s->token.val == '{') {
@@ -37415,7 +37424,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 /* XXX: should keep the address to nop it out if there is no finally block */
                 emit_goto(s, OP_catch, label_catch2);
 
-                push_scope(s);  /* catch block */
+                if (push_scope(s) < 0)  /* catch block */
+                    goto fail;
                 push_break_entry(s->cur_func, &block_env, JS_ATOM_NULL,
                                  -1, -1, 1);
                 block_env.label_finally = label_finally;
@@ -37513,7 +37523,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             if (js_parse_expr_paren(s))
                 goto fail;
 
-            push_scope(s);
+            if (push_scope(s) < 0)
+                goto fail;
             with_idx = define_var(s, s->cur_func, JS_ATOM__with_,
                                   JS_VAR_DEF_WITH);
             if (with_idx < 0)
@@ -44022,11 +44033,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 ls = &label_slots[label];
                 assert(ls->addr == -1);
                 ls->addr = bc_out.size;
-                /* resolve the relocation entries */
+                /* resolve the relocation entries (if out of memory, the
+                   relocated code may be missing) */
                 for(re = ls->first_reloc; re != NULL; re = re_next) {
                     int diff = ls->addr - re->addr;
                     re_next = re->next;
-                    switch (re->size) {
+                    switch (dbuf_error(&bc_out) ? 0 : re->size) {
                     case 4:
                         put_u32(bc_out.buf + re->addr, diff);
                         break;
@@ -45199,7 +45211,14 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     int function_size, byte_code_offset, cpool_offset;
     int closure_var_offset, vardefs_offset;
     BOOL strip_var_debug;
-    
+
+    /* out of memory while emitting: the last instruction may be
+       incomplete and some labels may be missing */
+    if (dbuf_error(&fd->byte_code)) {
+        JS_ThrowOutOfMemory(ctx);
+        goto fail;
+    }
+
     /* recompute scope linkage */
     for (scope = 0; scope < fd->scope_count; scope++) {
         fd->scopes[scope].first = -1;
