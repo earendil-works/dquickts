@@ -1,7 +1,8 @@
 //! JavaScript array types.
 
 use crate::{atom::PredefinedAtom, qjs, Ctx, FromJs, IntoJs, Object, Result, Value};
-use core::{iter::FusedIterator, marker::PhantomData, ptr};
+use alloc::vec::Vec;
+use core::{iter::FusedIterator, marker::PhantomData, mem, ptr};
 
 use super::convert::FromIteratorJs;
 
@@ -87,6 +88,16 @@ impl<'js> Array<'js> {
             count,
             marker: PhantomData,
         }
+    }
+
+    /// Create an array from owned values of `ctx`, freed even on failure.
+    ///
+    /// `values.len()` must not exceed `i32::MAX`.
+    pub(crate) unsafe fn from_raw_values(ctx: &Ctx<'js>, values: &[qjs::JSValue]) -> Result<Self> {
+        debug_assert!(values.len() <= i32::MAX as usize);
+        let val = qjs::JS_NewArrayFrom(ctx.as_ptr(), values.len() as _, values.as_ptr());
+        let val = ctx.handle_exception(val)?;
+        Ok(Array(Object(Value::from_js_value(ctx.clone(), val))))
     }
 
     pub fn into_object(self) -> Object<'js> {
@@ -179,10 +190,36 @@ where
     where
         T: IntoIterator<Item = A>,
     {
-        let array = Array::new(ctx.clone())?;
-        for (idx, item) in iter.into_iter().enumerate() {
-            let item = item.into_js(ctx)?;
-            array.set(idx as _, item)?;
+        /// Converted elements, freed on drop
+        struct Elements<'a, 'js> {
+            ctx: &'a Ctx<'js>,
+            values: Vec<qjs::JSValue>,
+        }
+
+        impl Drop for Elements<'_, '_> {
+            fn drop(&mut self) {
+                for &value in &self.values {
+                    unsafe { qjs::JS_FreeValue(self.ctx.as_ptr(), value) };
+                }
+            }
+        }
+
+        // JS_NewArrayFrom() takes at most i32::MAX values
+        const MAX_ELEMENTS: usize = i32::MAX as usize;
+
+        let mut iter = iter.into_iter();
+        let mut elements = Elements {
+            ctx,
+            values: Vec::with_capacity(iter.size_hint().0.min(MAX_ELEMENTS)),
+        };
+        for item in iter.by_ref().take(MAX_ELEMENTS) {
+            elements.values.push(item.into_js(ctx)?.into_js_value());
+        }
+        let values = mem::take(&mut elements.values);
+        // the values are consumed, even on failure
+        let array = unsafe { Array::from_raw_values(ctx, &values) }?;
+        for (idx, item) in (MAX_ELEMENTS..).zip(iter) {
+            array.set(idx, item)?;
         }
         Ok(array)
     }
@@ -369,6 +406,51 @@ mod test {
             assert!(ctx.eval::<Vec<i32>, _>("new Int32Array([1, 2])").is_err());
             assert!(ctx.eval::<Vec<i32>, _>("({ length: 1, 0: 1 })").is_err());
             assert!(ctx.eval::<List<(i32, i32)>, _>("new Proxy([1, 2], {})").is_err());
+        })
+    }
+
+    #[test]
+    fn into_js_lists() {
+        test_with(|ctx| {
+            let globals = ctx.globals();
+            globals.set("v", vec![1, 2, 3]).unwrap();
+            globals.set("e", Vec::<i32>::new()).unwrap();
+            globals.set("r", &vec![StdString::from("a"), StdString::from("b")]).unwrap();
+            globals.set("s", &[1.5f64, 2.5][..]).unwrap();
+            globals.set("t", List((1, "x", true))).unwrap();
+            globals.set("t1", List(((),))).unwrap();
+            let ok: bool = ctx
+                .eval(
+                    r#"
+                [v, e, r, s, t, t1].every(Array.isArray) &&
+                v.join() === '1,2,3' && e.length === 0 && r.join() === 'a,b' &&
+                s.join() === '1.5,2.5' && t.join() === '1,x,true' &&
+                t1.length === 1 && 0 in t1 &&
+                v.push(4) === 4 && v.length === 4 && Object.isExtensible(e)
+                "#,
+                )
+                .unwrap();
+            assert!(ok);
+        })
+    }
+
+    #[test]
+    fn into_js_conversion_error() {
+        test_with(|ctx| {
+            let obj = Object::new(ctx.clone()).unwrap();
+            let items: Vec<StdResult<Object, Error>> =
+                vec![Ok(obj.clone()), Err(Error::Unknown), Ok(obj.clone())];
+            assert!(matches!(items.into_js(&ctx), Err(Error::Unknown)));
+            let res = (0..3)
+                .map(|i| match i {
+                    1 => Err(Error::Unknown),
+                    _ => Ok(Object::new(ctx.clone()).unwrap()),
+                })
+                .collect_js::<Array>(&ctx);
+            assert!(matches!(res, Err(Error::Unknown)));
+            let res = List((obj, StdResult::<i32, Error>::Err(Error::Unknown))).into_js(&ctx);
+            assert!(matches!(res, Err(Error::Unknown)));
+            // the already converted values are freed (checked when the runtime is freed)
         })
     }
 }

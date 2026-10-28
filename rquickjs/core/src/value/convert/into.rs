@@ -281,9 +281,10 @@ macro_rules! into_js_impls {
                 #[allow(non_snake_case)]
                 fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
                     let ($($type,)*) = self.0;
-                    let array = Array::new(ctx.clone())?;
-                    $(array.set(into_js_impls!(@idx $type), $type)?;)*
-                    Ok(array.into_value())
+                    // the converted values are freed if a later conversion fails
+                    let values = [$($type.into_js(ctx)?,)*].map(Value::into_js_value);
+                    // the values are consumed, even on failure
+                    Ok(unsafe { Array::from_raw_values(ctx, &values) }?.into_value())
                 }
             }
         )*
@@ -392,23 +393,6 @@ macro_rules! into_js_impls {
             )*
         )*
     };
-
-    (@idx A) => { 0 };
-    (@idx B) => { 1 };
-    (@idx C) => { 2 };
-    (@idx D) => { 3 };
-    (@idx E) => { 4 };
-    (@idx F) => { 5 };
-    (@idx G) => { 6 };
-    (@idx H) => { 7 };
-    (@idx I) => { 8 };
-    (@idx J) => { 9 };
-    (@idx K) => { 10 };
-    (@idx L) => { 11 };
-    (@idx M) => { 12 };
-    (@idx N) => { 13 };
-    (@idx O) => { 14 };
-    (@idx P) => { 15 };
 }
 
 into_js_impls! {
