@@ -62,14 +62,15 @@ impl<'js> IntoJs<'js> for char {
 }
 
 impl<'js> IntoJs<'js> for CString<'js> {
-    fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        String::from_str(ctx.clone(), self.as_str()).map(|String(value)| value)
+    fn into_js(self, _: &Ctx<'js>) -> Result<Value<'js>> {
+        // the source string has the same contents
+        Ok(self.string.0.clone())
     }
 }
 
 impl<'js> IntoJs<'js> for &CString<'js> {
-    fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        String::from_str(ctx.clone(), self.as_str()).map(|String(value)| value)
+    fn into_js(self, _: &Ctx<'js>) -> Result<Value<'js>> {
+        Ok(self.string.0.clone())
     }
 }
 

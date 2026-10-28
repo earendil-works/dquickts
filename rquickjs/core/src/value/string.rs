@@ -198,12 +198,17 @@ impl<'js> String<'js> {
 pub struct CString<'js> {
     ptr: NonNull<c_char>,
     len: usize,
-    ctx: Ctx<'js>,
+    /// The source string, converted back to JavaScript without a copy.
+    pub(crate) string: String<'js>,
 }
 
 impl<'js> CString<'js> {
     /// Create a new JavaScript C string from a JavaScript string.
+    ///
+    /// Fails with [`Error::Utf8`] if the string contains an unpaired surrogate.
     pub fn from_string(string: String<'js>) -> Result<Self> {
+        // Latin-1 always encodes to valid UTF-8, UTF-16 may hold unpaired surrogates
+        let wide = matches!(string.data()?, StringData::Utf16(_));
         let mut len = mem::MaybeUninit::uninit();
         // SAFETY: The pointer points to a JSString content which is ref counted
         let ptr = unsafe {
@@ -215,11 +220,17 @@ impl<'js> CString<'js> {
             return Err(Error::Unknown);
         }
         let len = unsafe { len.assume_init() };
-        Ok(Self {
+        let this = Self {
             ptr: unsafe { NonNull::new_unchecked(ptr as *mut _) },
             len,
-            ctx: string.0.ctx.clone(),
-        })
+            string,
+        };
+        if wide {
+            // the engine keeps unpaired surrogates as invalid 3 byte sequences
+            let bytes = unsafe { slice::from_raw_parts(ptr as *const u8, len) };
+            str::from_utf8(bytes)?;
+        }
+        Ok(this)
     }
 
     /// Converts a `CString` to a raw pointer.
@@ -248,7 +259,7 @@ impl<'js> CString<'js> {
 
 impl<'js> Drop for CString<'js> {
     fn drop(&mut self) {
-        unsafe { qjs::JS_FreeCString(self.ctx.as_ptr(), self.ptr.as_ptr()) };
+        unsafe { qjs::JS_FreeCString(self.string.0.ctx.as_ptr(), self.ptr.as_ptr()) };
     }
 }
 impl<'js> AsRef<str> for CString<'js> {
@@ -423,6 +434,19 @@ mod test {
             ctx.run_gc();
             assert_eq!(view.len(), 2001);
             assert_eq!(&view[999..1002], "abc");
+        });
+    }
+
+    #[test]
+    fn cstring_rejects_unpaired_surrogates() {
+        test_with(|ctx| {
+            let res = ctx.eval::<CString, _>("'ab\\ud800'");
+            assert!(matches!(res, Err(Error::Utf8(_))));
+            let s: CString = ctx.eval("'h\\xe9llo \\ud83d\\ude00'").unwrap();
+            assert_eq!(s.as_str(), "h\u{e9}llo \u{1f600}");
+            let func: Function = ctx.eval("x => x === 'h\\xe9llo \\ud83d\\ude00'").unwrap();
+            assert!(func.call::<_, bool>((&s,)).unwrap());
+            assert!(func.call::<_, bool>((s,)).unwrap());
         });
     }
 
