@@ -1125,6 +1125,59 @@ static void test_autoinit_oom(void)
     CHECK(n_failed > 0);
 }
 
+/* regression test: out of memory errors during the compilation were
+   ignored in some places (variable resolution, constant pool, lookahead,
+   bytecode patches), which led to crashes and assertion failures or to
+   a successful compilation with a pending exception (upstream
+   bellard/quickjs issues 528, 530 and 532) */
+static void test_parser_oom(void)
+{
+    static const char src_head[] =
+        "function f(a, [b, c] = [1, 2], {d, e} = {}) {\n"
+        "  class C { #x = 1; static y = `t${a}`; m() { return this.#x; } }\n"
+        "  switch (a) { case 1: break; default: a++; }\n"
+        "  var g = (u, v) => u + v, h = async (w) => w;\n"
+        "  for (var [k, l] of [[1, 2]]) a += k + l;\n"
+        "  return function () { eval(''); return String.raw`x${b}` + [";
+    static const char src_tail[] = "]; };\n}\n";
+    char src[4096];
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSMemoryUsage stats;
+    JSValue v, e;
+    size_t limit, len;
+    int i, n_ok = 0, n_failed = 0;
+
+    len = snprintf(src, sizeof(src), "%s", src_head);
+    for(i = 0; i < 120; i++)
+        len += snprintf(src + len, sizeof(src) - len, "g%d, ", i);
+    len += snprintf(src + len, sizeof(src) - len, "%s", src_tail);
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    for(limit = 0; limit < 256 * 1024 && n_ok < 4; limit += 64) {
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, stats.malloc_size + limit);
+        v = JS_Eval(ctx, src, len, "<oom>",
+                    JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        JS_SetMemoryLimit(rt, -1);
+        if (JS_IsException(v)) {
+            /* the compilation fails with the exception */
+            e = JS_GetException(ctx);
+            CHECK(!JS_IsUninitialized(e));
+            JS_FreeValue(ctx, e);
+            n_failed++;
+        } else {
+            CHECK(!JS_HasException(ctx));
+            JS_FreeValue(ctx, v);
+            n_ok++;
+        }
+    }
+    CHECK(n_failed > 0 && n_ok > 0);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static int detect_module(const char *src)
 {
     return JS_DetectModule(src, strlen(src));
@@ -2057,6 +2110,7 @@ int main(void)
     test_promise_hooks();
     test_with_resolvers_oom();
     test_autoinit_oom();
+    test_parser_oom();
     test_detect_module();
     printf("test_api: OK\n");
     return 0;
