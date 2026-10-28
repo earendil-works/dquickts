@@ -1,6 +1,11 @@
 use crate::{qjs, Ctx, Error, Result, StdString, Value};
 use alloc::{borrow::Cow, vec::Vec};
-use core::{ffi::c_char, mem, ptr::NonNull, slice, str};
+use core::{
+    ffi::c_char,
+    mem::{self, MaybeUninit},
+    ptr::{self, NonNull},
+    slice, str,
+};
 
 /// Borrowed contents of a JavaScript string in its internal representation.
 pub(crate) enum StringData<'a> {
@@ -10,83 +15,331 @@ pub(crate) enum StringData<'a> {
     Utf16(&'a [u16]),
 }
 
+// UTF-8 encoders of the engine's string representations. They count the
+// exact output length in a vectorizable pass first, then encode runs of
+// words (8 Latin-1 bytes, 4 UTF-16 code units) that need the same number of
+// bytes per character with loops that the compiler vectorizes, and mixed
+// words character by character.
+
+/// Elements per block of the counting passes: the per block counters are
+/// `u16` lanes, which vectorize well, and grow by at most 2 per element.
+const COUNT_BLOCK: usize = 1 << 14;
+
+/// The high bit of each byte of a word of 8 Latin-1 bytes.
+const HIGH_BYTES: u64 = 0x8080_8080_8080_8080;
+
+/// 1 in each 16-bit lane of a word of 4 UTF-16 code units.
+const LANES: u64 = 0x0001_0001_0001_0001;
+
+/// Load 8 bytes as a word (the byte order does not matter to the tests of
+/// the high bits).
+#[inline(always)]
+fn word8(bytes: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap())
+}
+
+/// Load 4 code units as a word of 16-bit lanes.
+#[inline(always)]
+fn word16(units: &[u16], i: usize) -> u64 {
+    let u: &[u16; 4] = units[i..i + 4].try_into().unwrap();
+    u64::from(u[0]) | (u64::from(u[1]) << 16) | (u64::from(u[2]) << 32) | (u64::from(u[3]) << 48)
+}
+
+/// Whether a 16-bit lane of `w` is zero.
+#[inline(always)]
+fn has_zero_lane(w: u64) -> bool {
+    (w.wrapping_sub(LANES) & !w & (LANES << 15)) != 0
+}
+
+/// The 4 code units of `w` are ASCII.
+#[inline(always)]
+fn is_ascii_word(w: u64) -> bool {
+    (w & (LANES * 0xff80)) == 0
+}
+
+/// The 4 code units of `w` take 2 bytes in UTF-8 (U+0080 to U+07FF).
+#[inline(always)]
+fn is_two_byte_word(w: u64) -> bool {
+    (w & (LANES * 0xf800)) == 0 && !has_zero_lane(w & (LANES * 0x0780))
+}
+
+/// The 4 code units of `w` take 3 bytes in UTF-8 (U+0800 to U+FFFF but not
+/// surrogates).
+#[inline(always)]
+fn is_three_byte_word(w: u64) -> bool {
+    let t = w & (LANES * 0xf800);
+    !has_zero_lane(t) && !has_zero_lane(t ^ (LANES * 0xd800))
+}
+
+/// Number of bytes >= 0x80.
+fn count_non_ascii(bytes: &[u8]) -> usize {
+    let mut n = 0;
+    for block in bytes.chunks(COUNT_BLOCK) {
+        let mut count = 0u16;
+        for &b in block {
+            count += u16::from(b >> 7);
+        }
+        n += count as usize;
+    }
+    n
+}
+
+/// Copy ASCII bytes to the start of `dst`, returning the number of bytes written.
+#[inline(always)]
+fn copy_ascii(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> usize {
+    let dst = &mut dst[..src.len()];
+    // SAFETY: both slices have src.len() elements, MaybeUninit<u8> has the
+    // layout of u8, and a shared and a mutable borrow do not overlap
+    unsafe { ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<u8>(), src.len()) };
+    src.len()
+}
+
+/// Encode Latin-1 bytes which are all >= 0x80 to the start of `dst`,
+/// returning the number of bytes written.
+fn encode_latin1_high(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> usize {
+    let len = src.len() * 2;
+    for (d, &b) in dst[..len].chunks_exact_mut(2).zip(src) {
+        d[0] = MaybeUninit::new(0xc0 | (b >> 6));
+        d[1] = MaybeUninit::new(0x80 | (b & 0x3f));
+    }
+    len
+}
+
+/// Encode Latin-1 bytes one by one at `dst[pos..]`, returning the end position.
+#[inline(always)]
+fn encode_latin1_bytes(src: &[u8], dst: &mut [MaybeUninit<u8>], mut pos: usize) -> usize {
+    for &b in src {
+        if b < 0x80 {
+            dst[pos] = MaybeUninit::new(b);
+            pos += 1;
+        } else {
+            dst[pos] = MaybeUninit::new(0xc0 | (b >> 6));
+            dst[pos + 1] = MaybeUninit::new(0x80 | (b & 0x3f));
+            pos += 2;
+        }
+    }
+    pos
+}
+
+/// End of the run of words of 8 bytes from `i` whose high bits are `high`.
+#[inline(always)]
+fn latin1_run_end(bytes: &[u8], mut i: usize, high: u64) -> usize {
+    while i + 8 <= bytes.len() && (word8(bytes, i) & HIGH_BYTES) == high {
+        i += 8;
+    }
+    i
+}
+
+/// Encode Latin-1 bytes to the start of `dst`, returning the number of bytes
+/// written.
+fn encode_latin1(src: &[u8], dst: &mut [MaybeUninit<u8>]) -> usize {
+    let mut i = 0;
+    let mut pos = 0;
+    while i + 8 <= src.len() {
+        let start = i;
+        match word8(src, i) & HIGH_BYTES {
+            0 => {
+                i = latin1_run_end(src, i + 8, 0);
+                pos += copy_ascii(&src[start..i], &mut dst[pos..]);
+            }
+            HIGH_BYTES => {
+                i = latin1_run_end(src, i + 8, HIGH_BYTES);
+                pos += encode_latin1_high(&src[start..i], &mut dst[pos..]);
+            }
+            _ => {
+                i += 8;
+                pos = encode_latin1_bytes(&src[start..i], dst, pos);
+            }
+        }
+    }
+    encode_latin1_bytes(&src[i..], dst, pos)
+}
+
 /// Encode Latin-1 bytes as UTF-8.
-fn latin1_to_string(bytes: &[u8]) -> StdString {
+pub(crate) fn latin1_to_string(bytes: &[u8]) -> StdString {
     if bytes.is_ascii() {
         // SAFETY: ASCII is valid UTF-8
         return unsafe { StdString::from_utf8_unchecked(bytes.to_vec()) };
     }
-    let non_ascii = bytes.iter().filter(|&&b| b >= 0x80).count();
-    let mut out = Vec::with_capacity(bytes.len() + non_ascii);
-    for &b in bytes {
-        if b < 0x80 {
-            out.push(b);
+    let non_ascii = count_non_ascii(bytes);
+    let len = bytes.len() + non_ascii;
+    let mut out = Vec::<u8>::with_capacity(len);
+    let dst = &mut out.spare_capacity_mut()[..len];
+    let written = if non_ascii == bytes.len() {
+        encode_latin1_high(bytes, dst)
+    } else {
+        encode_latin1(bytes, dst)
+    };
+    // the encoders write their output in order from the start of dst
+    assert_eq!(written, len);
+    // SAFETY: the len bytes are initialized with the UTF-8 encoding of each
+    // Latin-1 code point
+    unsafe {
+        out.set_len(len);
+        StdString::from_utf8_unchecked(out)
+    }
+}
+
+/// Numbers of code units >= U+0080, >= U+0800 and of surrogates.
+fn count_utf16(units: &[u16]) -> (usize, usize, usize) {
+    let (mut n80, mut n800, mut surrogates) = (0, 0, 0);
+    for block in units.chunks(COUNT_BLOCK) {
+        let (mut a, mut b, mut c) = (0u16, 0u16, 0u16);
+        for &u in block {
+            a += u16::from(u >= 0x80);
+            b += u16::from(u >= 0x800);
+            c += u16::from((u & 0xf800) == 0xd800);
+        }
+        n80 += a as usize;
+        n800 += b as usize;
+        surrogates += c as usize;
+    }
+    (n80, n800, surrogates)
+}
+
+/// Encode ASCII code units to the start of `dst`, returning the number of
+/// bytes written.
+fn narrow_ascii(src: &[u16], dst: &mut [MaybeUninit<u8>]) -> usize {
+    for (d, &c) in dst[..src.len()].iter_mut().zip(src) {
+        *d = MaybeUninit::new(c as u8);
+    }
+    src.len()
+}
+
+/// Encode code units from U+0080 to U+07FF to the start of `dst`, returning
+/// the number of bytes written.
+fn encode_two_bytes(src: &[u16], dst: &mut [MaybeUninit<u8>]) -> usize {
+    let len = src.len() * 2;
+    for (d, &c) in dst[..len].chunks_exact_mut(2).zip(src) {
+        d[0] = MaybeUninit::new(0xc0 | (c >> 6) as u8);
+        d[1] = MaybeUninit::new(0x80 | (c & 0x3f) as u8);
+    }
+    len
+}
+
+/// Encode code units from U+0800 to U+FFFF which are not surrogates to the
+/// start of `dst`, returning the number of bytes written.
+fn encode_three_bytes(src: &[u16], dst: &mut [MaybeUninit<u8>]) -> usize {
+    let len = src.len() * 3;
+    for (d, &c) in dst[..len].chunks_exact_mut(3).zip(src) {
+        d[0] = MaybeUninit::new(0xe0 | (c >> 12) as u8);
+        d[1] = MaybeUninit::new(0x80 | ((c >> 6) & 0x3f) as u8);
+        d[2] = MaybeUninit::new(0x80 | (c & 0x3f) as u8);
+    }
+    len
+}
+
+/// Encode the code units `units[i..end]` one by one at `dst[pos..]` (a
+/// surrogate pair starting at `end - 1` is completed), returning the end
+/// positions in `units` and `dst`, or `None` if there is an unpaired surrogate.
+#[inline(always)]
+fn encode_utf16_units(
+    units: &[u16],
+    mut i: usize,
+    end: usize,
+    dst: &mut [MaybeUninit<u8>],
+    mut pos: usize,
+) -> Option<(usize, usize)> {
+    while i < end {
+        let c = u32::from(units[i]);
+        i += 1;
+        if c < 0x80 {
+            dst[pos] = MaybeUninit::new(c as u8);
+            pos += 1;
+        } else if c < 0x800 {
+            dst[pos] = MaybeUninit::new(0xc0 | (c >> 6) as u8);
+            dst[pos + 1] = MaybeUninit::new(0x80 | (c & 0x3f) as u8);
+            pos += 2;
+        } else if (c & 0xf800) != 0xd800 {
+            dst[pos] = MaybeUninit::new(0xe0 | (c >> 12) as u8);
+            dst[pos + 1] = MaybeUninit::new(0x80 | ((c >> 6) & 0x3f) as u8);
+            dst[pos + 2] = MaybeUninit::new(0x80 | (c & 0x3f) as u8);
+            pos += 3;
         } else {
-            out.extend_from_slice(&[0xc0 | (b >> 6), 0x80 | (b & 0x3f)]);
+            // a high surrogate followed by a low surrogate
+            let c1 = match units.get(i) {
+                Some(&c1) if c < 0xdc00 && (c1 & 0xfc00) == 0xdc00 => u32::from(c1),
+                _ => return None,
+            };
+            i += 1;
+            let c = 0x10000 + ((c - 0xd800) << 10) + (c1 - 0xdc00);
+            dst[pos] = MaybeUninit::new(0xf0 | (c >> 18) as u8);
+            dst[pos + 1] = MaybeUninit::new(0x80 | ((c >> 12) & 0x3f) as u8);
+            dst[pos + 2] = MaybeUninit::new(0x80 | ((c >> 6) & 0x3f) as u8);
+            dst[pos + 3] = MaybeUninit::new(0x80 | (c & 0x3f) as u8);
+            pos += 4;
         }
     }
-    // SAFETY: each byte was encoded as a valid UTF-8 sequence
-    unsafe { StdString::from_utf8_unchecked(out) }
+    Some((i, pos))
+}
+
+/// End of the run of words of 4 code units from `i` of the class `is_class`.
+#[inline(always)]
+fn utf16_run_end(units: &[u16], mut i: usize, is_class: impl Fn(u64) -> bool) -> usize {
+    while i + 4 <= units.len() && is_class(word16(units, i)) {
+        i += 4;
+    }
+    i
+}
+
+/// Encode UTF-16 code units to the start of `dst`, returning the number of
+/// bytes written, or `None` if there is an unpaired surrogate.
+fn encode_utf16(units: &[u16], dst: &mut [MaybeUninit<u8>]) -> Option<usize> {
+    let mut i = 0;
+    let mut pos = 0;
+    while i < units.len() {
+        if i + 4 <= units.len() {
+            let start = i;
+            let w = word16(units, i);
+            if is_ascii_word(w) {
+                i = utf16_run_end(units, i + 4, is_ascii_word);
+                pos += narrow_ascii(&units[start..i], &mut dst[pos..]);
+                continue;
+            }
+            if is_three_byte_word(w) {
+                i = utf16_run_end(units, i + 4, is_three_byte_word);
+                pos += encode_three_bytes(&units[start..i], &mut dst[pos..]);
+                continue;
+            }
+            if is_two_byte_word(w) {
+                i = utf16_run_end(units, i + 4, is_two_byte_word);
+                pos += encode_two_bytes(&units[start..i], &mut dst[pos..]);
+                continue;
+            }
+        }
+        // a mixed word or the last code units
+        let end = units.len().min(i + 4);
+        (i, pos) = encode_utf16_units(units, i, end, dst, pos)?;
+    }
+    Some(pos)
 }
 
 /// Encode UTF-16 code units as UTF-8, or `None` if there is an unpaired surrogate.
-fn utf16_to_string(units: &[u16]) -> Option<StdString> {
-    // exact UTF-8 length, rejecting unpaired surrogates
-    let mut len = 0;
-    let mut i = 0;
-    while i < units.len() {
-        let c = units[i];
-        len += match c {
-            0..=0x7f => 1,
-            0x80..=0x7ff => 2,
-            0xd800..=0xdbff => match units.get(i + 1) {
-                Some(&c1) if (0xdc00..=0xdfff).contains(&c1) => {
-                    i += 1;
-                    4
-                }
-                _ => return None,
-            },
-            0xdc00..=0xdfff => return None,
-            _ => 3,
-        };
-        i += 1;
-    }
+pub(crate) fn utf16_to_string(units: &[u16]) -> Option<StdString> {
+    let n = units.len();
+    let (n80, n800, surrogates) = count_utf16(units);
+    // a surrogate pair takes 4 bytes, the counts give it 3 per code unit
+    let len = n + n80 + n800 - surrogates;
     let mut out = Vec::<u8>::with_capacity(len);
-    let dst = out.as_mut_ptr();
-    let mut pos = 0;
-    let mut i = 0;
-    // SAFETY: the code units are classified as in the first pass, which
-    // counted exactly the bytes written here into the capacity of len
+    let dst = &mut out.spare_capacity_mut()[..len];
+    // the whole string at once when all the code units have the same length
+    let written = if surrogates != 0 {
+        encode_utf16(units, dst)?
+    } else if n80 == 0 {
+        narrow_ascii(units, dst)
+    } else if n800 == n {
+        encode_three_bytes(units, dst)
+    } else if n80 == n && n800 == 0 {
+        encode_two_bytes(units, dst)
+    } else {
+        encode_utf16(units, dst)?
+    };
+    // the encoders write their output in order from the start of dst
+    assert_eq!(written, len);
+    // SAFETY: the len bytes are initialized with the UTF-8 encoding of each
+    // code point (surrogates are paired)
     unsafe {
-        while i < units.len() {
-            let c = units[i] as u32;
-            i += 1;
-            if c < 0x80 {
-                dst.add(pos).write(c as u8);
-                pos += 1;
-            } else if c < 0x800 {
-                dst.add(pos).write(0xc0 | (c >> 6) as u8);
-                dst.add(pos + 1).write(0x80 | (c & 0x3f) as u8);
-                pos += 2;
-            } else if (0xd800..=0xdbff).contains(&c) {
-                // paired, checked by the first pass
-                let c = 0x10000 + ((c - 0xd800) << 10) + (units[i] as u32 - 0xdc00);
-                i += 1;
-                dst.add(pos).write(0xf0 | (c >> 18) as u8);
-                dst.add(pos + 1).write(0x80 | ((c >> 12) & 0x3f) as u8);
-                dst.add(pos + 2).write(0x80 | ((c >> 6) & 0x3f) as u8);
-                dst.add(pos + 3).write(0x80 | (c & 0x3f) as u8);
-                pos += 4;
-            } else {
-                dst.add(pos).write(0xe0 | (c >> 12) as u8);
-                dst.add(pos + 1).write(0x80 | ((c >> 6) & 0x3f) as u8);
-                dst.add(pos + 2).write(0x80 | (c & 0x3f) as u8);
-                pos += 3;
-            }
-        }
-        debug_assert_eq!(pos, len);
         out.set_len(len);
-        // SAFETY: UTF-8 encoding of scalar values (surrogates were paired)
         Some(StdString::from_utf8_unchecked(out))
     }
 }
@@ -401,6 +654,7 @@ mod test {
                         'a'.repeat(1000) + '\ud83d\ude00' + 'c'.repeat(1000) + '\xe9',
                         // unpaired surrogates
                         '\ud800', '\udc00', 'ab\ud800', '\ud800x', '\udc00\ud800', 'x\ud83d\ude00\udfff',
+                        '\u2713\u2713\u2713\u2713\ud800', '\u2713\u2713\u2713\ud800\u2713\u2713\u2713\u2713',
                         'a'.repeat(1000) + '\ud800' + 'c'.repeat(1000),
                     ]
                 "#,
@@ -417,6 +671,50 @@ mod test {
             assert!(matches!(strings[5].to_str().unwrap(), Cow::Owned(s) if s == "caf\u{e9}"));
             assert_eq!(strings[8].to_string().unwrap(), "\u{1f600} emoji \u{1f389}");
             assert!(matches!(strings[13].to_string(), Err(Error::Utf8(_))));
+        });
+    }
+
+    #[test]
+    fn to_string_matches_engine_mixed() {
+        test_with(|ctx| {
+            // every length around the word sizes of the encoders, with runs
+            // and mixes of characters of each UTF-8 length
+            let strings: Vec<String> = ctx
+                .eval(
+                    r#"
+                    const pools = [
+                        ['a', 'b'], ['a', '\xe9'], ['\xe9', '\xff', '\x80'], ['a', '\u0100', '\u07ff'],
+                        ['\u0800', '\u2713', '\uffff', '\ue000', '\ud7ff'], ['\u0080', '\u07ff'],
+                        ['a', '\xe9', '\u2713', '\ud83d\ude00'], ['\ud83d\ude00', '\u2713'],
+                        ['a', '\u2713', '\ud800'], ['\u2713', '\udc00'], ['\udbff\udfff', 'a'],
+                    ];
+                    let seed = 1;
+                    const rnd = (n) => {
+                        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+                        return seed % n;
+                    };
+                    const out = [];
+                    for (const pool of pools) {
+                        for (let len = 0; len < 40; len++) {
+                            let s = '';
+                            for (let i = 0; i < len; i++) s += pool[rnd(pool.length)];
+                            out.push(s);
+                            const [first, last] = [pool[0], pool[pool.length - 1]];
+                            out.push(first.repeat(len) + last + first.repeat(len));
+                            out.push(last.repeat(len) + first + last.repeat(len % 7));
+                        }
+                    }
+                    // more than one block of the counting passes
+                    out.push('\xe9'.repeat(40000), '\u2713'.repeat(40000), '\u07ff'.repeat(40000));
+                    out.push('a'.repeat(20000) + '\xe9'.repeat(20000) + 'a');
+                    out.push('a'.repeat(20000) + '\u2713'.repeat(20000) + '\ud83d\ude00');
+                    out
+                "#,
+                )
+                .unwrap();
+            for s in &strings {
+                check_same_as_cstring(s);
+            }
         });
     }
 
