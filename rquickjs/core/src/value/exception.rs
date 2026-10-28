@@ -231,6 +231,29 @@ mod test {
     }
 
     #[test]
+    fn throw_conversion_messages() {
+        let rt = Runtime::new().unwrap();
+        let ctx = Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            // same text as `Display`, on the stack buffer or not
+            for error in [
+                Error::new_from_js("value", "thing"),
+                Error::new_from_js_message("value", "thing", ""),
+                Error::new_from_js_message("value", "thing", "bad \u{e9}"),
+                Error::new_into_js("thing", "value"),
+                Error::new_into_js_message("thing", "value", "too long"),
+                Error::new_from_js_message("value", "thing", "y".repeat(220)),
+                Error::new_into_js_message("thing", "value", "z".repeat(300)),
+            ] {
+                let _ = error.throw(&ctx);
+                let object = ctx.catch().into_object().unwrap();
+                let exception = Exception::from_object(object).unwrap();
+                assert_eq!(exception.message(), Some(error.to_string()));
+            }
+        });
+    }
+
+    #[test]
     fn test_throw_dom() {
         let rt = Runtime::new().unwrap();
         let ctx = Context::custom::<intrinsic::DOMException>(&rt).unwrap();

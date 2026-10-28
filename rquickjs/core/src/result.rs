@@ -2,6 +2,7 @@ use core::{
     error::Error as StdError,
     ffi::FromBytesWithNulError,
     fmt::{self, Display, Formatter, Result as FmtResult},
+    mem::MaybeUninit,
     panic::UnwindSafe,
     str::{FromStr, Utf8Error},
 };
@@ -327,7 +328,28 @@ impl Error {
             }
         };
         // the message is not formatted nor truncated by QuickJS
-        let message = self.to_string();
+        let mut stack = MaybeUninit::uninit();
+        let mut heap = StdString::new();
+        let message = match self {
+            // frequent: built without the formatting machinery nor an allocation (same text
+            // as `Display`)
+            FromJs { from, to, message } => conversion_message(
+                &mut stack,
+                &mut heap,
+                ["Error converting from js '", *from, "' into type '", *to],
+                message,
+            ),
+            IntoJs { from, to, message } => conversion_message(
+                &mut stack,
+                &mut heap,
+                ["Error converting from '", *from, "' into js '", *to],
+                message,
+            ),
+            _ => {
+                heap = self.to_string();
+                heap.as_str()
+            }
+        };
         unsafe {
             qjs::JS_ThrowErrorLen(
                 ctx.as_ptr(),
@@ -336,6 +358,51 @@ impl Error {
                 message.len() as _,
             )
         }
+    }
+}
+
+/// Size of the stack buffer of [`concat_message`].
+const MESSAGE_STACK_SIZE: usize = 256;
+
+/// Returns the concatenation of `parts`, stored in `stack` or, if it is longer, in `heap`.
+fn concat_message<'a>(
+    stack: &'a mut MaybeUninit<[u8; MESSAGE_STACK_SIZE]>,
+    heap: &'a mut StdString,
+    parts: &[&str],
+) -> &'a str {
+    let len: usize = parts.iter().map(|part| part.len()).sum();
+    if len > MESSAGE_STACK_SIZE {
+        heap.reserve_exact(len);
+        for part in parts {
+            heap.push_str(part);
+        }
+        return heap.as_str();
+    }
+    let base = stack.as_mut_ptr().cast::<u8>();
+    let mut pos = 0;
+    for part in parts {
+        // SAFETY: `pos + part.len() <= len <= MESSAGE_STACK_SIZE`
+        unsafe { core::ptr::copy_nonoverlapping(part.as_ptr(), base.add(pos), part.len()) };
+        pos += part.len();
+    }
+    // SAFETY: the first `len` bytes are initialized with a concatenation of UTF-8 strings
+    unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(base, len)) }
+}
+
+/// Returns the message of a `FromJs` or `IntoJs` error (see `Display`) whose text before the
+/// closing quote of the target type is `head`.
+fn conversion_message<'a>(
+    stack: &'a mut MaybeUninit<[u8; MESSAGE_STACK_SIZE]>,
+    heap: &'a mut StdString,
+    head: [&str; 4],
+    message: &Option<StdString>,
+) -> &'a str {
+    let [a, b, c, d] = head;
+    match message.as_deref() {
+        Some(message) if !message.is_empty() => {
+            concat_message(stack, heap, &[a, b, c, d, "': ", message])
+        }
+        _ => concat_message(stack, heap, &[a, b, c, d, "'"]),
     }
 }
 
