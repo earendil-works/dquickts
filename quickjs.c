@@ -555,6 +555,10 @@ typedef enum {
     JS_AUTOINIT_ID_PROP,
 } JSAutoInitIDEnum;
 
+/* log2 of the number of shapes kept by JSContext.object_from_shapes */
+#define JS_OBJECT_FROM_SHAPES_BITS 4
+#define JS_OBJECT_FROM_SHAPES (1 << JS_OBJECT_FROM_SHAPES_BITS)
+
 /* must be large enough to have a negligible runtime cost and small
    enough to call the interrupt callback often. */
 #ifndef JS_INTERRUPT_COUNTER_INIT
@@ -577,6 +581,10 @@ struct JSContext {
     /* shapes of the Error objects with a 'message' property, created
        on first use (see js_get_error_shape()) */
     JSShape *error_shape[JS_NATIVE_ERROR_COUNT + 1];
+    /* the last shapes created by JS_NewObjectFrom(), kept alive so
+       that the next objects with the same properties reuse them
+       (indexed by the shape hash) */
+    JSShape *object_from_shapes[JS_OBJECT_FROM_SHAPES];
 
     JSValue *class_proto;
     JSValue function_proto;
@@ -3199,6 +3207,10 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
         if (ctx->error_shape[i])
             mark_func(rt, &ctx->error_shape[i]->header);
     }
+    for(i = 0; i < JS_OBJECT_FROM_SHAPES; i++) {
+        if (ctx->object_from_shapes[i])
+            mark_func(rt, &ctx->object_from_shapes[i]->header);
+    }
 }
 
 /* called by JS_FreeContext() when the last reference is released */
@@ -3273,6 +3285,8 @@ void __JS_FreeContext(JSContext *ctx)
     js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
     for(i = 0; i <= JS_NATIVE_ERROR_COUNT; i++)
         js_free_shape_null(ctx->rt, ctx->error_shape[i]);
+    for(i = 0; i < JS_OBJECT_FROM_SHAPES; i++)
+        js_free_shape_null(ctx->rt, ctx->object_from_shapes[i]);
 
     list_del(&ctx->link);
     remove_gc_object(&ctx->header);
@@ -6526,6 +6540,103 @@ static JSShape *find_hashed_shape_prop(JSRuntime *rt, JSShape *sh,
     next: ;
     }
     return NULL;
+}
+
+/* hash of the shape with prototype 'proto' and the properties
+   'props[]' of flags 'prop_flags', as add_shape_property() would
+   compute it adding them in this order */
+static uint32_t shape_hash_props(JSObject *proto, int count,
+                                 const JSAtom *props, int prop_flags)
+{
+    uint32_t h;
+    int i;
+
+    h = shape_initial_hash(proto);
+    for(i = 0; i < count; i++)
+        h = shape_hash(shape_hash(h, props[i]), prop_flags);
+    return h;
+}
+
+/* find a hashed shape of hash 'h' with prototype 'proto' and exactly
+   the properties 'props[]' of flags 'prop_flags'. Return NULL if not
+   found */
+static JSShape *find_hashed_shape_props(JSRuntime *rt, uint32_t h,
+                                        JSObject *proto, int count,
+                                        const JSAtom *props, int prop_flags)
+{
+    JSShape *sh;
+    JSShapeProperty *prs;
+    int i;
+
+    for(sh = rt->shape_hash[get_shape_hash(h, rt->shape_hash_bits)];
+        sh != NULL; sh = sh->shape_hash_next) {
+        if (sh->hash == h && sh->proto == proto && sh->prop_count == count) {
+            prs = get_shape_prop(sh);
+            for(i = 0; i < count; i++) {
+                if (prs[i].atom != props[i] || prs[i].flags != prop_flags)
+                    break;
+            }
+            if (i == count)
+                return sh;
+        }
+    }
+    return NULL;
+}
+
+/* create the hashed shape of hash 'h' (see shape_hash_props()) with
+   prototype 'proto' and the properties 'props[]' of flags
+   'prop_flags', sized for them. Return -1 if exception, 1 (and
+   *psh = NULL) if 'props[]' contains duplicates or too many
+   properties */
+static int js_new_shape_props(JSContext *ctx, JSShape **psh, uint32_t h,
+                              JSObject *proto, int count,
+                              const JSAtom *props, int prop_flags)
+{
+    JSRuntime *rt = ctx->rt;
+    JSShape *sh;
+    JSShapeProperty *prs, *pr;
+    int i, hash_size, prop_size;
+    uint32_t hi, j;
+
+    *psh = NULL;
+    /* JSShapeProperty.hash_next holds a property index + 1 */
+    if (count >= (1 << 26) - 1)
+        return 1;
+    if (count <= JS_PROP_INITIAL_SIZE) {
+        prop_size = JS_PROP_INITIAL_SIZE;
+        hash_size = JS_PROP_INITIAL_HASH_SIZE;
+    } else {
+        /* as resize_properties() */
+        prop_size = count;
+        hash_size = 1 << (32 - clz32(count - 1));
+    }
+    /* resize the shape hash table if necessary */
+    if (2 * (rt->shape_hash_count + 1) > rt->shape_hash_size)
+        resize_shape_hash(rt, rt->shape_hash_bits + 1);
+    sh = js_new_shape_nohash(ctx, proto, hash_size, prop_size);
+    if (!sh)
+        return -1;
+    prs = get_shape_prop(sh);
+    for(i = 0; i < count; i++) {
+        hi = prop_hash_index(props[i], sh->prop_hash_mask);
+        for(j = sh->hash_table[hi]; j != 0; j = prs[j - 1].hash_next) {
+            if (prs[j - 1].atom == props[i]) {
+                js_free_shape(rt, sh);
+                return 1;
+            }
+        }
+        pr = &prs[i];
+        pr->atom = JS_DupAtom(ctx, props[i]);
+        pr->flags = prop_flags;
+        pr->hash_next = sh->hash_table[hi];
+        sh->hash_table[hi] = i + 1;
+        sh->prop_count = i + 1;
+    }
+    sh->hash = h;
+    sh->is_hashed = TRUE;
+    js_shape_hash_link(rt, sh);
+    *psh = sh;
+    return 0;
 }
 
 static __maybe_unused void JS_DumpShape(JSRuntime *rt, int i, JSShape *sh)
@@ -11860,8 +11971,10 @@ JS_BOOL JS_GetFastArray(JSContext *ctx, JSValueConst obj,
     return js_get_fast_array(ctx, obj, pvalues, plen);
 }
 
-JSValue JS_NewObjectFrom(JSContext *ctx, int count, const JSAtom *props,
-                         const JSValue *values)
+/* JS_NewObjectFrom() defining the properties one by one */
+static JSValue js_new_object_from_slow(JSContext *ctx, int count,
+                                       const JSAtom *props,
+                                       const JSValue *values)
 {
     JSValue obj;
     int i;
@@ -11883,6 +11996,50 @@ JSValue JS_NewObjectFrom(JSContext *ctx, int count, const JSAtom *props,
     return obj;
  fail:
     for(; i < count; i++)
+        JS_FreeValue(ctx, values[i]);
+    return JS_EXCEPTION;
+}
+
+JSValue JS_NewObjectFrom(JSContext *ctx, int count, const JSAtom *props,
+                         const JSValue *values)
+{
+    JSRuntime *rt = ctx->rt;
+    JSObject *proto, *p;
+    JSShape *sh, **psh;
+    JSValue obj;
+    uint32_t h;
+    int i, ret;
+
+    if (count <= 0)
+        return JS_NewObject(ctx);
+    /* the object gets the shape of an object of JS_NewObject() after
+       the definition of the properties, created with the final size */
+    proto = get_proto_obj(ctx->class_proto[JS_CLASS_OBJECT]);
+    h = shape_hash_props(proto, count, props, JS_PROP_C_W_E);
+    sh = find_hashed_shape_props(rt, h, proto, count, props, JS_PROP_C_W_E);
+    if (sh) {
+        js_dup_shape(sh);
+    } else {
+        ret = js_new_shape_props(ctx, &sh, h, proto, count, props,
+                                 JS_PROP_C_W_E);
+        if (ret < 0)
+            goto fail;
+        if (ret > 0) /* duplicate properties: the last value is kept */
+            return js_new_object_from_slow(ctx, count, props, values);
+        psh = &ctx->object_from_shapes[get_shape_hash(h, JS_OBJECT_FROM_SHAPES_BITS)];
+        js_free_shape_null(rt, *psh);
+        *psh = js_dup_shape(sh);
+    }
+    obj = JS_NewObjectFromShape(ctx, sh, JS_CLASS_OBJECT, NULL);
+    if (JS_IsException(obj))
+        goto fail;
+    /* no allocation before the properties are initialized */
+    p = JS_VALUE_GET_OBJ(obj);
+    for(i = 0; i < count; i++)
+        p->prop[i].u.value = values[i];
+    return obj;
+ fail:
+    for(i = 0; i < count; i++)
         JS_FreeValue(ctx, values[i]);
     return JS_EXCEPTION;
 }

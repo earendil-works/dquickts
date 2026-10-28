@@ -110,6 +110,104 @@ static void test_objects(JSContext *ctx)
     JS_FreeValue(ctx, obj);
 }
 
+/* new object of JS_NewObjectFrom() with the properties 'names' (comma
+   separated) set to 0, 1, ... */
+static JSValue new_object_from(JSContext *ctx, const char *names)
+{
+    JSAtom atoms[128];
+    JSValue values[128], obj;
+    const char *p, *q;
+    int i, n;
+
+    n = 0;
+    for(p = names; *p != '\0'; p = *q ? q + 1 : q) {
+        q = strchr(p, ',');
+        if (!q)
+            q = p + strlen(p);
+        CHECK(n < countof(atoms));
+        atoms[n] = JS_NewAtomLen(ctx, p, q - p);
+        values[n] = JS_NewInt32(ctx, n);
+        n++;
+    }
+    obj = JS_NewObjectFrom(ctx, n, atoms, values);
+    for(i = 0; i < n; i++)
+        JS_FreeAtom(ctx, atoms[i]);
+    return obj;
+}
+
+static void test_object_from(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx, *ctx2;
+    JSValue obj;
+    char names[1024];
+    int i, len;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+
+    /* integer keys first in increasing order, then insertion order */
+    obj = new_object_from(ctx, "b,1,a,0");
+    CHECK(!JS_IsException(obj));
+    set_global(ctx, "o", obj);
+    CHECK(eval_bool(ctx, "JSON.stringify(o) === '{\"0\":3,\"1\":1,\"b\":0,\"a\":2}'"));
+    CHECK(eval_bool(ctx, "Object.values(Object.getOwnPropertyDescriptors(o))"
+                    ".every(d => d.writable && d.enumerable && d.configurable)"));
+    /* objects of the same properties are independent */
+    set_global(ctx, "o2", new_object_from(ctx, "b,1,a,0"));
+    CHECK(eval_bool(ctx, "o2.b = 5; delete o2.a; o2.c = 6;"
+                    "JSON.stringify(o) === '{\"0\":3,\"1\":1,\"b\":0,\"a\":2}' &&"
+                    "JSON.stringify(o2) === '{\"0\":3,\"1\":1,\"b\":5,\"c\":6}'"));
+    /* same shape as an object literal built by the program */
+    CHECK(eval_bool(ctx, "var l = {}; l.b = 0; l[1] = 1; l.a = 2; l[0] = 3;"
+                    "JSON.stringify(l) === JSON.stringify(o)"));
+    set_global(ctx, "o3", new_object_from(ctx, "b,1,a,0"));
+    CHECK(eval_bool(ctx, "o3.z = 1; delete l.b; JSON.stringify(o3) === "
+                    "'{\"0\":3,\"1\":1,\"b\":0,\"a\":2,\"z\":1}'"));
+
+    /* a repeated property keeps its first position and its last value */
+    set_global(ctx, "o", new_object_from(ctx, "a,b,a"));
+    CHECK(eval_bool(ctx, "JSON.stringify(o) === '{\"a\":2,\"b\":1}'"));
+
+    /* the properties are defined: '__proto__' is an own property */
+    set_global(ctx, "o", new_object_from(ctx, "x,__proto__"));
+    CHECK(eval_bool(ctx, "Object.getPrototypeOf(o) === Object.prototype &&"
+                    "Object.hasOwn(o, '__proto__') && o.__proto__ === 1 &&"
+                    "Object.keys(o).join() === 'x,__proto__'"));
+
+    /* sized for many properties */
+    len = 0;
+    for(i = 0; i < 100; i++)
+        len += snprintf(names + len, sizeof(names) - len, "%sp%d", i ? "," : "", i);
+    set_global(ctx, "o", new_object_from(ctx, names));
+    CHECK(eval_bool(ctx, "Object.keys(o).length === 100 && o.p0 === 0 && o.p99 === 99"
+                    "&& Object.keys(o).every((k, i) => k === 'p' + i && o[k] === i)"));
+    CHECK(eval_bool(ctx, "o.p100 = 100; delete o.p50; Object.keys(o).length === 100"));
+
+    /* more property lists than the shapes kept by the context */
+    for(i = 0; i < 100; i++) {
+        snprintf(names, sizeof(names), "x%d,y", i % 40);
+        obj = new_object_from(ctx, names);
+        CHECK(!JS_IsException(obj));
+        if (i == 50)
+            set_global(ctx, "o", obj);
+        else
+            JS_FreeValue(ctx, obj);
+    }
+    JS_RunGC(rt);
+    CHECK(eval_bool(ctx, "JSON.stringify(o) === '{\"x10\":0,\"y\":1}'"));
+
+    /* the shapes kept by a context are freed with it */
+    ctx2 = JS_NewContext(rt);
+    obj = new_object_from(ctx2, "a,b,c");
+    CHECK(!JS_IsException(obj));
+    JS_FreeValue(ctx2, obj);
+    JS_FreeContext(ctx2);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static void test_numbers(JSContext *ctx)
 {
     JSValue v;
@@ -2963,6 +3061,7 @@ int main(void)
     test_find_atom();
     test_property_str_len();
     test_property_str_lookup();
+    test_object_from();
     test_pending_jobs();
 
     rt = JS_NewRuntime();

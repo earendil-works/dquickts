@@ -1036,7 +1036,9 @@ JSValue JS_NewObjectClass(JSContext *ctx, int class_id);
 JSValue JS_NewObjectProto(JSContext *ctx, JSValueConst proto);
 JSValue JS_NewObject(JSContext *ctx);
 /* new object with the 'count' enumerable properties props[i] = values[i].
-   The values are freed, even in case of exception. */
+   The values are freed, even in case of exception. The properties are
+   defined, as with JS_DefinePropertyValue(JS_PROP_C_W_E), on an object
+   of JS_NewObject(): the last value of a repeated property is kept. */
 JSValue JS_NewObjectFrom(JSContext *ctx, int count, const JSAtom *props,
                          const JSValue *values);
 /* same as JS_NewObjectFrom() with property names as UTF-8 strings */
