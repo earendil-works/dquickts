@@ -708,16 +708,17 @@ mod test {
     fn into_js_setter_added_during_conversion() {
         // The element 1 conversion adds setters for the indexes 0 and 2: the element 0 was
         // already set, the element 2 goes through the setter (and isn't defined).
+        // The setters log to a string: setting array elements in them would recurse.
         let add = r#"
-            globalThis.got = [];
+            globalThis.got = "";
             for (const i of ["0", "2"]) {
                 Object.defineProperty(Array.prototype, i,
-                    { set(v) { got.push(i, v) }, configurable: true });
+                    { set(v) { got += i + ":" + v + ";" }, configurable: true });
             }
         "#;
         let check = r#"
             a.length === 2 && Object.hasOwn(a, 0) && a[0] === 0 && a[1] === 1 &&
-                !Object.hasOwn(a, 2) && got.join() === '2,2'
+                !Object.hasOwn(a, 2) && got === "2:2;"
         "#;
         test_with(|ctx| {
             let list = vec![Scripted(0, ""), Scripted(1, add), Scripted(2, "")];
