@@ -17,7 +17,7 @@ import { createWasi, type WasiFunction, type WasiOverrides, type WasmMemory } fr
 export type { WasiFunction, WasiOverrides, WasmMemory } from "./wasi.ts";
 
 /** Version of these bindings. */
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 
 /**
  * Largest `maxStackSize`, and its default. quickjs.wasm has 1 MiB of stack; the rest is for the C frames below the
