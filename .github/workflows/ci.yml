@@ -228,6 +228,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
+      # the Cosmopolitan build reads the host zoneinfo, and the backward
+      # compatible zone names used by test262 live in tzdata-legacy
+      - name: Install tzdata-legacy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tzdata-legacy
       - name: Install Cosmopolitan
         run: |
           mkdir ~/cosmocc

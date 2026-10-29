@@ -126,6 +126,12 @@ function convertCompactPattern(cldrPat) {
     return cldrPat.replace(/(\d+)/g, '{0}');
 }
 
+function isBidiControl(code) {
+    return code === 0x061c || code === 0x200e || code === 0x200f ||
+        (code >= 0x202a && code <= 0x202e) ||
+        (code >= 0x2066 && code <= 0x2069);
+}
+
 function escapeCString(s) {
     if (s === null || s === undefined) return '';
     if (typeof s !== 'string') s = String(s);
@@ -139,6 +145,12 @@ function escapeCString(s) {
         else if (ch === '\t') r += '\\t';
         else if (code < 0x20) {
             r += `\\x${code.toString(16).padStart(2, '0')}`;
+        }
+        else if (isBidiControl(code)) {
+            /* GCC rejects raw bidi controls in sources (-Wbidi-chars),
+               so emit their UTF-8 bytes as octal escapes */
+            for (const b of Buffer.from(ch, 'utf8'))
+                r += '\\' + b.toString(8).padStart(3, '0');
         }
         else r += ch;
     }

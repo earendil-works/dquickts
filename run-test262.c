@@ -328,7 +328,7 @@ char *skip_prefix(const char *str, const char *prefix)
 
 char *get_basename(const char *filename)
 {
-    char *p;
+    const char *p;
 
     p = strrchr(filename, '/');
     if (!p)
@@ -1823,10 +1823,10 @@ int run_test(ThreadLocalStorage *tls, const char *filename, int index)
 
     if (new_style) {
         if (!harness) {
-            p = strstr(filename, "test/");
-            if (p) {
+            const char *test_dir = strstr(filename, "test/");
+            if (test_dir) {
                 snprintf(harnessbuf, sizeof(harnessbuf), "%.*s%s",
-                         (int)(p - filename), filename, "harness");
+                         (int)(test_dir - filename), filename, "harness");
             } else {
                 pstrcpy(harnessbuf, sizeof(harnessbuf), "");
             }
@@ -1915,10 +1915,10 @@ int run_test(ThreadLocalStorage *tls, const char *filename, int index)
         char *ifile;
 
         if (!harness) {
-            p = strstr(filename, "test/");
-            if (p) {
+            const char *test_dir = strstr(filename, "test/");
+            if (test_dir) {
                 snprintf(harnessbuf, sizeof(harnessbuf), "%.*s%s",
-                         (int)(p - filename), filename, "test/harness");
+                         (int)(test_dir - filename), filename, "test/harness");
             } else {
                 pstrcpy(harnessbuf, sizeof(harnessbuf), "");
             }

@@ -12120,7 +12120,7 @@ JS_BOOL JS_NewObjectSetIsDefine(JSContext *ctx, JSAtom prop)
 JSValue JS_NewObjectFromStr(JSContext *ctx, int count, const char **props,
                             const JSValue *values)
 {
-    JSAtom atoms_s[16], *atoms = atoms_s;
+    JSAtom atoms_s[16] = { 0 }, *atoms = atoms_s;
     JSValue ret;
     int i, n;
 
@@ -39409,7 +39409,7 @@ static char *js_default_module_normalize_name(JSContext *ctx,
                                               const char *name)
 {
     char *filename, *p;
-    const char *r;
+    const char *r, *sep;
     int cap;
     int len;
 
@@ -39418,9 +39418,9 @@ static char *js_default_module_normalize_name(JSContext *ctx,
         return js_strdup(ctx, name);
     }
 
-    p = strrchr(base_name, '/');
-    if (p)
-        len = p - base_name;
+    sep = strrchr(base_name, '/');
+    if (sep)
+        len = sep - base_name;
     else
         len = 0;
 
