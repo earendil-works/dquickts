@@ -16,7 +16,8 @@
 	"files": [
 		"dist",
 		"quickjs.wasm",
-		"README.md"
+		"README.md",
+		"LICENSE"
 	],
 	"scripts": {
 		"build:wasm": "make",
