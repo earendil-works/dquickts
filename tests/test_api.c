@@ -2611,10 +2611,13 @@ static void test_bigint_pow_leak(void)
 }
 
 static int poll_count, poll_limit;
+static int poll_once; /* interrupt only at the poll 'poll_limit' */
 
 static int counting_interrupt_handler(JSRuntime *rt, void *opaque)
 {
     poll_count++;
+    if (poll_once)
+        return poll_count == poll_limit;
     return poll_limit > 0 && poll_count >= poll_limit;
 }
 
@@ -2672,6 +2675,104 @@ static void test_interrupt_polls(void)
     CHECK(count_polls(ctx, "let re = /(a|aa)+b/, s = 'a'.repeat(13);"
                       "for (let i = 0; i < 100; i++) re.test(s);", 0) >= 20);
     count_polls(ctx, "try { /(a+)+b/.test('a'.repeat(40)) } catch (e) {}", 3);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static int side_effects; /* calls of side() */
+
+static JSValue side_effect(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv)
+{
+    side_effects++;
+    return JS_UNDEFINED;
+}
+
+/* evaluate 'str', which is interrupted at the poll 'limit' and every
+   later one if 'persistent', else only at that one: check that it
+   throws the uncatchable interruption and return the number of side()
+   calls */
+static int eval_interrupted(JSContext *ctx, const char *str, int limit,
+                            int persistent)
+{
+    JSValue val;
+
+    side_effects = 0;
+    poll_count = 0;
+    poll_limit = limit;
+    poll_once = !persistent;
+    val = eval_str(ctx, str);
+    CHECK(JS_IsException(val));
+    CHECK(JS_IsUncatchableException(ctx));
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    return side_effects;
+}
+
+/* Once interrupted, no JS code runs until the execution returns to the
+   host, which gets the interruption also if an async function turned it
+   into a rejection: no side() call after it. */
+static void test_interrupt_async(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSValue val;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    set_global(ctx, "side", JS_NewCFunction(ctx, side_effect, "side", 0));
+    JS_SetInterruptHandler(rt, counting_interrupt_handler, NULL);
+
+    /* a rejection handler of the interrupted async function */
+    CHECK(eval_interrupted(ctx, "var p = (async () => { for (;;); })();"
+                           "p.catch(() => side()); p", 3, 1) == 0);
+    CHECK(!JS_IsJobPending(rt));
+    /* the same, interrupted in a job: the job returns the interruption
+       and the promise is not rejected, so the handler never runs */
+    poll_limit = 0;
+    val = eval_str(ctx, "var p = (async () => { await null; for (;;); })();"
+                   "p.catch(() => side()); p");
+    CHECK(!JS_IsException(val));
+    JS_FreeValue(ctx, val);
+    poll_count = 0;
+    poll_limit = 3;
+    poll_once = 0;
+    CHECK(JS_ExecutePendingJob(rt, NULL) < 0);
+    CHECK(JS_IsUncatchableException(ctx));
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    while (JS_IsJobPending(rt)) {
+        CHECK(JS_ExecutePendingJob(rt, NULL) < 0);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    CHECK(side_effects == 0);
+    /* the synchronous code after an interrupted async call */
+    CHECK(eval_interrupted(ctx, "(async () => { for (;;); })(); side(); 1",
+                           3, 1) == 0);
+    /* interrupted async calls in a loop: the execution ends, also if the
+       handler interrupts only once */
+    CHECK(eval_interrupted(ctx, "(async () => { for (;;) {"
+                           "(async () => { for (;;); })(); side() } })()",
+                           3, 1) == 0);
+    CHECK(eval_interrupted(ctx, "(async () => { for (;;) {"
+                           "(async () => { for (;;); })(); side() } })()",
+                           3, 0) == 0);
+    /* an async generator and a promise executor */
+    CHECK(eval_interrupted(ctx, "(async function *() { for (;;); })().next();"
+                           "side()", 3, 1) == 0);
+    CHECK(eval_interrupted(ctx, "new Promise(() => { for (;;); }); side()",
+                           3, 1) == 0);
+    /* the iterator closed by new Map() after its adder was interrupted:
+       its return() method is not run and the error stays uncatchable */
+    CHECK(eval_interrupted(ctx, "var it = { [Symbol.iterator]() { return this },"
+                           "next() { return { value: [1, 1] } },"
+                           "return() { side(); return {} } };"
+                           "class M extends Map { set() { for (;;); } }"
+                           "try { new M(it) } catch (e) { side() }",
+                           3, 0) == 0);
+    /* the interruption ends with the execution */
+    poll_limit = 0;
+    val = eval_str(ctx, "side(); 1 + 1");
+    CHECK(JS_VALUE_GET_INT(val) == 2 && side_effects == 1);
 
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
@@ -3229,6 +3330,7 @@ int main(void)
     test_trigger_interrupt();
     test_bigint_pow_leak();
     test_interrupt_polls();
+    test_interrupt_async();
     test_find_atom();
     test_property_str_len();
     test_property_str_lookup();

@@ -97,7 +97,7 @@ rule.
 | `wasm` | `quickjs.wasm`, compiled or as bytes |
 | `memoryLimit` | bytes the engine may allocate; beyond it scripts get a catchable `InternalError: out of memory` |
 | `maxStackSize` | the JS stack guard (default and maximum 512 KiB); deep recursion throws a catchable `InternalError: stack overflow` |
-| `interruptHandler` | polled while JS runs; returning true throws an uncatchable `InternalError: interrupted` |
+| `interruptHandler` | polled while JS runs; returning true throws an uncatchable `InternalError: interrupted`, and no JS code runs until the call into the VM returns: it throws the interruption, also if an async function turned it into a rejection |
 | `intrinsics` | `Intrinsics` flags, e.g. `Intrinsics.ALL & ~Intrinsics.WEAK_REF` |
 | `timezoneOffset` | `"host"` (default), a fixed offset in minutes (`getTimezoneOffset()` convention), or a function of the time |
 | `wasi` | replaces WASI functions: `clock_time_get` (Date, performance, the seed of `Math.random()`), `random_get`, `fd_write` (engine diagnostics) |
@@ -138,9 +138,6 @@ embedders use most, so most code only changes its import. The differences come f
   exceeded`. A JS call uses more wasm stack: about 820 frames fit in 256 KiB (1090 with
   quickjs-wasi).
 - `Math.random()` uses another generator: the same seed gives other values.
-- An exception in a promise job rejects the job's promise, an interruption included. An
-  interrupted async function cannot catch the interruption with `try`/`catch`, but its promise
-  rejects. Stop running jobs once the interrupt handler returns true.
 - `Atomics` and `SharedArrayBuffer` are not available, as with quickjs-wasi.
 - `executePendingJob()` and `isJobPending()` are public; `_getExports()` returns different
   exports.

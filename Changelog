@@ -37,6 +37,13 @@ unreleased:
   'typescript' option; qjs: '-' as file name reads stdin
 - fixed the export of the names bound by array destructuring exports
   ('export const [a, b] = ...', quickjs-ng #1576)
+- an interruption stops the execution until it returns to the host:
+  every later function call and loop iteration throws it again, and
+  the call or job entered from the host returns it, also if an async
+  function, a promise executor or JS_IteratorClose() absorbed it. Before,
+  the code after an interrupted async function kept running and could
+  avoid the interruption (e.g. a loop of interrupted async calls).
+  JS_SetUncatchableException(ctx, FALSE) ends the interruption
 - added explicit resource management (ES2026): 'using' and 'await using'
   declarations, DisposableStack, AsyncDisposableStack, SuppressedError,
   Symbol.dispose, Symbol.asyncDispose, Iterator.prototype[Symbol.dispose]

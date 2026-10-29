@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Built on the bellard QuickJS tree this copy is vendored in instead of QuickJS-NG: `Value::is_uncatchable_error` is removed (see `Ctx::has_uncatchable_exception`); `Runtime::set_dump_flags` takes the `JS_DUMP_*` flags of this engine, compiled in by any `dump-*` feature.
 - `Allocator` implementations are given the memory limit through QuickJS's allocation state: `Runtime::set_memory_limit` also applies with a custom allocator.
+- An interruption by the interrupt handler stops all JS code until the call into the runtime returns, and that call returns it, also if an async function or a promise executor turned it into a rejection. A promise executor that is interrupted makes the call fail instead of rejecting the promise.
 
 ### Added
 

@@ -600,8 +600,8 @@ mod test {
                 )
                 .catch(&ctx)
                 .unwrap();
-            let promise: Promise = func.call(()).catch(&ctx).unwrap();
-            let result = promise.into_future::<i32>().await;
+            // the interruption is not turned into a rejection: the call returns it
+            let result: Result<Promise> = func.call(());
             assert!(result.is_err(), "should fail due to interrupt");
         })
         .await

@@ -202,16 +202,51 @@ describe("promises and jobs", () => {
 		assert.equal(promise.promiseResult.getProp("value").toNumber(), 3);
 	});
 
-	it("rejects the promise of an async function that is interrupted", async () => {
-		// The engine turns an exception in a job into a rejection, an interruption included: a script cannot catch it
-		// with try/catch, but sees it as a rejection. Hosts should stop running jobs once they interrupt.
+	it("reports an interrupted async function to the host", async () => {
+		// The job throws the interruption, and the promise of the async function never settles.
 		let interrupt = false;
 		using vm = await create({ interruptHandler: () => interrupt });
 		const promise = vm.evalCode("(async () => { try { await null; for (;;); } catch { return 'caught' } })()");
 		interrupt = true;
-		vm.executePendingJobs();
-		assert.equal(promise.promiseState, PromiseState.REJECTED);
-		assert.equal(promise.promiseResult.toString(), "InternalError: interrupted");
+		const interrupted = thrown(() => vm.executePendingJobs());
+		assert.equal(interrupted.uncatchable, true);
+		assert.equal(promise.promiseState, PromiseState.PENDING);
+	});
+
+	it("runs no code after an interruption", async () => {
+		let polls = 0;
+		let limit = 0;
+		let once = false;
+		let sideEffects = 0;
+		using vm = await create({
+			interruptHandler: () => (once ? ++polls === limit : limit > 0 && ++polls >= limit),
+		});
+		vm.global.setProp(
+			"side",
+			vm.newFunction("side", () => {
+				sideEffects++;
+			}),
+		);
+		const run = (code: string, interruptOnce: boolean) => {
+			polls = 0;
+			limit = 3;
+			once = interruptOnce;
+			sideEffects = 0;
+			const interrupted = thrown(() => vm.evalCode(code));
+			assert.equal(interrupted.uncatchable, true);
+			return sideEffects;
+		};
+		// a rejection handler and the code after an interrupted async call
+		assert.equal(run("const p = (async () => { for (;;); })(); p.catch(() => side()); side(); p", false), 0);
+		// interrupted async calls in a loop end, also if the handler interrupts only once
+		const loop = "(async () => { for (;;) { (async () => { for (;;); })(); side() } })()";
+		assert.equal(run(loop, false), 0);
+		assert.equal(run(loop, true), 0);
+		assert.equal(vm.isJobPending(), false);
+		// the next call runs normally once the handler stops interrupting
+		limit = 0;
+		assert.equal(vm.evalCode("side(); 1 + 1").toNumber(), 2);
+		assert.equal(sideEffects, 1);
 	});
 });
 

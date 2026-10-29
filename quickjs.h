@@ -853,6 +853,10 @@ static inline JS_BOOL JS_IsModule(JSValueConst v)
 }
 
 JSValue JS_Throw(JSContext *ctx, JSValue obj);
+/* Make the pending exception uncatchable (flag = TRUE) or catchable.
+   Making an interruption catchable also ends the interruption of the
+   execution, e.g. to report it to the JS code which called a nested
+   evaluation (see JS_SetInterruptHandler()). */
 void JS_SetUncatchableException(JSContext *ctx, JS_BOOL flag);
 /* TRUE if the pending exception cannot be caught by JS code (interruption,
    suspension) */
@@ -1369,7 +1373,14 @@ typedef void JSHostPromiseRejectionTracker(JSContext *ctx, JSValueConst promise,
                                            JS_BOOL is_handled, void *opaque);
 void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRejectionTracker *cb, void *opaque);
 
-/* return != 0 if the JS code needs to be interrupted */
+/* return != 0 if the JS code needs to be interrupted: the uncatchable
+   InternalError "interrupted" is thrown. The execution then stays
+   interrupted until it returns to the host: every later function call
+   and loop iteration throws it again, without calling the handler, and
+   the call or job entered from the host (JS_Call(), JS_Eval(),
+   JS_ExecutePendingJob()...) returns it, also if the JS code turned it
+   into a promise rejection (async functions). After that, the handler
+   is called at its regular rate again. */
 typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
 /* return the current interrupt handler (NULL if none) and store its

@@ -87,7 +87,9 @@ export interface QuickJSOptions {
 	maxStackSize?: number;
 	/**
 	 * Polled while JS runs. Returning true interrupts the execution with an uncatchable error. A handler that throws
-	 * interrupts too.
+	 * interrupts too. No JS code runs after that until the call into the VM (`evalCode()`, `callFunction()`,
+	 * `executePendingJob()`...) returns: it throws the interruption, also if an async function turned it into a
+	 * rejection.
 	 */
 	interruptHandler?: () => boolean;
 	/** Replaces the default WASI functions (clocks, random bytes, output). */
@@ -776,9 +778,8 @@ export class QuickJS {
 	}
 
 	/**
-	 * Runs one promise job. Returns false if none was pending. Throws a `JSException` if the job threw. Exceptions in
-	 * promise reactions and async functions reject their promise instead, an interruption included: once the
-	 * interrupt handler returns true, stop running jobs rather than relying on the exception.
+	 * Runs one promise job. Returns false if none was pending. Throws a `JSException` if the job threw or was
+	 * interrupted. Exceptions in promise reactions and async functions reject their promise instead.
 	 */
 	executePendingJob(): boolean {
 		this.#assertAlive();

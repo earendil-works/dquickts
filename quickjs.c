@@ -332,6 +332,12 @@ struct JSRuntime {
     JSValue current_exception;
     /* true if the current exception cannot be catched */
     BOOL current_exception_is_uncatchable : 8;
+    /* TRUE from the time the interrupt handler interrupts the execution
+       until it returns to the host (see js_set_interrupted()) */
+    BOOL interrupted : 8;
+    /* TRUE while a call entered from the host runs (see
+       js_call_from_host()) */
+    BOOL in_host_call : 8;
     /* true if inside an out of memory error, to avoid recursing */
     BOOL in_out_of_memory : 8;
     /* TRUE while Error.prepareStackTrace runs: the errors it creates
@@ -1330,9 +1336,15 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
 static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
                                       JSValueConst this_obj,
                                       int argc, JSValueConst *argv, int flags);
-static JSValue JS_CallInternal(JSContext *ctx, JSValueConst func_obj,
-                               JSValueConst this_obj, JSValueConst new_target,
-                               int argc, JSValue *argv, int flags);
+static inline JSValue JS_CallInternal(JSContext *ctx, JSValueConst func_obj,
+                                      JSValueConst this_obj,
+                                      JSValueConst new_target,
+                                      int argc, JSValue *argv, int flags);
+static JSValue js_call_internal(JSContext *ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+                                int argc, JSValue *argv, int flags);
+static inline BOOL js_is_host_entry(JSRuntime *rt);
+static JSValue js_host_entry_end(JSContext *ctx, JSValue ret);
 static JSValue JS_CallConstructorInternal(JSContext *ctx,
                                           JSValueConst func_obj,
                                           JSValueConst new_target,
@@ -2685,17 +2697,20 @@ static int js_execute_first_job(JSRuntime *rt, JSContext **pctx)
     JSJobEntry *e;
     JSValue res;
     int i, ret;
-    BOOL saved_in_job;
+    BOOL saved_in_job, host_entry;
 
     e = list_entry(rt->job_list.next, JSJobEntry, link);
     list_del(&e->link);
     ctx = e->realm;
+    host_entry = js_is_host_entry(rt);
     /* code run by a job cannot be suspended: the job function is a
        native continuation */
     saved_in_job = rt->in_job;
     rt->in_job = TRUE;
     res = e->job_func(ctx, e->argc, (JSValueConst *)e->argv);
     rt->in_job = saved_in_job;
+    if (host_entry)
+        res = js_host_entry_end(ctx, res);
     for(i = 0; i < e->argc; i++)
         JS_FreeValue(ctx, e->argv[i]);
     if (JS_IsException(res))
@@ -9277,7 +9292,8 @@ static void js_error_format_stack(JSContext *ctx, JSObject *p)
 
 /* Return the Error.prepareStackTrace() function to use for a new stack
    trace or JS_UNDEFINED. It is not used for the errors raised by
-   itself, for the uncatchable ones (interruption) and outside of JS
+   itself, for the uncatchable ones and in an interrupted execution
+   (interruption) and outside of JS
    code (host calls, heap snapshot reading where the functions may be
    incomplete, GC). No JS code is run. */
 static JSValueConst js_get_prepare_stack_trace(JSContext *ctx)
@@ -9286,6 +9302,7 @@ static JSValueConst js_get_prepare_stack_trace(JSContext *ctx)
     JSValueConst prepare_func;
 
     if (rt->in_prepare_stack_trace || rt->current_exception_is_uncatchable ||
+        rt->interrupted ||
         !rt->current_stack_frame || rt->gc_phase != JS_GC_PHASE_NONE)
         return JS_UNDEFINED;
     prepare_func = js_get_error_ctor_data(ctx, JS_ATOM_prepareStackTrace);
@@ -9899,6 +9916,72 @@ static void JS_ThrowInterrupted(JSContext *ctx)
     JS_SetUncatchableException(ctx, TRUE);
 }
 
+/* Interruption
+
+   Once the interrupt handler returns TRUE in a call or job entered from
+   the host, the execution stays interrupted until it returns to the
+   host ('rt->interrupted'): every later poll (function call, branch,
+   regexp step) throws the uncatchable error again without calling the
+   handler. JS code can absorb the error without catching it, e.g. an
+   async function turns it into a rejection of its promise, but cannot
+   run anything with it: it cannot call a function nor loop. The call
+   or job entered from the host then returns the uncatchable error, also
+   if the JS code absorbed it, and the execution is no longer
+   interrupted (js_host_entry_end()). */
+
+/* start ('interrupted' = TRUE) or end the interruption */
+static void js_set_interrupted(JSRuntime *rt, BOOL interrupted)
+{
+    struct list_head *el;
+    JSContext *ctx;
+
+    rt->interrupted = interrupted;
+    /* poll at the next call or branch, also in the other realms, or
+       back at the regular rate */
+    list_for_each(el, &rt->context_list) {
+        ctx = list_entry(el, JSContext, link);
+        ctx->interrupt_counter = interrupted ? 1 : JS_INTERRUPT_COUNTER_INIT;
+    }
+}
+
+/* poll of an interrupted execution */
+static no_inline int js_poll_interrupted(JSContext *ctx)
+{
+    ctx->interrupt_counter = 1;
+    JS_ThrowInterrupted(ctx);
+    return -1;
+}
+
+/* TRUE if JS code called now is entered from the host: no JS code, job
+   or native continuation of the runtime is running */
+static inline BOOL js_is_host_entry(JSRuntime *rt)
+{
+    return !rt->current_stack_frame && !rt->in_job && !rt->in_host_call &&
+        rt->native_call_depth == 0;
+}
+
+/* End of a call or job entered from the host which returned 'ret'
+   (JS_EXCEPTION if it threw): if it was interrupted, return the
+   uncatchable error, also if the JS code absorbed it, and end the
+   interruption. */
+static JSValue js_host_entry_end(JSContext *ctx, JSValue ret)
+{
+    JSRuntime *rt = ctx->rt;
+
+    if (likely(!rt->interrupted))
+        return ret;
+    js_set_interrupted(rt, FALSE);
+    if (JS_IsException(ret)) {
+        if (rt->current_exception_is_uncatchable)
+            return ret;
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    } else {
+        JS_FreeValue(ctx, ret);
+    }
+    JS_ThrowInterrupted(ctx);
+    return JS_EXCEPTION;
+}
+
 /* Host code called by the engine outside of a class 'call' handler
    (exotic behaviors, iterator_next functions called directly, module
    loading, rejection tracker, interrupt handler) is a native
@@ -9931,6 +10014,11 @@ static __exception int js_call_interrupt_handler(JSContext *ctx)
         int interrupted = rt->interrupt_handler(rt, rt->interrupt_opaque);
         js_host_callback_leave(rt, saved_caller);
         if (interrupted) {
+            /* only an execution entered from the host can end the
+               interruption. Before the error is created: no
+               Error.prepareStackTrace(). */
+            if (rt->in_host_call || rt->in_job)
+                js_set_interrupted(rt, TRUE);
             JS_ThrowInterrupted(ctx);
             return -1;
         }
@@ -9944,6 +10032,8 @@ static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
 
+    if (unlikely(rt->interrupted))
+        return js_poll_interrupted(ctx);
     if (unlikely(ctx->suspend_poll_budget > 0)) {
         /* early poll to reach a suspension point: the interrupt handler
            is only called at the end of its regular period */
@@ -13602,6 +13692,9 @@ BOOL JS_IsError(JSContext *ctx, JSValueConst val)
 void JS_SetUncatchableException(JSContext *ctx, BOOL flag)
 {
     ctx->rt->current_exception_is_uncatchable = flag;
+    /* the interruption is handled by the caller */
+    if (!flag && ctx->rt->interrupted)
+        js_set_interrupted(ctx->rt, FALSE);
 }
 
 JS_BOOL JS_IsUncatchableException(JSContext *ctx)
@@ -20703,6 +20796,8 @@ static no_inline __exception int js_poll_safepoint(JSContext *ctx,
     JSRuntime *rt = ctx->rt;
 
     sf->cur_pc = pc;
+    if (unlikely(rt->interrupted))
+        return js_poll_interrupted(ctx);
     if (unlikely(ctx->suspend_poll_budget > 0)) {
         /* early poll requested by __js_poll_interrupts(): continue the
            regular period of the interrupt handler */
@@ -21692,15 +21787,52 @@ static JSValue js_decorator_helper(JSContext *ctx, JSValueConst a,
 #define FUNC_RET_YIELD_STAR    2
 #define FUNC_RET_INITIAL_YIELD 3
 
+/* JS_CallInternal() or JS_CallConstructorInternal() ('is_constructor')
+   of a call entered from the host: report an interruption to the host
+   (see js_host_entry_end()) */
+static no_inline JSValue js_call_from_host(JSContext *ctx, JSValueConst func_obj,
+                                           JSValueConst this_obj,
+                                           JSValueConst new_target,
+                                           int argc, JSValue *argv, int flags,
+                                           BOOL is_constructor)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue ret;
+
+    rt->in_host_call = TRUE;
+    if (is_constructor)
+        ret = JS_CallConstructorInternal(ctx, func_obj, new_target, argc, argv,
+                                         flags);
+    else
+        ret = js_call_internal(ctx, func_obj, this_obj, new_target, argc, argv,
+                               flags);
+    rt->in_host_call = FALSE;
+    return js_host_entry_end(ctx, ret);
+}
+
+/* The check of the host entry is not in js_call_internal(): code at its
+   beginning makes the compiler optimize the interpreter loop less. */
+static inline JSValue JS_CallInternal(JSContext *ctx, JSValueConst func_obj,
+                                      JSValueConst this_obj,
+                                      JSValueConst new_target,
+                                      int argc, JSValue *argv, int flags)
+{
+    if (unlikely(js_is_host_entry(ctx->rt)))
+        return js_call_from_host(ctx, func_obj, this_obj, new_target,
+                                 argc, argv, flags, FALSE);
+    return js_call_internal(ctx, func_obj, this_obj, new_target, argc, argv,
+                            flags);
+}
+
 #ifdef OPCODE_ASM_LABEL
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-label"
 #endif
 
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
-static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
-                               JSValueConst this_obj, JSValueConst new_target,
-                               int argc, JSValue *argv, int flags)
+static JSValue js_call_internal(JSContext *caller_ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+                                int argc, JSValue *argv, int flags)
 {
     JSRuntime *rt = caller_ctx->rt;
     JSContext *ctx;
@@ -25034,6 +25166,9 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
     JSFunctionBytecode *b;
     JSValue ret;
 
+    if (unlikely(js_is_host_entry(ctx->rt)))
+        return js_call_from_host(ctx, func_obj, JS_UNDEFINED, new_target,
+                                 argc, argv, flags, TRUE);
     if (js_poll_interrupts(ctx))
         return JS_EXCEPTION;
     flags |= JS_CALL_FLAG_CONSTRUCTOR;
